@@ -583,7 +583,28 @@ fn chat_row(
 /// Test hook: WA_DEBUG_UI="wait 1500; click 300,26; rclick 120,200; key down; type abc"
 /// drives the window with real mouse/key events (window coordinates in points).
 /// `drag x,y a.png|b.pdf` / `drop x,y` simulate dragging files from Finder.
+/// `scroll x,y dy` scrolls by dy points at x,y; `scrollbench x,y secs` scrolls there for
+/// secs seconds in a fixed pattern (one event per 8 ms, 1.5 s each way at 1200 pt/s),
+/// so profiling runs compare.
 /// A reopened window (see `WA_DEBUG_REOPEN`) runs `WA_DEBUG_UI_REOPENED` instead.
+fn parse_point(at: &str) -> Point<Pixels> {
+    let (x, y) = at.split_once(',').unwrap_or(("0", "0"));
+    point(px(x.trim().parse().unwrap_or(0.)), px(y.trim().parse().unwrap_or(0.)))
+}
+
+fn debug_scroll(window: &mut Window, cx: &mut App, position: Point<Pixels>, dy: f32) {
+    window.dispatch_event(
+        PlatformInput::Scroll(ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            source: Default::default(),
+        }),
+        cx,
+    );
+}
+
 fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
     static WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let var = if WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 { "WA_DEBUG_UI" } else { "WA_DEBUG_UI_REOPENED" };
@@ -595,6 +616,22 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
             if verb == "wait" {
                 let ms = arg.parse().unwrap_or(500);
                 cx.background_executor().timer(Duration::from_millis(ms)).await;
+                continue;
+            }
+            if verb == "scrollbench" {
+                let (at, secs) = arg.split_once(' ').unwrap_or((arg, "10"));
+                let position = parse_point(at);
+                let end = std::time::Instant::now() + Duration::from_secs_f32(secs.trim().parse().unwrap_or(10.));
+                let (mut tick, start) = (0u64, std::time::Instant::now());
+                log::info!("WA_DEBUG_UI: scrollbench start");
+                while std::time::Instant::now() < end {
+                    // 1.5 s up (towards older messages), 1.5 s back down; 9.6 pt per 8 ms.
+                    let up = (start.elapsed().as_millis() / 1500) % 2 == 0;
+                    let _ = cx.update(|window, cx| debug_scroll(window, cx, position, if up { 9.6 } else { -9.6 }));
+                    tick += 1;
+                    cx.background_executor().timer(Duration::from_millis(8)).await;
+                }
+                log::info!("WA_DEBUG_UI: scrollbench done ({tick} events)");
                 continue;
             }
             // Keystroke parsing wants 'static strings; a test hook can afford the leak.
@@ -645,6 +682,10 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                         FileDropEvent::Submit { position }
                     };
                     window.dispatch_event(PlatformInput::FileDrop(event), cx);
+                }
+                "scroll" => {
+                    let (at, dy) = arg.split_once(' ').unwrap_or((arg, "0"));
+                    debug_scroll(window, cx, parse_point(at), dy.trim().parse().unwrap_or(0.));
                 }
                 "key" => {
                     if let Ok(ks) = Keystroke::parse(arg) {
