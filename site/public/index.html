@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>WhatsRusty — Your WhatsApp chats, in a Mac app that feels like Messages.</title><meta name="description" content="A fast, native macOS client for WhatsApp with an iMessage-style look. Written in Rust. Unofficial and open source.">
+<meta property="og:title" content="WhatsRusty — WhatsApp chats, Messages feel."><meta property="og:description" content="A fast, native macOS client for WhatsApp with an iMessage-style look. Written in Rust."><meta property="og:type" content="website"><meta property="og:url" content="https://whatsapp.apps.balaj.me/"><meta property="og:image" content="https://whatsapp.apps.balaj.me/images/app-mock.webp">
+<link rel="canonical" href="https://whatsapp.apps.balaj.me/"><link rel="icon" href="/icon.png" type="image/png"><link rel="stylesheet" href="/styles.css"><script type="module" src="/app.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header shell"><a class="wordmark" href="/" aria-label="WhatsRusty home"><img src="/icon.png" width="32" height="32" alt=""><span>WhatsRusty</span></a><nav aria-label="Main navigation"><a href="#features">Features</a><a href="#faq">FAQ</a><a href="https://github.com/talhabalaj/whatsrusty">GitHub</a></nav></header>
+<main id="main">
+<section class="hero shell" aria-labelledby="hero-title">
+<div class="thread" aria-hidden="true">
+<p class="stamp">Today 9:41 AM</p>
+<p class="bubble in">Is there a WhatsApp for Mac that feels like Messages?</p>
+<p class="bubble out">There is now.</p>
+<p class="bubble out tail">Native, fast, and written in Rust 🦀</p>
+<p class="receipt">Read 9:41 AM</p>
+</div>
+<h1 id="hero-title">Your WhatsApp chats, in a Mac app that feels like Messages.</h1>
+<p class="lede">WhatsRusty is a native macOS client for WhatsApp with the look you already know from iMessage. It links to your phone like WhatsApp Web, starts instantly and stays light.</p>
+<div class="actions"><a class="button primary" href="/downloads/latest.zip" data-release-link><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></svg><span data-release-label>Download for Mac</span></a><a class="button" href="https://github.com/talhabalaj/whatsrusty">View source</a></div>
+<p class="release-detail" data-release-detail>Apple silicon · macOS 14 or later</p>
+<p class="notice" role="note"><strong>Unofficial.</strong> WhatsRusty is an independent project, not made by or affiliated with WhatsApp or Meta. Third-party clients may violate WhatsApp’s Terms of Service and can get an account banned. Consider a secondary number.</p>
+</section>
+<figure class="shot shell"><img src="/images/app-mock.webp" width="1600" height="1067" alt="WhatsRusty showing a chat list on the left and a conversation with a poll, a contact card, a video and a sticker in iMessage-style bubbles." fetchpriority="high"><figcaption>Sample conversations from the app’s demo mode. No real chats shown.</figcaption></figure>
+<section class="features shell" id="features" aria-labelledby="features-title"><h2 id="features-title">Feels at home on your Mac.</h2><div class="grid">
+<article><h3>Messages look and feel</h3><p>Blue and gray bubbles, tapbacks, read receipts under the last message, and a sidebar that looks like the one you use every day.</p></article>
+<article><h3>Native and fast</h3><p>Built in Rust with GPUI, the GPU-accelerated UI framework from Zed. No browser, no Electron.</p></article>
+<article><h3>Your phone stays in charge</h3><p>Link it once by scanning a QR code under Linked Devices. Messages stay end-to-end encrypted and the session lives only on your Mac.</p></article>
+<article><h3>All your messages</h3><p>Send text, photos and stickers; reply, react, edit, forward and delete. Photos, videos, voice notes, documents, polls, locations and contact cards show up right in the thread.</p></article>
+<article><h3>Notifications</h3><p>Native macOS notifications that open the right chat, plus an unread badge on the Dock icon.</p></article>
+<article><h3>Signed and up to date</h3><p>Notarized by Apple and updated in place through Sparkle with signed updates. Choose Check for Updates… any time.</p></article>
+</div></section>
+<section class="split shell" aria-labelledby="link-title"><div><h2 id="link-title">Link it like WhatsApp Web.</h2><ol><li>Open WhatsRusty and wait for the QR code.</li><li>On your phone, open WhatsApp → Settings → Linked Devices → Link a Device.</li><li>Scan the code. Your chats appear as WhatsRusty syncs.</li></ol><p>Your phone lists the Mac as <em>WhatsRusty</em>. Unlink it there, or with Log Out in the app menu, whenever you like.</p></div></section>
+<section class="faq shell" id="faq" aria-labelledby="faq-title"><h2 id="faq-title">Questions</h2><div class="questions">
+<details><summary>What does my Mac need?</summary><p>An Apple silicon Mac with macOS 14 or later, and WhatsApp on your phone.</p></details>
+<details><summary>Is this the official WhatsApp app?</summary><p>No. WhatsRusty is an unofficial, independent client built on the open-source <a href="https://github.com/jlucaso1/whatsapp-rust">whatsapp-rust</a> library. It is not affiliated with WhatsApp or Meta, and using it may break WhatsApp’s Terms of Service. Use it at your own risk.</p></details>
+<details><summary>Where is my data stored?</summary><p>On your Mac only, in <code>~/Library/Application Support/WhatsRusty</code>. There is no WhatsRusty server: the app talks to WhatsApp directly, and only checks <code>whatsapp.apps.balaj.me</code> for updates.</p></details>
+<details><summary>How do I install and update it?</summary><p>Download the ZIP, open it and move WhatsRusty to Applications. Updates arrive inside the app and are verified before they install.</p></details>
+<details><summary>Can it open at login?</summary><p>Yes. Choose Launch at Login in the WhatsRusty menu.</p></details>
+<details><summary>Is it free?</summary><p>Yes, free and open source. The code is on <a href="https://github.com/talhabalaj/whatsrusty">GitHub</a>.</p></details>
+</div></section>
+<section class="closing shell" aria-labelledby="closing-title"><img src="/icon.png" width="96" height="96" alt="" loading="lazy"><h2 id="closing-title">Say hi from your Mac.</h2><a class="button primary" href="/downloads/latest.zip" data-release-link><span data-release-label>Download for Mac</span></a><p class="release-detail" data-release-detail>Apple silicon · macOS 14 or later</p></section>
+</main>
+<footer class="site-footer shell"><span class="wordmark">WhatsRusty</span><a href="https://github.com/talhabalaj/whatsrusty">Source on GitHub</a><a href="/appcast.xml">Update feed</a><p class="legal">WhatsApp is a trademark of WhatsApp LLC. WhatsRusty is not affiliated with, endorsed by or sponsored by WhatsApp LLC or Meta Platforms, Inc.</p></footer>
+</body></html>

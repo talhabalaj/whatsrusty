@@ -5,3 +5,8 @@
 /dist
 /target-ui
 /target-*
+Local.xcconfig
+/build
+xcuserdata/
+*.xcarchive
+packaging/Sparkle/.swiftpm

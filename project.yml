@@ -1,0 +1,62 @@
+name: WhatsRusty
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  bundleIdPrefix: me.balaj
+settings:
+  base:
+    DEVELOPMENT_TEAM: W7TT249CUU
+    ENABLE_HARDENED_RUNTIME: YES
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+packages:
+  Sparkle:
+    path: packaging/Sparkle
+configFiles:
+  Debug: packaging/Signing.xcconfig
+  Release: packaging/Signing.xcconfig
+targets:
+  WhatsRusty:
+    type: application
+    platform: macOS
+    # The product reference, scheme and Cloud artifact all use the Release wrapper name.
+    productName: WhatsRusty
+    sources:
+      - path: packaging/icon/AppIcon.icon
+        buildPhase: resources
+    dependencies:
+      - package: Sparkle
+    preBuildScripts:
+      - name: Build Rust executable
+        script: /bin/bash "$SRCROOT/packaging/xcode-cargo-build.sh"
+        basedOnDependencyAnalysis: false
+        showEnvVars: false
+    settings:
+      base:
+        INFOPLIST_FILE: packaging/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: packaging/entitlements.plist
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        PRODUCT_NAME: WhatsRusty
+        PRODUCT_BUNDLE_IDENTIFIER: me.balaj.WhatsRusty
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        COMBINE_HIDPI_IMAGES: YES
+        DEAD_CODE_STRIPPING: NO
+        # The executable is produced by cargo, not clang/ld.
+        STRIP_INSTALLED_PRODUCT: NO
+        DEBUG_INFORMATION_FORMAT: dwarf
+      configs:
+        Debug:
+          PRODUCT_NAME: WhatsRusty Dev
+          PRODUCT_BUNDLE_IDENTIFIER: me.balaj.WhatsRusty.dev
+schemes:
+  WhatsRusty:
+    build:
+      targets:
+        WhatsRusty: all
+    archive:
+      config: Release

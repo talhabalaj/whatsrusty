@@ -1,0 +1,124 @@
+name: Release macOS app
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Existing release tag, for example v1.1.0'
+        required: true
+        type: string
+      cloud_build_id:
+        description: 'Optional completed Xcode Cloud build ID to resume publishing'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whatsrusty-app-production
+  cancel-in-progress: false
+
+jobs:
+  # Xcode Cloud only archives and notarizes; the Rust tests gate the release here.
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          toolchain="$(cat ci_scripts/rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --target aarch64-apple-darwin
+          rustup default "$toolchain"
+      - run: xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - run: cargo test --locked --workspace
+
+  cloud-build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+      XCODE_CLOUD_WORKFLOW_ID: ${{ vars.XCODE_CLOUD_WORKFLOW_ID }}
+      RELEASE_REF: ${{ inputs.ref || github.ref }}
+      CLOUD_BUILD_ID: ${{ inputs.cloud_build_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Require release tag and cloud configuration
+        run: |
+          if [[ "$RELEASE_REF" != refs/tags/* ]]; then RELEASE_REF="refs/tags/$RELEASE_REF"; fi
+          [[ "$RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo 'Use a numeric v1.2.3 release tag.' >&2; exit 1; }
+          test -n "$ASC_KEY_ID" && test -n "$ASC_ISSUER_ID" && test -n "$ASC_PRIVATE_KEY" || { echo 'Configure the ASC API credentials in repository secrets.' >&2; exit 1; }
+          test -n "$XCODE_CLOUD_WORKFLOW_ID" || { echo 'Configure XCODE_CLOUD_WORKFLOW_ID in repository variables.' >&2; exit 1; }
+          printf 'RELEASE_REF=%s\n' "$RELEASE_REF" >> "$GITHUB_ENV"
+      - name: Build and notarize in Xcode Cloud
+        run: |
+          commit_sha="$(git rev-parse HEAD)"
+          command=start
+          args=()
+          if [[ -n "$CLOUD_BUILD_ID" ]]; then command=download; args+=(--build-id "$CLOUD_BUILD_ID"); fi
+          node scripts/ci/xcode-cloud.mjs "$command" \
+            --workflow-id "$XCODE_CLOUD_WORKFLOW_ID" \
+            --ref "$RELEASE_REF" --sha "$commit_sha" \
+            --output build/ci/notarized-artifact.zip \
+            --result build/ci/xcode-cloud-result.json \
+            --timeout-seconds 7200 "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xcode-cloud-notarized
+          path: |
+            build/ci/notarized-artifact.zip
+            build/ci/xcode-cloud-result.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: cloud-build
+    permissions:
+      contents: write
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: xcode-cloud-notarized
+          path: build/ci
+      - name: Verify notarization and sign update files
+        run: bash scripts/ci/package-release.sh build/ci/notarized-artifact.zip "$PWD/build/ci/xcode-cloud-result.json" build/ci/release
+      - name: Publish verified archive and signed feed to GitHub Releases
+        run: node scripts/ci/publish-release.mjs build/ci/release
+      - name: Retain release and publication evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: whatsrusty-release
+          path: build/ci/release/
+          if-no-files-found: warn
+          retention-days: 30

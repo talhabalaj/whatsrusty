@@ -8,7 +8,7 @@
     is compromised (it parses untrusted media/protobufs from the network).
   - But it moves the data dir into ~/Library/Containers/<bundle id>/, which
     would orphan the existing session/messages DBs in
-    ~/Library/Application Support/WhatsApp GPUI, and every future feature
+    ~/Library/Application Support/WhatsRusty, and every future feature
     (file save/open, drag-and-drop) then needs explicit entitlements.
   Hardened runtime + notarization is all Gatekeeper requires for direct
   distribution, so sandboxing is deferred until a migration path exists.

@@ -1,0 +1,87 @@
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+  --blue: #0a84ff; --blue-press: #0071e3; --gray-bubble: #e9e9eb; --gray-text: #1d1d1f;
+  --notice: #fff8e6; --notice-line: #f0d999;
+  --ease: cubic-bezier(0.23, 1, 0.32, 1);
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #000000; --surface: #1c1c1e; --text: #f5f5f7; --muted: #98989d; --line: #38383a;
+    --gray-bubble: #3a3a3c; --gray-text: #f5f5f7; --notice: #2a2414; --notice-line: #5c4b1e; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+a { color: var(--blue); }
+h1, h2, h3 { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif; letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
+h1 { font-size: clamp(2.3rem, 5.5vw, 4rem); max-width: 15ch; margin: 0 auto; }
+h2 { font-size: clamp(1.8rem, 4vw, 2.6rem); }
+h3 { font-size: 1.15rem; letter-spacing: -0.01em; }
+code { font: 0.9em ui-monospace, "SF Mono", monospace; }
+.shell { width: min(1080px, calc(100% - 40px)); margin-inline: auto; }
+.skip-link { position: absolute; left: -999px; top: 8px; }
+.skip-link:focus { left: 8px; background: var(--surface); padding: 8px 12px; border-radius: 8px; z-index: 10; }
+
+.site-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+.wordmark { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; font-size: 1.05rem; color: var(--text); text-decoration: none; }
+.site-header nav { display: flex; gap: 22px; }
+.site-header nav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
+.site-header nav a:hover { color: var(--text); }
+
+.hero { text-align: center; padding: 40px 0 28px; }
+.thread { display: flex; flex-direction: column; gap: 4px; max-width: 420px; margin: 0 auto 44px; text-align: left; }
+.stamp { align-self: center; margin: 0 0 6px; font-size: 0.75rem; color: var(--muted); }
+.bubble { margin: 0; padding: 8px 14px; border-radius: 18px; max-width: 78%; width: fit-content; font-size: 1rem; line-height: 1.35;
+  opacity: 0; transform: translateY(8px) scale(0.98); animation: bubble-in 300ms var(--ease) forwards; }
+.bubble.in { background: var(--gray-bubble); color: var(--gray-text); border-bottom-left-radius: 6px; }
+.bubble.out { align-self: flex-end; background: var(--blue); color: #fff; }
+.bubble.out.tail { border-bottom-right-radius: 6px; }
+.bubble:nth-of-type(2) { animation-delay: 150ms; }
+.bubble:nth-of-type(3) { animation-delay: 700ms; }
+.bubble:nth-of-type(4) { animation-delay: 1000ms; }
+.receipt { align-self: flex-end; margin: 2px 4px 0; font-size: 0.72rem; color: var(--muted); opacity: 0; animation: bubble-in 300ms var(--ease) 1300ms forwards; }
+@keyframes bubble-in { to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .bubble, .receipt { animation-duration: 1ms; animation-delay: 0ms !important; transform: none; } }
+.lede { max-width: 38em; margin: 20px auto 0; color: var(--muted); font-size: 1.15rem; }
+.actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-top: 30px; }
+.button { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 999px; font-weight: 600; text-decoration: none;
+  color: var(--blue); background: var(--surface); border: 1px solid var(--line); transition: transform 160ms var(--ease), background 160ms; }
+.button.primary { background: var(--blue); color: #fff; border-color: transparent; }
+@media (hover: hover) and (pointer: fine) { .button.primary:hover { background: var(--blue-press); } }
+.button:active { transform: scale(0.97); }
+.button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.release-detail { margin: 12px 0 0; color: var(--muted); font-size: 0.85rem; }
+.notice { max-width: 44em; margin: 28px auto 0; padding: 12px 16px; border-radius: 14px; background: var(--notice); border: 1px solid var(--notice-line); font-size: 0.88rem; text-align: left; }
+
+.shot { margin-top: 36px; margin-bottom: 0; text-align: center; }
+.shot img { display: block; width: 100%; height: auto; border-radius: 14px; box-shadow: 0 30px 80px rgb(0 0 0 / 0.22), 0 0 0 1px rgb(0 0 0 / 0.08); }
+.shot figcaption { margin-top: 14px; font-size: 0.8rem; color: var(--muted); }
+
+.features { padding: 100px 0 40px; }
+.features h2 { text-align: center; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 40px; }
+.grid article { background: var(--surface); border-radius: 20px; padding: 24px; }
+.grid p { margin: 8px 0 0; color: var(--muted); font-size: 0.97rem; }
+
+.split { max-width: 640px; padding: 60px 0; }
+.split ol { padding-left: 1.2em; }
+.split li { margin: 8px 0; }
+.split p { color: var(--muted); }
+
+.faq { display: grid; grid-template-columns: 1fr 2fr; gap: 40px; padding: 60px 0; }
+@media (max-width: 760px) { .faq { grid-template-columns: 1fr; } }
+.questions details { border-bottom: 1px solid var(--line); padding: 16px 0; }
+.questions summary { cursor: pointer; font-weight: 600; list-style: none; }
+.questions summary::-webkit-details-marker { display: none; }
+.questions summary::after { content: "+"; float: right; color: var(--muted); }
+.questions details[open] summary::after { content: "−"; }
+.questions p { margin: 10px 0 0; color: var(--muted); }
+
+.closing { text-align: center; padding: 60px 0 90px; }
+.closing img { border-radius: 22px; }
+.closing h2 { margin: 18px 0 26px; }
+
+.site-footer { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; padding: 28px 0 40px; border-top: 1px solid var(--line); font-size: 0.85rem; }
+.site-footer a { color: var(--muted); }
+.legal { flex-basis: 100%; margin: 4px 0 0; color: var(--muted); font-size: 0.78rem; }

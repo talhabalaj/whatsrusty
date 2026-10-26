@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          toolchain="$(cat ci_scripts/rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --target aarch64-apple-darwin
+          rustup default "$toolchain"
+          rustc --version
+      # gpui compiles its Metal shaders at build time; newer Xcode ships the compiler separately.
+      - run: xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - run: cargo build --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+  tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci --prefix site
+      - run: node --test scripts/ci/*.test.mjs
+      - run: python3 -m unittest discover -s scripts/ci -p '*_test.py'
+      - run: node --experimental-strip-types --test site/tests/*.test.mjs
+      - run: npm run typecheck --prefix site
+      - run: npm run build --prefix site
+      - name: Check shell script syntax
+        run: |
+          for f in scripts/ci/package-release.sh packaging/*.sh; do bash -n "$f"; done
+          for f in ci_scripts/*.sh; do sh -n "$f"; done

@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
-# Build, sign (Developer ID + hardened runtime), notarize, staple, and package
-# "WhatsApp GPUI" as a DMG in dist/.
+# Local Developer ID release of WhatsRusty, outside the Xcode Cloud pipeline (see CI.md):
+# xcodebuild archive -> developer-id export -> verify -> notarize + staple app -> DMG -> notarize + staple DMG.
 #
-#   packaging/release.sh                 # build + sign + verify + dmg + notarize + staple
-#   packaging/release.sh --no-notarize   # build + sign + verify + dmg (local testing)
-#   packaging/release.sh --skip-build    # reuse the existing dist/*.app (re-signs it)
-#   packaging/release.sh --universal     # passed through to build-app.sh
+#   packaging/release.sh                 # full pipeline -> dist/WhatsRusty-<version>.dmg (+ .zip)
+#   packaging/release.sh --no-notarize   # sign, verify and package only (local testing)
 #
 # Env:
-#   SIGN_IDENTITY   codesign identity (default: SHA-1 of the first
-#                   "Developer ID Application" identity in the keychain)
-#   NOTARY_PROFILE  notarytool keychain profile (default: whatsapp-gpui-notary)
+#   SIGN_IDENTITY     codesign identity (default: SHA-1 of the first
+#                     "Developer ID Application ... (W7TT249CUU)" identity in the keychain)
+#   NOTARY_PROFILE    notarytool keychain profile (default: WhatsRusty)
+#   BUILD_NUMBER      CFBundleVersion (default: the project's CURRENT_PROJECT_VERSION)
+#   CARGO_TARGET_DIR  passed through to the cargo build phase (default: ./target)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="WhatsApp GPUI"
-APP="$ROOT/dist/$APP_NAME.app"
-ENTITLEMENTS="$ROOT/packaging/entitlements.plist"
-NOTARY_PROFILE="${NOTARY_PROFILE:-whatsapp-gpui-notary}"
+APP_NAME="WhatsRusty"
 TEAM_ID="W7TT249CUU"
+NOTARY_PROFILE="${NOTARY_PROFILE:-WhatsRusty}"
+BUILD_DIR="$ROOT/build/release"
+ARCHIVE="$BUILD_DIR/$APP_NAME.xcarchive"
+EXPORT="$BUILD_DIR/export"
+APP="$EXPORT/$APP_NAME.app"
 
 NOTARIZE=1
-BUILD=1
-BUILD_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --no-notarize) NOTARIZE=0 ;;
-    --skip-build) BUILD=0 ;;
-    --universal) BUILD_ARGS+=(--universal) ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -41,13 +39,8 @@ if [[ $NOTARIZE == 1 ]] && ! xcrun notarytool history --keychain-profile "$NOTAR
   cat >&2 <<EOF
 error: no notarytool keychain profile named "$NOTARY_PROFILE".
 
-Store credentials once (pick one), then re-run:
+Store an App Store Connect API key once (Users and Access > Integrations > Team Keys), then re-run:
 
-  # Apple ID + app-specific password (create at https://account.apple.com > Sign-In and Security)
-  xcrun notarytool store-credentials "$NOTARY_PROFILE" \\
-    --apple-id "<your Apple ID email>" --team-id "$TEAM_ID" --password "<app-specific password>"
-
-  # or an App Store Connect API key (Users and Access > Integrations > Team Keys)
   xcrun notarytool store-credentials "$NOTARY_PROFILE" \\
     --key ~/path/AuthKey_<KEYID>.p8 --key-id "<KEYID>" --issuer "<issuer UUID>"
 
@@ -62,33 +55,55 @@ if [[ -z ${SIGN_IDENTITY:-} ]]; then
   [[ -n $SIGN_IDENTITY ]] || { echo "error: no Developer ID Application identity for $TEAM_ID" >&2; exit 1; }
 fi
 
-if [[ $BUILD == 1 ]]; then
-  step "Building app bundle"
-  "$ROOT/packaging/build-app.sh" "${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}"
+if [[ ! -d WhatsRusty.xcodeproj ]] || [[ project.yml -nt WhatsRusty.xcodeproj/project.pbxproj ]]; then
+  step "Generating WhatsRusty.xcodeproj"
+  xcodegen generate
 fi
-[[ -d $APP ]] || { echo "error: $APP not found" >&2; exit 1; }
 
-VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-DMG="$ROOT/dist/WhatsApp-GPUI-$VERSION.dmg"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+overrides=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=$SIGN_IDENTITY" "DEVELOPMENT_TEAM=$TEAM_ID")
+[[ -z ${BUILD_NUMBER:-} ]] || overrides+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
 
-step "Signing app with $SIGN_IDENTITY"
-# Single-binary bundle, so no nested code to sign first.
-codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" "$APP"
+step "Archiving (Release, arm64)"
+xcodebuild -project WhatsRusty.xcodeproj -scheme WhatsRusty -configuration Release \
+  -destination 'generic/platform=macOS' -derivedDataPath "$BUILD_DIR/derived" \
+  -archivePath "$ARCHIVE" "${overrides[@]}" archive
 
-step "Verifying signature"
+step "Exporting with Developer ID"
+plutil -create xml1 "$BUILD_DIR/export-options.plist"
+plutil -insert method -string developer-id "$BUILD_DIR/export-options.plist"
+plutil -insert signingStyle -string manual "$BUILD_DIR/export-options.plist"
+plutil -insert teamID -string "$TEAM_ID" "$BUILD_DIR/export-options.plist"
+plutil -insert signingCertificate -string "$SIGN_IDENTITY" "$BUILD_DIR/export-options.plist"
+xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT" \
+  -exportOptionsPlist "$BUILD_DIR/export-options.plist"
+python3 -I "$ROOT/scripts/ci/cloud-app.py" "$EXPORT" >/dev/null
+
+step "Verifying signatures"
 codesign --verify --deep --strict --verbose=2 "$APP"
-codesign -dvv "$APP" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|Runtime Version|CodeDirectory)'
+codesign --display --verbose=4 "$APP" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|Runtime Version)'
+for nested in Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate \
+    Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app \
+    Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc \
+    Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc; do
+  details="$(codesign --display --verbose=4 "$APP/$nested" 2>&1)"
+  grep -q "^TeamIdentifier=$TEAM_ID\$" <<< "$details" && grep -q 'flags=.*runtime' <<< "$details" \
+    || { echo "error: $nested lacks the team signature or hardened runtime" >&2; exit 1; }
+done
+codesign --display --entitlements - --xml "$APP" > "$BUILD_DIR/entitlements.plist"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$BUILD_DIR/entitlements.plist")" == true ]]
+[[ "$(lipo -archs "$APP/Contents/MacOS/$APP_NAME")" == arm64 ]]
 # Before notarization spctl reports "Unnotarized Developer ID"; that's expected.
 spctl -a -vv -t exec "$APP" || true
 
 notarize() {
   step "Notarizing $(basename "$1")"
   xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json \
-    | tee /tmp/whatsapp-gpui-notary.json
+    | tee "$BUILD_DIR/notary.json"
   local id status
-  id="$(python3 -c 'import json; print(json.load(open("/tmp/whatsapp-gpui-notary.json"))["id"])')"
-  status="$(python3 -c 'import json; print(json.load(open("/tmp/whatsapp-gpui-notary.json"))["status"])')"
+  id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$BUILD_DIR/notary.json")"
+  status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$BUILD_DIR/notary.json")"
   if [[ $status != Accepted ]]; then
     xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" >&2 || true
     echo "error: notarization $status" >&2
@@ -96,16 +111,24 @@ notarize() {
   fi
 }
 
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
+mkdir -p "$ROOT/dist"
+ZIP="$ROOT/dist/$APP_NAME-$VERSION-$BUILD.zip"
+DMG="$ROOT/dist/$APP_NAME-$VERSION.dmg"
+
 if [[ $NOTARIZE == 1 ]]; then
   # Notarize + staple the .app first, so the copy inside the DMG carries its
   # own ticket and launches offline after being dragged to /Applications.
-  ZIP="$ROOT/dist/$APP_NAME.zip"
-  ditto -c -k --keepParent "$APP" "$ZIP"
-  notarize "$ZIP"
-  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$BUILD_DIR/notarize.zip"
+  notarize "$BUILD_DIR/notarize.zip"
   xcrun stapler staple "$APP"
+  xcrun stapler validate "$APP"
   spctl -a -vv -t exec "$APP"
 fi
+# Same layout as the Sparkle archive CI publishes.
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 step "Creating DMG"
 STAGE="$(mktemp -d)"
@@ -126,4 +149,5 @@ fi
 
 step "Done"
 echo "app: $APP"
+echo "zip: $ZIP"
 echo "dmg: $DMG"
