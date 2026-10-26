@@ -552,7 +552,8 @@ impl Composer {
             loop {
                 cx.background_executor().timer(Duration::from_millis(60)).await;
                 let go = this.update(cx, |this, cx| {
-                    let Some(rec) = &this.recording else { return false };
+                    let Some(rec) = &mut this.recording else { return false };
+                    rec.keep_alive();
                     if let Some(e) = rec.error() {
                         this.recording = None;
                         this.mic_notice = Some(format!("Couldn't record: {e}"));

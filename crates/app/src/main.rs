@@ -347,6 +347,8 @@ fn main() {
             force_appearance(&mode);
         }
         audio::AudioPlayer::init(cx);
+        // A prepared microphone engine, so the first voice note starts without a pause.
+        recorder::warm_up();
         text_replace::TextReplacements::init(cx);
         conversation::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", CloseWindow, None)]);
