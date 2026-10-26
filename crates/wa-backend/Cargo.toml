@@ -11,10 +11,8 @@ log.workspace = true
 whatsapp-rust = { version = "0.7", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
-# Voice notes: Ogg demux + pure-Rust Opus decoder (no system libs).
 ogg = "0.9"
-opus-decoder = "0.1"
-# Recording voice notes: libopus built from its vendored source (static, no system lib).
+# Voice notes in and out: libopus built from its vendored source (static, no system lib).
 opus-codec = "0.2"
 # Thumbnails/dimensions for sent photos.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

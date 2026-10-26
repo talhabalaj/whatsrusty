@@ -1,15 +1,18 @@
 //! Voice notes: Ogg/Opus (what WhatsApp sends) -> 16-bit PCM WAV the UI can play directly.
-//! Pure Rust (`ogg` + `opus-decoder`); other audio formats go through macOS `afconvert`.
-//! Recorded notes go the other way: PCM -> Ogg/Opus (libopus via `opus-codec`).
+//! `ogg` demuxing + libopus (via `opus-codec`) in both directions; other audio formats go
+//! through macOS `afconvert`.
 
 use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use opus_decoder::OpusDecoder;
 
 /// Opus always decodes at 48 kHz; RFC 7845 granule positions count 48 kHz samples.
 const RATE: u32 = 48_000;
+/// The longest Opus packet: 120 ms at 48 kHz.
+const MAX_FRAME: usize = 5760;
+/// Concealment length for a corrupt packet (20 ms; libopus wants a 2.5 ms multiple).
+const PLC_FRAME: usize = 960;
 
 /// Decoded PCM, interleaved.
 pub struct Pcm {
@@ -35,9 +38,11 @@ pub fn decode_ogg_opus(data: &[u8]) -> Result<Pcm> {
         bail!("unsupported channel count {channels}");
     }
     let pre_skip = u16::from_le_bytes([head[10], head[11]]) as usize;
-    let mut decoder = OpusDecoder::new(RATE, channels as usize).map_err(|e| anyhow::anyhow!("opus init: {e}"))?;
+    let layout = if channels == 1 { opus_codec::Channels::Mono } else { opus_codec::Channels::Stereo };
+    let mut decoder = opus_codec::Decoder::new(opus_codec::SampleRate::Hz48000, layout)
+        .map_err(|e| anyhow::anyhow!("opus init: {e}"))?;
     let ch = channels as usize;
-    let mut frame = vec![0i16; OpusDecoder::MAX_FRAME_SIZE_48K * ch];
+    let mut frame = vec![0i16; MAX_FRAME * ch];
     let mut samples: Vec<i16> = Vec::new();
     let mut last_granule: Option<u64> = None;
     let mut first_packet = true;
@@ -55,7 +60,7 @@ pub fn decode_ogg_opus(data: &[u8]) -> Result<Pcm> {
             Err(e) => {
                 // A corrupt packet: conceal it rather than drop the whole note.
                 log::debug!("opus packet: {e}");
-                decoder.decode(&[], &mut frame, false).unwrap_or(0)
+                decoder.decode(&[], &mut frame[..PLC_FRAME * ch], false).unwrap_or(0)
             }
         };
         samples.extend_from_slice(&frame[..n * ch]);
@@ -321,6 +326,18 @@ mod tests {
     /// application, 16 kbit/s, so SILK/hybrid frames):
     /// `ffmpeg -f lavfi -i sine=f=440:d=1 -ar 16000 -ac 1 -c:a libopus -application voip -b:a 16k sine_voip.ogg`
     const SINE_VOIP: &[u8] = include_bytes!("../tests/fixtures/sine_voip.ogg");
+    /// Music-mode (CELT) Opus at 64 kbit/s; the pure-Rust decoder used to panic on these.
+    const SINE_CELT: &[u8] = include_bytes!("../tests/fixtures/sine_celt.ogg");
+
+    #[test]
+    fn decodes_celt_opus() {
+        let pcm = decode_ogg_opus(SINE_CELT).unwrap();
+        assert_eq!((pcm.channels, pcm.sample_rate), (1, 48_000));
+        let n = pcm.samples.len();
+        assert!((18_000..=21_000).contains(&n), "unexpected length {n}");
+        let rms = (pcm.samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / n as f64).sqrt();
+        assert!(rms > 1000.0, "decoded audio is (near) silent: rms {rms}");
+    }
 
     #[test]
     fn decodes_voice_note_opus_to_wav() {

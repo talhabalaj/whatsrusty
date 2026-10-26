@@ -5460,15 +5460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opus-decoder"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15ae32c275dabb0cd2c863460bf349e9abc3568ba2abf0f9eb7b7d2edeeed07e"
-dependencies = [
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "ordered-float"
 version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8428,7 +8419,6 @@ dependencies = [
  "log",
  "ogg",
  "opus-codec",
- "opus-decoder",
  "qrcode",
  "rusqlite",
  "tokio",
