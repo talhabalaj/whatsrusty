@@ -20,3 +20,14 @@ refreshRelease();
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') refreshRelease();
 });
+
+// Feature-card animations only run while their card is visible.
+const stages = document.querySelectorAll('.stage');
+if ('IntersectionObserver' in window) {
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) entry.target.classList.toggle('on', entry.isIntersecting);
+  }, { threshold: 0.25 });
+  stages.forEach(stage => observer.observe(stage));
+} else {
+  stages.forEach(stage => stage.classList.add('on'));
+}

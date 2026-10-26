@@ -85,3 +85,109 @@ code { font: 0.9em ui-monospace, "SF Mono", monospace; }
 .site-footer { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; padding: 28px 0 40px; border-top: 1px solid var(--line); font-size: 0.85rem; }
 .site-footer a { color: var(--muted); }
 .legal { flex-basis: 100%; margin: 4px 0 0; color: var(--muted); font-size: 0.78rem; }
+
+/* Feature card animations: CSS only; they run while the card is on screen (app.js toggles .on). */
+.stage { position: relative; height: 150px; margin: -8px -8px 20px; border-radius: 14px; overflow: hidden;
+  background: var(--bg); display: flex; flex-direction: column; justify-content: center; padding: 14px 18px; font-size: 13px; line-height: 1.3; }
+.stage, .stage * { animation-play-state: paused !important; }
+.stage.on, .stage.on * { animation-play-state: running !important; }
+@keyframes show-a { 0%, 6% { opacity: 0; transform: translateY(8px) scale(.96); } 12%, 90% { opacity: 1; transform: none; } 96%, 100% { opacity: 0; transform: none; } }
+@keyframes show-b { 0%, 24% { opacity: 0; transform: translateY(8px) scale(.96); } 30%, 90% { opacity: 1; transform: none; } 96%, 100% { opacity: 0; transform: none; } }
+@keyframes show-c { 0%, 42% { opacity: 0; transform: translateY(8px) scale(.96); } 48%, 90% { opacity: 1; transform: none; } 96%, 100% { opacity: 0; transform: none; } }
+@keyframes show-d { 0%, 60% { opacity: 0; transform: translateY(8px) scale(.96); } 66%, 90% { opacity: 1; transform: none; } 96%, 100% { opacity: 0; transform: none; } }
+.a1 { animation: show-a var(--loop, 6s) var(--ease) infinite both; }
+.a2 { animation: show-b var(--loop, 6s) var(--ease) infinite both; }
+.a3 { animation: show-c var(--loop, 6s) var(--ease) infinite both; }
+.a4 { animation: show-d var(--loop, 6s) var(--ease) infinite both; }
+
+/* Messages: bubbles, a tapback, a read receipt. */
+.s-chat { gap: 5px; }
+.s-chat .m { position: relative; max-width: 70%; padding: 6px 11px; border-radius: 16px; }
+.s-chat .in { align-self: flex-start; background: var(--gray-bubble); color: var(--gray-text); border-bottom-left-radius: 5px; margin-top: 8px; }
+.s-chat .out { align-self: flex-end; background: var(--blue); color: #fff; border-bottom-right-radius: 5px; }
+.s-chat .tap { position: absolute; top: -12px; right: -14px; font-size: 11px; padding: 3px 5px; border-radius: 999px; background: var(--surface);
+  box-shadow: 0 0 0 2px var(--bg); animation: tap-pop 6s var(--ease) infinite both; }
+@keyframes tap-pop { 0%, 52% { opacity: 0; transform: scale(.2); } 57% { opacity: 1; transform: scale(1.25); } 61%, 90% { opacity: 1; transform: scale(1); } 96%, 100% { opacity: 0; } }
+.s-chat .read { align-self: flex-end; font-size: 10.5px; color: var(--muted); }
+
+/* Native and fast: a list scrolling at a steady clip. */
+.s-fast { padding: 0; }
+.s-fast .rows { display: flex; flex-direction: column; gap: 10px; padding: 12px 18px; animation: rows 3.2s linear infinite; }
+.s-fast .rows i { display: block; height: 14px; width: var(--w); border-radius: 7px; background: var(--gray-bubble); }
+.s-fast .rows i:nth-child(3n) { align-self: flex-end; background: var(--blue); opacity: .85; }
+@keyframes rows { to { transform: translateY(-50%); } }
+.s-fast::after { content: ""; position: absolute; inset: 0; background: linear-gradient(var(--bg), transparent 30%, transparent 70%, var(--bg)); }
+.s-fast .fps { position: absolute; z-index: 1; right: 12px; top: 12px; display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px;
+  border-radius: 999px; background: var(--surface); font: 600 11px/1 ui-monospace, SFMono-Regular, monospace; }
+.s-fast .fps b { width: 7px; height: 7px; border-radius: 50%; background: #30d158; animation: blink 1.2s ease-in-out infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+
+/* Phone stays in charge: QR scan, then encrypted packets to the Mac. */
+.s-link { flex-direction: row; align-items: center; justify-content: center; gap: 0; }
+.s-link .phone { position: relative; width: 52px; height: 96px; border-radius: 12px; border: 2px solid var(--muted); display: grid; place-items: center; overflow: hidden; }
+.s-link .qr { width: 32px; fill: var(--text); }
+.s-link .scan { position: absolute; left: 4px; right: 4px; height: 2px; background: var(--blue); box-shadow: 0 0 8px var(--blue); animation: scan 5s ease-in-out infinite; }
+@keyframes scan { 0% { top: 20%; opacity: 0; } 5% { opacity: 1; } 30% { top: 78%; } 40% { top: 20%; opacity: 1; } 45%, 100% { opacity: 0; top: 20%; } }
+.s-link .wire { position: relative; width: 110px; height: 2px; margin: 0 6px; background: repeating-linear-gradient(90deg, var(--line) 0 6px, transparent 6px 10px); }
+.s-link .wire b { position: absolute; top: -3px; left: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--blue); opacity: 0; animation: packet 5s linear infinite; }
+.s-link .wire b:nth-child(2) { animation-delay: .35s; } .s-link .wire b:nth-child(3) { animation-delay: .7s; }
+@keyframes packet { 0%, 45% { left: 0; opacity: 0; } 48% { opacity: 1; } 80% { left: calc(100% - 8px); opacity: 1; } 84%, 100% { left: calc(100% - 8px); opacity: 0; } }
+.s-link .lock { position: absolute; left: 50%; top: -24px; transform: translateX(-50%); font-size: 15px; animation: show-c 5s var(--ease) infinite both; }
+.s-link .mac { width: 92px; height: 60px; border-radius: 6px; border: 2px solid var(--muted); border-bottom-width: 6px; position: relative; padding: 8px; }
+.s-link .mac span { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--gray-bubble) 0 32%, transparent 32%); animation: glow 5s var(--ease) infinite; }
+@keyframes glow { 0%, 78% { box-shadow: none; } 84%, 94% { box-shadow: inset 0 0 0 2px var(--blue); } 100% { box-shadow: none; } }
+
+/* All your messages: photo, live voice note, document, poll. */
+.s-kinds { --loop: 7s; gap: 6px; align-items: flex-start; }
+.s-kinds .k { border-radius: 14px; }
+.s-kinds .photo { position: absolute; right: 18px; top: 18px; width: 74px; height: 74px; background: linear-gradient(135deg, #ff9f0a, #ff375f 55%, #5e5ce6); }
+.s-kinds .voice { display: flex; align-items: center; gap: 3px; height: 30px; padding: 0 12px; background: var(--blue); color: #fff; }
+.s-kinds .voice .play { font-size: 10px; margin-right: 4px; }
+.s-kinds .voice i { width: 3px; height: 18px; border-radius: 2px; background: #fff; transform: scaleY(var(--h)); animation: wave .9s ease-in-out var(--d) infinite alternate; }
+@keyframes wave { to { transform: scaleY(calc(var(--h) * .35)); } }
+.s-kinds .doc { display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; background: var(--gray-bubble); color: var(--gray-text); }
+.s-kinds .pdf { padding: 6px 5px; border-radius: 6px; background: #ff453a; color: #fff; font-size: 9px; font-weight: 700; }
+.s-kinds .poll { display: flex; align-items: center; gap: 8px; width: 150px; padding: 6px 12px; background: var(--gray-bubble); color: var(--gray-text); }
+.s-kinds .poll b { flex: 1; height: 6px; border-radius: 3px; background: linear-gradient(var(--blue), var(--blue)) no-repeat 0 0 / 0 100%, var(--line);
+  animation: fill 7s var(--ease) infinite; }
+@keyframes fill { 0%, 66% { background-size: 0 100%, auto; } 80%, 100% { background-size: 70% 100%, auto; } }
+
+/* Notifications: banner slides in, Dock icon bounces and gets a badge. */
+.s-notify { justify-content: space-between; padding: 12px; }
+.s-notify .banner { align-self: flex-end; display: flex; gap: 9px; align-items: center; width: 190px; padding: 9px 11px; border-radius: 14px;
+  background: var(--surface); box-shadow: 0 6px 20px rgb(0 0 0 / .18); animation: banner 5s var(--ease) infinite; }
+.s-notify .banner img { width: 26px; height: 26px; }
+.s-notify .banner div { display: flex; flex-direction: column; font-size: 12px; }
+.s-notify .banner span { color: var(--muted); }
+@keyframes banner { 0%, 8% { transform: translateX(120%); opacity: 0; } 16%, 70% { transform: none; opacity: 1; } 80%, 100% { transform: translateX(120%); opacity: 0; } }
+.s-notify .dock { align-self: center; display: flex; gap: 8px; padding: 6px 9px; border-radius: 14px; background: var(--surface); }
+.s-notify .dock i, .s-notify .dock .app img { display: block; width: 28px; height: 28px; border-radius: 7px; background: var(--gray-bubble); }
+.s-notify .dock .app { position: relative; animation: bounce 5s ease-out infinite; }
+.s-notify .dock em { position: absolute; top: -5px; right: -6px; min-width: 16px; height: 16px; border-radius: 8px; background: #ff3b30; color: #fff;
+  font: 700 10px/16px -apple-system, system-ui, sans-serif; text-align: center; font-style: normal; animation: badge 5s var(--ease) infinite both; }
+@keyframes badge { 0%, 18% { opacity: 0; transform: scale(.2); } 23% { opacity: 1; transform: scale(1.3); } 27%, 90% { opacity: 1; transform: scale(1); } 96%, 100% { opacity: 0; } }
+@keyframes bounce { 0%, 14%, 34%, 100% { transform: none; } 20% { transform: translateY(-12px); } 27% { transform: translateY(-5px); } }
+
+/* Signed and up to date: download, verify, sealed. */
+.s-update { --loop: 6s; align-items: center; }
+.s-update .dialog { position: relative; display: flex; gap: 12px; align-items: center; width: 250px; padding: 12px 14px; border-radius: 14px; background: var(--surface); }
+.s-update .dialog > img { width: 40px; height: 40px; }
+.s-update .txt { flex: 1; display: grid; gap: 3px; font-size: 12px; }
+.s-update .t1, .s-update .t2 { grid-area: 2 / 1; color: var(--muted); }
+.s-update .t1 { animation: swap-out 6s infinite; } .s-update .t2 { animation: swap-in 6s infinite; }
+@keyframes swap-out { 0%, 55% { opacity: 1; } 60%, 100% { opacity: 0; } }
+@keyframes swap-in { 0%, 58% { opacity: 0; } 63%, 92% { opacity: 1; } 97%, 100% { opacity: 0; } }
+.s-update .bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.s-update .bar b { display: block; height: 100%; width: 100%; background: var(--blue); transform-origin: left; animation: progress 6s var(--ease) infinite; }
+@keyframes progress { 0%, 5% { transform: scaleX(0); } 52%, 92% { transform: scaleX(1); } 97%, 100% { transform: scaleX(0); } }
+.s-update .seal { position: absolute; right: -9px; top: -9px; width: 26px; fill: #30d158; stroke: #fff; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round;
+  animation: tap-pop 6s var(--ease) infinite both; }
+.s-update .seal path { fill: none; stroke-dasharray: 16; animation: draw 6s ease-out infinite; }
+@keyframes draw { 0%, 60% { stroke-dashoffset: 16; } 68%, 100% { stroke-dashoffset: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .stage *, .stage *::before, .stage *::after { animation: none !important; }
+  .s-notify .banner, .s-update .seal path { transform: none; stroke-dashoffset: 0; }
+  .s-update .t1 { opacity: 0; } .s-update .bar b { transform: none; }
+  .s-link .wire b { display: none; } .s-link .scan { top: 50%; }
+}
