@@ -31,3 +31,6 @@ if ('IntersectionObserver' in window) {
 } else {
   stages.forEach(stage => stage.classList.add('on'));
 }
+
+const demo = document.querySelector('[data-demo]');
+if (demo) import('./demo.js').then(({ startDemo }) => startDemo(demo));
