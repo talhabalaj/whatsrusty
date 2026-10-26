@@ -19,8 +19,8 @@ use crate::extract::{
 };
 use crate::stickers::StickerSync;
 use crate::types::{
-    ChatMessage, ChatSummary, ContactCard, DeliveryStatus, LocationInfo, MediaState, MessageBody, MessagePreview,
-    PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
+    ChatMessage, ChatSummary, ContactCard, DeliveryStatus, LocationInfo, MediaState, Mention, MessageBody,
+    MessagePreview, PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
 mod chat_list;
@@ -373,6 +373,31 @@ pub struct Store {
     /// LID chats merged into PN chats (`(lid, pn)`) by committed changes, for the backend
     /// to announce. See [`Store::take_merges`].
     merges: std::cell::RefCell<Vec<(String, String)>>,
+    /// My own JIDs (PN, LID), so mentions of me read "You".
+    own: Vec<String>,
+}
+
+/// The `@<digits>` tokens of a text (at least 5 digits, not inside a word or e-mail).
+pub fn mention_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices('@').filter_map(move |(i, _)| {
+        let before_ok = text[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let rest = &text[i + 1..];
+        let len = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let after_ok = !rest[len..].starts_with(|c: char| c.is_alphanumeric());
+        (before_ok && after_ok && len >= 5).then(|| &rest[..len])
+    })
+}
+
+/// The text of a body that can carry mentions (text, captions).
+fn mention_text(body: &MessageBody) -> Option<&str> {
+    match body {
+        MessageBody::Text(t) => Some(t.as_str()),
+        MessageBody::Image(i) => i.caption.as_deref(),
+        MessageBody::Video(v) => v.caption.as_deref(),
+        MessageBody::Document(d) => d.caption.as_deref(),
+        _ => None,
+    }
+    .filter(|t| t.contains('@'))
 }
 
 /// A message removed by [`Store::purge_expired`].
@@ -747,7 +772,7 @@ impl Store {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA secure_delete = ON;")?;
         conn.execute_batch(SCHEMA)?;
         let from_version = Self::migrate(&conn)?;
-        let store = Self { conn, path, merges: Default::default() };
+        let store = Self { conn, path, merges: Default::default(), own: Vec::new() };
         if from_version < 4 {
             store.forget_view_once_media()?;
         }
@@ -2041,6 +2066,10 @@ impl Store {
             None => None,
         };
         let edited = r.edit_ts.is_some() && !r.revoked;
+        let mentions = match mention_text(&r.body) {
+            Some(text) if !r.revoked => self.resolve_mentions(text)?,
+            _ => Vec::new(),
+        };
         Ok(ChatMessage {
             id: r.id,
             chat_jid: r.chat_jid,
@@ -2055,7 +2084,51 @@ impl Store {
             status: r.status,
             forwarded: r.forwarded,
             deleted: r.revoked,
+            mentions,
         })
+    }
+
+    pub fn set_own_jids(&mut self, jids: Vec<String>) {
+        self.own = jids;
+    }
+
+    /// `text` with known `@<digits>` shown as `@Name` (chat list, notifications).
+    pub fn with_mention_names(&self, text: String) -> Result<String> {
+        if !text.contains('@') {
+            return Ok(text);
+        }
+        let mut sorted = self.resolve_mentions(&text)?;
+        // Longest first, so one number that prefixes another can't clobber it.
+        sorted.sort_by_key(|m| std::cmp::Reverse(m.user.len()));
+        Ok(sorted.iter().fold(text, |t, m| t.replace(&format!("@{}", m.user), &format!("@{}", m.name))))
+    }
+
+    /// Who the `@<digits>` tokens in `text` are: each is tried as a phone number and as
+    /// a LID (messages carry the digits of whichever the group is addressed by). Tokens
+    /// that match nobody known are left out (shown as typed).
+    pub fn resolve_mentions(&self, text: &str) -> Result<Vec<Mention>> {
+        let mut out: Vec<Mention> = Vec::new();
+        for user in mention_tokens(text) {
+            if out.iter().any(|m| m.user == user) {
+                continue;
+            }
+            for jid in [format!("{user}@s.whatsapp.net"), format!("{user}@lid")] {
+                let canonical = self.canonical(&jid)?;
+                let name = if self.own.iter().any(|o| *o == jid || *o == canonical) {
+                    Some("You".to_owned())
+                } else {
+                    match self.contact_name(&canonical)? {
+                        Some(n) => Some(n),
+                        None => self.contact_name(&jid)?,
+                    }
+                };
+                if let Some(name) = name {
+                    out.push(Mention { user: user.to_owned(), jid, name });
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Who wrote the quoted message: the stored original if we have it (most reliable),
@@ -2114,7 +2187,7 @@ impl Store {
             let display = chat_display_name(&jid, is_group, name, full, push);
             let last_message = match last {
                 Some(m) => Some(MessagePreview {
-                    text: preview_text(&m.body).into_owned(),
+                    text: self.with_mention_names(preview_text(&m.body).into_owned())?,
                     timestamp: m.ts,
                     from_me: m.from_me,
                     sender_name: if is_group && !m.from_me {
@@ -2403,6 +2476,37 @@ mod tests {
             quoted: None,
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn mention_tokens_need_digits_on_their_own() {
+        let tokens: Vec<&str> = mention_tokens("@15550000001 hi @900000000002, mail a@123456 or @12 @12345x (@15550000002)").collect();
+        assert_eq!(tokens, ["15550000001", "900000000002", "15550000002"]);
+    }
+
+    /// `@<digits>` resolve through contacts, LID aliases and my own JIDs, on every read.
+    #[test]
+    fn messages_carry_resolved_mentions() {
+        let mut s = store();
+        s.set_contact_name(ALICE, "Alice").unwrap();
+        s.add_alias(BOB_LID, BOB).unwrap();
+        s.set_push_name(BOB, "Bob").unwrap();
+        s.set_own_jids(vec![ME.into()]);
+        let text = "@15550000001 and @900000000002 meet @15550000009, not @15550000777";
+        s.insert_message(&msg(GROUP, "M1", ALICE, text, 10), false).unwrap();
+        let m = s.get_message(GROUP, "M1").unwrap().unwrap();
+        let got: Vec<(&str, &str, &str)> = m.mentions.iter().map(|m| (m.user.as_str(), m.jid.as_str(), m.name.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("15550000001", ALICE, "Alice"),
+                ("900000000002", BOB_LID, "Bob"),
+                ("15550000009", ME, "You"),
+            ]
+        );
+        s.insert_message(&msg(GROUP, "M2", ALICE, "no mentions", 11), false).unwrap();
+        assert!(s.get_message(GROUP, "M2").unwrap().unwrap().mentions.is_empty());
+        assert_eq!(s.with_mention_names("hi @15550000001 @15550000777".into()).unwrap(), "hi @Alice @15550000777");
     }
 
     fn store() -> Store {

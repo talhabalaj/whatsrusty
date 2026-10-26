@@ -212,6 +212,17 @@ pub struct ChatMessage {
     pub forwarded: bool,
     /// Deleted for everyone: `body` is only a placeholder ("This message was deleted").
     pub deleted: bool,
+    /// People @mentioned in the text / caption (`@<digits>` tokens), resolved to names.
+    pub mentions: Vec<Mention>,
+}
+
+/// An `@<digits>` token in a message's text and who it stands for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mention {
+    /// The digits after the `@`, as they appear in the text.
+    pub user: String,
+    pub jid: String,
+    pub name: String,
 }
 
 /// One message of a chat matching [`Command::SearchMessages`].
@@ -352,7 +363,9 @@ pub enum Command {
     /// `client_id` becomes the WhatsApp message id if it is 8-64 ASCII alphanumerics
     /// (use [`crate::new_message_id`]); otherwise the backend generates one, and the
     /// `MessageUpserted` carries it.
-    SendText { chat_jid: String, text: String, client_id: String, reply_to: Option<String> },
+    ///
+    /// `mentions`: JIDs @mentioned in `text`, which carries them as `@<digits of the JID>`.
+    SendText { chat_jid: String, text: String, client_id: String, reply_to: Option<String>, mentions: Vec<String> },
     /// Send a photo from disk (JPEG/PNG/HEIC/WebP). Same lifecycle as `SendText`.
     SendImage { chat_jid: String, path: PathBuf, caption: Option<String>, client_id: String, reply_to: Option<String> },
     /// Download an image/voice/video/document/sticker message's media; the backend emits `MessageUpserted`
@@ -414,6 +427,13 @@ pub enum Command {
     /// Make sure a 1:1 chat exists in the chat list (New Message to someone without a
     /// chat yet); a `Chats` update follows.
     OpenChat { jid: String },
+    /// Send any file: videos (MP4, or converted to it) as videos, everything else as a
+    /// document. Same lifecycle as `SendText`; the file is prepared and uploaded in order
+    /// with other sends (the Pending message is shown right away and updated once its
+    /// thumbnail is ready).
+    SendFile { chat_jid: String, path: PathBuf, caption: Option<String>, client_id: String, reply_to: Option<String> },
+    /// Send a recorded voice note (mono PCM), encoded as a WhatsApp PTT (Ogg/Opus).
+    SendVoice { chat_jid: String, samples: Vec<i16>, sample_rate: u32, client_id: String, reply_to: Option<String> },
 }
 
 /// Someone I can start a chat with (New Message picker).

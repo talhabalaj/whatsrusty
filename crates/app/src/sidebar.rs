@@ -552,8 +552,12 @@ fn chat_row(
 
 /// Test hook: WA_DEBUG_UI="wait 1500; click 300,26; rclick 120,200; key down; type abc"
 /// drives the window with real mouse/key events (window coordinates in points).
+/// `drag x,y a.png|b.pdf` / `drop x,y` simulate dragging files from Finder.
+/// A reopened window (see `WA_DEBUG_REOPEN`) runs `WA_DEBUG_UI_REOPENED` instead.
 fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
-    let Ok(script) = std::env::var("WA_DEBUG_UI") else { return };
+    static WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let var = if WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 { "WA_DEBUG_UI" } else { "WA_DEBUG_UI_REOPENED" };
+    let Ok(script) = std::env::var(var) else { return };
     cx.spawn_in(window, async move |_, cx| {
         cx.background_executor().timer(Duration::from_millis(2000)).await;
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -595,6 +599,22 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                         PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers, click_count: 1 }),
                         cx,
                     );
+                }
+                "drag" | "drop" => {
+                    let (at, files) = arg.split_once(' ').unwrap_or((arg, ""));
+                    let Some((x, y)) = at.split_once(',') else { return };
+                    let position = point(px(x.trim().parse().unwrap_or(0.)), px(y.trim().parse().unwrap_or(0.)));
+                    let event = if verb == "drag" {
+                        let paths: Vec<std::path::PathBuf> = files.split('|').filter(|p| !p.is_empty()).map(Into::into).collect();
+                        window.dispatch_event(
+                            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths: ExternalPaths(paths.into()) }),
+                            cx,
+                        );
+                        FileDropEvent::Pending { position }
+                    } else {
+                        FileDropEvent::Submit { position }
+                    };
+                    window.dispatch_event(PlatformInput::FileDrop(event), cx);
                 }
                 "key" => {
                     if let Ok(ks) = Keystroke::parse(arg) {

@@ -28,6 +28,23 @@ pub enum Change {
     Updated,
 }
 
+/// What a chat's composer holds while it's not on screen. Kept here rather than in the
+/// composer so it survives closing the window.
+#[derive(Default, Clone, PartialEq)]
+pub struct Draft {
+    pub text: String,
+    /// Files waiting to be sent with the next message (pasted, dropped or chosen with +).
+    pub attachments: Vec<PathBuf>,
+    /// `@Name`s inserted into `text` and who they are: (name, JID).
+    pub mentions: Vec<(String, String)>,
+}
+
+impl Draft {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.attachments.is_empty()
+    }
+}
+
 /// Paging state of one chat's transcript.
 #[derive(Default, Clone, Copy)]
 pub struct History {
@@ -94,6 +111,8 @@ pub struct Store {
     pub phone_lookups: HashMap<String, Result<Option<String>, String>>,
     /// The user closed the conversation (Mark as Unread on it): don't auto-select another.
     stay_deselected: bool,
+    /// Unsent text and attachments per chat.
+    pub drafts: HashMap<String, Draft>,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
@@ -141,6 +160,7 @@ impl Store {
             contacts: Vec::new(),
             phone_lookups: HashMap::new(),
             stay_deselected: false,
+            drafts: HashMap::new(),
         }
     }
 
@@ -396,6 +416,9 @@ impl Store {
         if let Some(a) = self.avatars.remove(&from) {
             self.avatars.entry(to.clone()).or_insert(a);
         }
+        if let Some(d) = self.drafts.remove(&from) {
+            self.drafts.entry(to.clone()).or_insert(d);
+        }
         if was_loaded {
             self.requested.insert(to.clone());
             self.messages.entry(to.clone()).or_default();
@@ -430,6 +453,7 @@ impl Store {
         self.profiles.clear();
         self.stickers.clear();
         self.just_sent.clear();
+        self.drafts.clear();
         self.sync_progress = None;
         crate::audio::AudioPlayer::stop(cx);
         cx.emit(StoreEvent::AccountReset);
@@ -460,18 +484,66 @@ impl Store {
         self.chats.iter().find(|c| c.jid == jid)
     }
 
-    pub fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
+    /// `mentions`: JIDs whose `@<digits>` are in `text`.
+    pub fn send_text(&mut self, text: String, mentions: Vec<String>, cx: &mut Context<Self>) {
         let Some(chat_jid) = self.selected.clone() else { return };
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
+        let client_id = self.new_sent_id();
+        let reply_to = self.replying_to.take().map(|m| m.id);
+        self.send(Command::SendText { chat_jid, text, client_id, reply_to, mentions });
+        cx.notify();
+    }
+
+    /// Any file but photos (videos, documents); see [`Command::SendFile`].
+    pub fn send_file(&mut self, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
+        let Some(chat_jid) = self.selected.clone() else { return };
+        let client_id = self.new_sent_id();
+        let reply_to = self.replying_to.take().map(|m| m.id);
+        self.send(Command::SendFile { chat_jid, path, caption, client_id, reply_to });
+        cx.notify();
+    }
+
+    /// A recorded voice note (mono PCM).
+    pub fn send_voice(&mut self, samples: Vec<i16>, sample_rate: u32, cx: &mut Context<Self>) {
+        let Some(chat_jid) = self.selected.clone() else { return };
+        let client_id = self.new_sent_id();
+        let reply_to = self.replying_to.take().map(|m| m.id);
+        self.send(Command::SendVoice { chat_jid, samples, sample_rate, client_id, reply_to });
+        cx.notify();
+    }
+
+    /// An id for a message sent from this window (animated in when it arrives).
+    fn new_sent_id(&mut self) -> String {
         let client_id = wa_backend::new_message_id();
         self.just_sent.retain(|_, t| t.elapsed() < Duration::from_secs(5));
         self.just_sent.insert(client_id.clone(), Instant::now());
-        let reply_to = self.replying_to.take().map(|m| m.id);
-        self.send(Command::SendText { chat_jid, text, client_id, reply_to });
-        cx.notify();
+        client_id
+    }
+
+    /// Store (or drop, when empty) the composer's draft for `chat`. No notify: only the
+    /// composer reads it.
+    pub fn save_draft(&mut self, chat: &str, draft: Draft) {
+        if draft.is_empty() {
+            self.drafts.remove(chat);
+        } else {
+            self.drafts.insert(chat.to_string(), draft);
+        }
+    }
+
+    /// Members of a group I can @mention (not me), loading them once if needed.
+    pub fn mentionable(&mut self, jid: &str, cx: &mut Context<Self>) -> Vec<wa_backend::Participant> {
+        match self.profiles.get(jid) {
+            Some(p) => p.participants.iter().filter(|p| !p.is_me).cloned().collect(),
+            None => {
+                if !self.profile_loading(jid) {
+                    self.request_profile(jid, cx);
+                }
+                Vec::new()
+            }
+        }
     }
 
     pub fn request_stickers(&self) {
@@ -489,9 +561,7 @@ impl Store {
 
     pub fn send_image(&mut self, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
         let Some(chat_jid) = self.selected.clone() else { return };
-        let client_id = wa_backend::new_message_id();
-        self.just_sent.retain(|_, t| t.elapsed() < Duration::from_secs(5));
-        self.just_sent.insert(client_id.clone(), Instant::now());
+        let client_id = self.new_sent_id();
         let reply_to = self.replying_to.take().map(|m| m.id);
         self.send(Command::SendImage { chat_jid, path, caption, client_id, reply_to });
         cx.notify();

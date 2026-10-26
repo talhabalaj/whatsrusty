@@ -23,6 +23,8 @@ const CHEVRON_UP: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 const CHEVRON_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4.5 9 L12 16.5 L19.5 9" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 const ARROW_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 19.5 L5.5 13 M12 19.5 L18.5 13 M12 19.2 V4.5" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 const MAGNIFIER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="black" stroke-width="2.2"/><path d="M15 15 L20 20" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round"/></svg>"#;
+const MIC: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="8.6" y="3" width="6.8" height="11.6" rx="3.4" fill="black"/><path d="M5.6 11 A6.4 6.4 0 0 0 18.4 11 M12 17.6 V20.6" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>"#;
+const FILM: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="3.5" y="6" width="12" height="12" rx="2.6" fill="none" stroke="black" stroke-width="1.9"/><path d="M15.5 10.6 L20.5 7.8 V16.2 L15.5 13.4" fill="none" stroke="black" stroke-width="1.9" stroke-linejoin="round"/></svg>"#;
 
 #[derive(Clone, Copy)]
 pub enum Glyph {
@@ -44,6 +46,8 @@ pub enum Glyph {
     ChevronDown,
     ArrowDown,
     Magnifier,
+    Mic,
+    Film,
 }
 
 pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
@@ -66,6 +70,8 @@ pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
         Glyph::ChevronDown => CHEVRON_DOWN,
         Glyph::ArrowDown => ARROW_DOWN,
         Glyph::Magnifier => MAGNIFIER,
+        Glyph::Mic => MIC,
+        Glyph::Film => FILM,
     };
     Icon::default().data(svg.as_bytes()).size(px(size)).text_color(color)
 }

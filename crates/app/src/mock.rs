@@ -33,11 +33,36 @@ fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
+/// The hiking group's members: (name, JID).
+const MEMBERS: &[(&str, &str)] = &[
+    ("Omar", "15551110011@s.whatsapp.net"),
+    ("Sara Ali", "15551110012@s.whatsapp.net"),
+    ("Ali Raza", "15551110013@s.whatsapp.net"),
+];
+
+fn member_jid(name: &str) -> String {
+    MEMBERS
+        .iter()
+        .find(|(n, _)| n.split(' ').next() == Some(name) || *n == name)
+        .map_or_else(|| format!("{name}@s.whatsapp.net"), |(_, j)| j.to_string())
+}
+
+/// What the real store does: `@<digits>` of people we know, with their names.
+fn mock_mentions(text: &str) -> Vec<Mention> {
+    let known = MEMBERS.iter().copied().chain([("You", ME)]);
+    known
+        .filter_map(|(name, jid)| {
+            let user = jid.split('@').next()?;
+            text.contains(&format!("@{user}")).then(|| Mention { user: user.into(), jid: jid.into(), name: name.into() })
+        })
+        .collect()
+}
+
 fn msg(chat: &str, id: usize, from_me: bool, sender: Option<&str>, text: &str, ts: i64) -> ChatMessage {
     ChatMessage {
         id: format!("{chat}-{id}"),
         chat_jid: chat.into(),
-        sender_jid: if from_me { ME.into() } else { sender.map_or(chat.into(), |s| format!("{s}@s.whatsapp.net")) },
+        sender_jid: if from_me { ME.into() } else { sender.map_or(chat.into(), member_jid) },
         sender_name: sender.map(String::from),
         from_me,
         body: MessageBody::Text(text.into()),
@@ -48,6 +73,7 @@ fn msg(chat: &str, id: usize, from_me: bool, sender: Option<&str>, text: &str, t
         edited: false,
         forwarded: false,
         deleted: false,
+        mentions: mock_mentions(text),
     }
 }
 
@@ -75,6 +101,7 @@ fn seed() -> Fake {
             ("Works for me, I'll bring snacks", true, None, -d - 3 * h + 300),
             ("Don't forget sunscreen this time 😅", false, Some("Omar"), -d - 2 * h),
             ("That was ONE time", false, Some("Sara"), -d - 2 * h + 60),
+            ("@15551110011 you're bringing the map, right? cc @15550000000", false, Some("Sara"), -d - 2 * h + 120),
         ]),
         ("15551110003@s.whatsapp.net", "Bilal", false, false, &[
             ("Did you push the fix?", false, None, -2 * d),
@@ -102,7 +129,7 @@ fn seed() -> Fake {
             name: name.to_string(),
             is_group: *is_group,
             last_message: Some(MessagePreview {
-                text: last.0.into(),
+                text: mock_mentions(last.0).iter().fold(last.0.to_string(), |t, m| t.replace(&format!("@{}", m.user), &format!("@{}", m.name))),
                 timestamp: n + last.3,
                 from_me: last.1,
                 sender_name: last.2.map(String::from),
@@ -310,6 +337,25 @@ impl Fake {
     }
 }
 
+impl Fake {
+    /// Like the backend: show my message as Pending, then Sent.
+    fn send_own(&mut self, m: ChatMessage, ev: &flume::Sender<Event>) {
+        self.messages.push(m.clone());
+        let _ = ev.send(Event::MessageUpserted(m.clone()));
+        let text = crate::state::body_text(&m.body).to_string();
+        self.update_chat(
+            &m.chat_jid,
+            |c| c.last_message = Some(MessagePreview { text, timestamp: m.timestamp, from_me: true, sender_name: None }),
+            ev,
+        );
+        let ev = ev.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(900));
+            let _ = ev.send(Event::StatusChanged { chat_jid: m.chat_jid, message_ids: vec![m.id], status: DeliveryStatus::Sent });
+        });
+    }
+}
+
 /// Pinned first, then most recent activity (like the real backend).
 fn sort_chats(chats: &mut [ChatSummary]) {
     chats.sort_by_key(|c| (!c.pinned, std::cmp::Reverse(c.last_message.as_ref().map_or(i64::MAX, |l| l.timestamp))));
@@ -414,7 +460,8 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     let _ = ev.send(Event::HistoryLoading { chat_jid, loading: false, exhausted });
                 }
             }
-            Command::SendText { chat_jid, text, client_id, reply_to } => {
+            Command::SendText { chat_jid, text, client_id, reply_to, mentions } => {
+                eprintln!("mock: SendText {text:?} mentions {mentions:?}");
                 let mut m = msg(&chat_jid, 0, true, None, &text, now());
                 m.id = client_id;
                 m.quoted = reply_to.and_then(|id| fake.messages.iter().find(|q| q.id == id)).map(|q| QuotedMessage {
@@ -501,7 +548,7 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 let name = chat.map_or_else(|| jid.split('@').next().unwrap_or("").to_string(), |c| c.name.clone());
                 let is_group = jid.ends_with("@g.us");
                 let participant = |n: &str, admin: bool, me: bool| Participant {
-                    jid: format!("{n}@s.whatsapp.net"),
+                    jid: if me { ME.into() } else { member_jid(n) },
                     name: n.to_string(),
                     is_admin: admin,
                     is_me: me,
@@ -515,7 +562,12 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     is_group,
                     description: is_group.then(|| "Weekend hikes around Margalla Hills. Bring water!".to_string()),
                     participants: if is_group {
-                        vec![participant("Omar", true, false), participant("Me", false, true), participant("Sara", false, false), participant("Ali", false, false)]
+                        vec![
+                            participant("Omar", true, false),
+                            participant("Me", false, true),
+                            participant("Ali Raza", false, false),
+                            participant("Sara Ali", false, false),
+                        ]
                     } else {
                         Vec::new()
                     },
@@ -543,7 +595,7 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 }
                 let _ = ev.send(Event::MessageUpserted(m.clone()));
             }
-            Command::SendImage { chat_jid, path, client_id, .. } => {
+            Command::SendImage { chat_jid, path, client_id, caption, .. } => {
                 let mut m = msg(&chat_jid, 0, true, None, "", now());
                 m.id = client_id;
                 m.status = DeliveryStatus::Sent;
@@ -552,7 +604,7 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     thumbnail: None,
                     width: None,
                     height: None,
-                    caption: None,
+                    caption,
                     state: MediaState::Idle,
                 });
                 fake.messages.push(m.clone());
@@ -665,6 +717,61 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     let _ = ev.send(Event::Chats(fake.chats.clone()));
                 }
             }
+            Command::SendFile { chat_jid, path, caption, client_id, .. } => {
+                let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let size = std::fs::metadata(&path).map(|m| m.len()).ok();
+                let video = path.extension().is_some_and(|e| ["mp4", "mov", "m4v"].contains(&e.to_string_lossy().to_lowercase().as_str()));
+                eprintln!("mock: SendFile {name} ({size:?} bytes, video: {video}) caption {caption:?}");
+                let mut m = msg(&chat_jid, 0, true, None, "", now());
+                (m.id, m.status) = (client_id, DeliveryStatus::Pending);
+                m.body = if video {
+                    MessageBody::Video(VideoMedia {
+                        path: Some(path),
+                        thumbnail: None,
+                        width: Some(1280),
+                        height: Some(720),
+                        duration_secs: 15,
+                        caption,
+                        gif: false,
+                        round: false,
+                        state: MediaState::Idle,
+                    })
+                } else {
+                    MessageBody::Document(DocumentMedia {
+                        path: Some(path),
+                        file_name: name,
+                        mimetype: None,
+                        size_bytes: size,
+                        page_count: None,
+                        thumbnail: None,
+                        caption,
+                        state: MediaState::Idle,
+                    })
+                };
+                fake.send_own(m, &ev);
+            }
+            Command::SendVoice { chat_jid, samples, sample_rate, client_id, .. } => {
+                let secs = (samples.len() as f32 / sample_rate as f32).round().max(1.) as u32;
+                eprintln!("mock: SendVoice {} samples at {sample_rate} Hz ({secs} s)", samples.len());
+                let path = std::env::temp_dir().join(format!("wa-mock-sent-{client_id}.wav"));
+                let _ = std::fs::write(&path, wav_bytes(&samples, sample_rate));
+                let mut m = msg(&chat_jid, 0, true, None, "", now());
+                (m.id, m.status) = (client_id, DeliveryStatus::Pending);
+                let levels: Vec<f32> = samples
+                    .chunks((samples.len() / 64).max(1))
+                    .take(64)
+                    .map(|c| c.iter().map(|v| f32::from(*v).abs()).sum::<f32>() / c.len() as f32)
+                    .collect();
+                let max = levels.iter().copied().fold(1., f32::max);
+                m.body = MessageBody::Voice(VoiceMedia {
+                    path: Some(path),
+                    duration_secs: secs,
+                    waveform: levels.iter().map(|l| (l / max * 100.) as u8).collect(),
+                    ptt: true,
+                    state: MediaState::Idle,
+                });
+                fake.send_own(m, &ev);
+            }
             Command::Shutdown => break,
         }
     }
@@ -685,6 +792,27 @@ fn mock_photo() -> Option<std::path::PathBuf> {
         }
     }
     Some(out)
+}
+
+fn wav_bytes(samples: &[i16], rate: u32) -> Vec<u8> {
+    let data_len = samples.len() as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    wav
 }
 
 /// A short WAV (two-tone chirp) standing in for a decoded voice note.

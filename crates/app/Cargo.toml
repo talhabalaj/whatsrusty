@@ -23,9 +23,9 @@ dirs = "6"
 env_logger = "0.11"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSGeometry", "NSNotification", "NSOperation", "block2", "NSBundle", "NSError"] }
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2", "NSApplication", "NSDockTile"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2", "NSApplication", "NSDockTile", "NSAppearance"] }
 objc2-av-kit = { version = "0.3", default-features = false, features = ["std", "AVPlayerView", "objc2-app-kit", "objc2-av-foundation"] }
-objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVAsset"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVAsset", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "wav"] }
 # Only for the `snapshots` feature (gpui-kit's own test-support pulls in a conflicting gpui-fast).

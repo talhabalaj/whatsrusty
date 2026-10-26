@@ -12,10 +12,12 @@ mod icons;
 mod identity;
 mod kinds;
 mod login_item;
+mod mentions;
 mod new_chat;
 mod mock;
 mod pairing;
 mod profile;
+mod recorder;
 mod sidebar;
 mod state;
 mod text_replace;
@@ -47,8 +49,13 @@ impl Root {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
         let conversation = cx.new(|cx| Conversation::new(store.clone(), window, cx));
+        // Menus, popovers and text fields from gpui-component follow light / dark mode too.
+        gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
         let subs = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe_window_appearance(window, |_, window, cx| {
+                gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
+            }),
             // Coming back to the window counts as reading the open conversation.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -276,6 +283,14 @@ fn refresh_menus(cx: &mut App) {
     cx.set_menus(vec![Menu { name: identity::APP_NAME.into(), items, disabled: false }]);
 }
 
+fn force_appearance(mode: &str) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication};
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    let name = unsafe { if mode == "dark" { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua } };
+    let appearance = NSAppearance::appearanceNamed(name);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+}
+
 struct MainStore(Entity<Store>);
 impl gpui_kit::Global for MainStore {}
 
@@ -326,6 +341,10 @@ fn main() {
     });
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // Test hook: WA_DEBUG_APPEARANCE=dark|light overrides the system appearance.
+        if let Ok(mode) = std::env::var("WA_DEBUG_APPEARANCE") {
+            force_appearance(&mode);
+        }
         audio::AudioPlayer::init(cx);
         text_replace::TextReplacements::init(cx);
         conversation::init(cx);
@@ -396,6 +415,20 @@ fn main() {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
                 store.update(cx, |s, _| s.request_media(&chat, &id));
+            })
+            .detach();
+        }
+        // WA_DEBUG_REOPEN="<close ms>,<reopen ms>": close the window (⌘W), then bring it back.
+        if let Some((close, reopen)) = std::env::var("WA_DEBUG_REOPEN").ok().and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+        }) {
+            let store = debug_store.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(close)).await;
+                cx.update(|cx| cx.dispatch_action(&CloseWindow));
+                cx.background_executor().timer(std::time::Duration::from_millis(reopen)).await;
+                cx.update(|cx| open_main_window(store, cx));
             })
             .detach();
         }

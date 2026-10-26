@@ -213,7 +213,7 @@ fn forwarded_context() -> wa::ContextInfo {
 }
 
 /// Put `ci` on the (single) content of a message built by [`forward_content`].
-fn set_context(m: &mut wa::Message, ci: wa::ContextInfo) {
+pub(super) fn set_context(m: &mut wa::Message, ci: wa::ContextInfo) {
     macro_rules! set {
         ($($field:ident),*) => {
             $(if let Some(x) = m.$field.as_option_mut() {
@@ -238,7 +238,7 @@ fn needs_reupload(media: &StoredMedia, now: Timestamp) -> bool {
         || key_ts.is_none_or(|t| now - t > REUPLOAD_AFTER_SECS)
 }
 
-fn upload_type(media: &StoredMedia) -> MediaType {
+pub(super) fn upload_type(media: &StoredMedia) -> MediaType {
     match media.kind() {
         MediaKind::Image => MediaType::Image,
         MediaKind::Video | MediaKind::Ptv => MediaType::Video,
@@ -248,7 +248,7 @@ fn upload_type(media: &StoredMedia) -> MediaType {
     }
 }
 
-fn apply_upload(media: &mut StoredMedia, up: whatsapp_rust::upload::UploadResponse) {
+pub(super) fn apply_upload(media: &mut StoredMedia, up: whatsapp_rust::upload::UploadResponse) {
     macro_rules! apply {
         ($m:expr) => {{
             $m.url = Some(up.url);

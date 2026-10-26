@@ -42,6 +42,7 @@ use crate::types::*;
 
 mod chat_list;
 mod message_actions;
+mod outgoing;
 
 const CHATS_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Consecutive QR sessions without a scan before backing off for `QR_BACKOFF`, so an
@@ -447,6 +448,11 @@ impl Shared {
     fn set_own(&self, pn: Option<&Jid>, lid: Option<&Jid>) {
         *self.own_jid.lock().unwrap_or_else(|e| e.into_inner()) = pn.map(Jid::to_non_ad_string);
         *self.own_lid.lock().unwrap_or_else(|e| e.into_inner()) = lid.map(Jid::to_non_ad_string);
+        let own: Vec<String> = [pn, lid].into_iter().flatten().map(Jid::to_non_ad_string).collect();
+        self.store(|s| {
+            s.set_own_jids(own);
+            Ok(())
+        });
     }
 
     /// Emit the stored state of a message.
@@ -1584,13 +1590,13 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 }));
             }
         }
-        Command::SendText { chat_jid, text, client_id, reply_to } => {
+        Command::SendText { chat_jid, text, client_id, reply_to, mentions } => {
             let id = message_id_from(client_id);
             let body = MessageBody::Text(text.clone());
             let Some(canonical) = insert_pending(shared, &chat_jid, &id, body, None, reply_to.as_deref()) else {
                 return;
             };
-            let job = SendJob::Text { chat_jid, canonical, id, text, reply_to };
+            let job = SendJob::Text { chat_jid, canonical, id, text, reply_to, mentions };
             queue_send(shared, session, job);
         }
         Command::SendImage { chat_jid, path, caption, client_id, reply_to } => {
@@ -1680,6 +1686,12 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
         | Command::ListContacts
         | Command::LookupPhone { .. }
         | Command::OpenChat { .. } => chat_list::chat_command(shared, session, cmd).await,
+        Command::SendFile { chat_jid, path, caption, client_id, reply_to } => {
+            outgoing::send_file(shared, session, chat_jid, path, caption, client_id, reply_to).await
+        }
+        Command::SendVoice { chat_jid, samples, sample_rate, client_id, reply_to } => {
+            outgoing::send_voice(shared, session, chat_jid, samples, sample_rate, client_id, reply_to).await
+        }
     }
 }
 
@@ -1875,7 +1887,7 @@ fn notification(s: &Store, msg: &NewMessage) -> Result<Option<Event>> {
     if muted {
         return Ok(None);
     }
-    let text = preview_text(&msg.body).into_owned();
+    let text = s.with_mention_names(preview_text(&msg.body).into_owned())?;
     let (title, body) = if is_group {
         let sender = s.sender_display_name(&msg.sender_jid, msg.push_name.as_deref())?;
         (name, format!("{sender}: {text}"))
@@ -2132,7 +2144,15 @@ struct ReactJob {
 /// An outgoing message waiting in the session's send queue. Its `Pending` row is stored
 /// (and shown) before it's queued.
 enum SendJob {
-    Text { chat_jid: String, canonical: String, id: String, text: String, reply_to: Option<String> },
+    Text {
+        chat_jid: String,
+        canonical: String,
+        id: String,
+        text: String,
+        reply_to: Option<String>,
+        /// JIDs @mentioned in the text.
+        mentions: Vec<String>,
+    },
     Image {
         chat_jid: String,
         canonical: String,
@@ -2151,6 +2171,8 @@ enum SendJob {
     },
     /// A copy of a stored message, marked forwarded.
     Forward { chat_jid: String, canonical: String, id: String, forward: Box<ForwardJob> },
+    /// A file, video or voice note (see [`outgoing`]).
+    Upload { chat_jid: String, canonical: String, id: String, upload: Box<outgoing::UploadJob> },
     /// Not a message: no status of its own (see [`Shared::finish_reaction`]).
     React(Box<ReactJob>),
     /// Not a message either (see [`Shared::finish_edit`]).
@@ -2170,7 +2192,8 @@ impl SendJob {
             SendJob::Text { chat_jid, canonical, id, .. }
             | SendJob::Image { chat_jid, canonical, id, .. }
             | SendJob::Sticker { chat_jid, canonical, id, .. }
-            | SendJob::Forward { chat_jid, canonical, id, .. } => Some((chat_jid, canonical, id)),
+            | SendJob::Forward { chat_jid, canonical, id, .. }
+            | SendJob::Upload { chat_jid, canonical, id, .. } => Some((chat_jid, canonical, id)),
             SendJob::React(_) | SendJob::Edit(_) => None,
         }
     }
@@ -2493,8 +2516,11 @@ impl Session {
 
     async fn send_job(&self, job: SendJob) -> Result<()> {
         match job {
-            SendJob::Text { chat_jid, id, text, reply_to, .. } => {
-                let context = reply_to.as_deref().and_then(|r| reply_context(&self.shared, &chat_jid, r));
+            SendJob::Text { chat_jid, id, text, reply_to, mentions, .. } => {
+                let mut context = reply_to.as_deref().and_then(|r| reply_context(&self.shared, &chat_jid, r));
+                if !mentions.is_empty() {
+                    context.get_or_insert_with(Default::default).mentioned_jid = mentions;
+                }
                 let message = match context {
                     Some(ctx) => wa::Message {
                         extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
@@ -2544,6 +2570,7 @@ impl Session {
                 let message = self.forward_content(&chat_jid, &id, *forward).await?;
                 self.send(&chat_jid, message, id).await
             }
+            SendJob::Upload { chat_jid, id, upload, .. } => self.send_upload(&chat_jid, id, *upload).await,
             SendJob::React(_) => unreachable!("reactions are sent by `send_reaction`"),
             SendJob::Edit(_) => unreachable!("edits are sent by `send_edit`"),
         }
@@ -3060,6 +3087,8 @@ enum RetryPlan {
     Image { file: PathBuf, proto: Box<wa::message::ImageMessage>, reply_to: Option<String> },
     /// `sticker_id`: hex SHA-256 of the sticker file.
     Sticker { sticker_id: String, proto: Box<wa::message::StickerMessage>, reply_to: Option<String> },
+    /// A file, video or voice note, from our copy of it.
+    Upload(Box<outgoing::UploadJob>),
 }
 
 /// Why a message isn't resent: `Ignore` (not a failed send of mine; logged only) or
@@ -3083,6 +3112,9 @@ fn retry_plan(raw: &RawMessage) -> Result<RetryPlan, RetryRefusal> {
         return Err(RetryRefusal::Ignore("not failed"));
     }
     let reply_to = raw.quoted_id.clone();
+    if let Some(upload) = outgoing::retry_upload(raw)? {
+        return Ok(RetryPlan::Upload(Box::new(upload)));
+    }
     match (&raw.body, &raw.media) {
         (MessageBody::Text(text), _) => Ok(RetryPlan::Text { text: text.clone(), reply_to }),
         (MessageBody::Image(image), Some(StoredMedia::Image(stored))) => {
@@ -3127,7 +3159,14 @@ async fn retry_send(shared: &Arc<Shared>, session: Option<&Arc<Session>>, chat_j
     let (wire, canonical, id) = (raw.wire_chat.clone(), raw.chat_jid.clone(), raw.id.clone());
     let (kind, job) = match plan {
         RetryPlan::Text { text, reply_to } => {
-            ("text", SendJob::Text { chat_jid: wire, canonical: canonical.clone(), id: id.clone(), text, reply_to })
+            // Mentions aren't stored; the `@<digits>` in the text say who they were.
+            let mentions = shared.store(|s| s.resolve_mentions(&text)).unwrap_or_default();
+            let mentions = mentions.into_iter().map(|m| m.jid).collect();
+            let job = SendJob::Text { chat_jid: wire, canonical: canonical.clone(), id: id.clone(), text, reply_to, mentions };
+            ("text", job)
+        }
+        RetryPlan::Upload(upload) => {
+            ("file", SendJob::Upload { chat_jid: wire, canonical: canonical.clone(), id: id.clone(), upload })
         }
         RetryPlan::Image { file, proto, reply_to } => {
             let generation = session.map_or_else(|| shared.generation(), |s| s.generation);

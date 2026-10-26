@@ -712,7 +712,8 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Voice(media) => voice_content(&self.store, m, media, from_me, last, theme, window, cx),
-            MessageBody::Text(t) => bubble(found_text(t, found), from_me, last, theme).into_any_element(),
+            MessageBody::Text(t) => bubble(found_text(t, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme)
+                .into_any_element(),
             MessageBody::Unsupported { label } => {
                 bubble(text_content(label, true), from_me, last, theme).into_any_element()
             }
@@ -1334,7 +1335,7 @@ impl Conversation {
                 .gap(px(2.))
                 .when(from_me, |d| d.items_end())
                 .child(frame)
-                .child(bubble(found_text(caption, found), from_me, last, theme))
+                .child(bubble(found_text(caption, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme))
                 .into_any_element(),
         }
     }
@@ -1408,22 +1409,49 @@ fn names_label(typists: &[(String, String)]) -> String {
     }
 }
 
-/// Bubble text with find-in-chat matches highlighted (the current match stronger).
-fn found_text(text: &str, found: Option<(&str, bool)>) -> Div {
-    let Some((query, current)) = found else { return text_content(text, false) };
-    let ranges = match_ranges(text, query);
-    if ranges.is_empty() {
-        return text_content(text, false);
+/// @mentions: bold, tinted on incoming bubbles (white on my blue ones), like Messages.
+fn mention_color(from_me: bool, theme: &Theme) -> Hsla {
+    if from_me { theme.bubble_out_text } else { theme.accent }
+}
+
+/// Bubble text with @mentions shown by name and find-in-chat matches highlighted (the
+/// current match stronger). Matches are found in the text as shown.
+fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::Mention], mention_color: Hsla) -> Div {
+    let (text, mentioned) = crate::mentions::display(text, mentions);
+    let matches = found.map(|(query, _)| match_ranges(&text, query)).unwrap_or_default();
+    if matches.is_empty() && mentioned.is_empty() {
+        return text_content(&text, false);
     }
-    let style = HighlightStyle {
+    let current = found.is_some_and(|(_, current)| current);
+    let find_style = HighlightStyle {
         background_color: Some(if current { hsla(48. / 360., 1., 0.55, 1.) } else { hsla(52. / 360., 1., 0.7, 0.75) }),
         color: Some(black()),
         ..Default::default()
     };
-    div()
-        .text_size(px(14.))
-        .line_height(px(19.))
-        .child(StyledText::new(text.to_string()).with_highlights(ranges.into_iter().map(|r| (r, style))))
+    // Cut at every boundary so a match inside a mention gets both looks.
+    let mut cuts: Vec<usize> = matches.iter().chain(&mentioned).flat_map(|r| [r.start, r.end]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let inside = |ranges: &[std::ops::Range<usize>], seg: &std::ops::Range<usize>| {
+        ranges.iter().any(|r| r.start <= seg.start && seg.end <= r.end)
+    };
+    let highlights: Vec<_> = cuts
+        .windows(2)
+        .map(|w| w[0]..w[1])
+        .filter_map(|seg| {
+            let style = match (inside(&matches, &seg), inside(&mentioned, &seg)) {
+                (false, false) => return None,
+                (true, m) => HighlightStyle { font_weight: m.then_some(FontWeight::SEMIBOLD), ..find_style },
+                (false, true) => HighlightStyle {
+                    color: Some(mention_color),
+                    font_weight: Some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                },
+            };
+            Some((seg, style))
+        })
+        .collect();
+    div().text_size(px(14.)).line_height(px(19.)).child(StyledText::new(text).with_highlights(highlights))
 }
 
 fn text_content(text: &str, italic: bool) -> Div {
@@ -1748,6 +1776,8 @@ impl Render for Conversation {
         let history = store.selected_history();
         let loading_older = history.page_pending || history.fetching_remote;
         let replying = store.replying_to.is_some();
+        // The composer's attachment tray (one row of 64pt tiles plus padding).
+        let attaching = store.selected.as_ref().and_then(|c| store.drafts.get(c)).is_some_and(|d| !d.attachments.is_empty());
         let header_photo = store.avatar_cached(&chat.jid);
         if header_photo.is_none() {
             let (s, jid) = (self.store.clone(), chat.jid.clone());
@@ -1757,7 +1787,7 @@ impl Render for Conversation {
         let store_handle = self.store.clone();
         let find_bar = self.find.as_ref().map(|f| f.bar.clone());
         let top = HEADER_HEIGHT + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
-        let bottom = COMPOSER_CLEARANCE + if replying { 44. } else { 0. };
+        let bottom = COMPOSER_CLEARANCE + if replying { 44. } else { 0. } + if attaching { 76. } else { 0. };
         let away = self.away.get();
         if !away {
             self.unseen = 0;
@@ -1854,6 +1884,21 @@ impl Render for Conversation {
             })
             .when(away, |d| d.child(scroll_button(unseen, bottom, &theme, cx)))
             .child(div().absolute().bottom_0().left_0().right_0().child(self.composer.clone()))
+            // Files dragged over the conversation: a soft tint and outline; dropped, they're
+            // attached. Doesn't occlude, so the transcript still scrolls and takes clicks.
+            .child({
+                let (tint, outline) = (theme.accent.opacity(0.07), theme.accent.opacity(0.75));
+                div()
+                    .id("drop-zone")
+                    .absolute()
+                    .inset(px(6.))
+                    .rounded(px(14.))
+                    .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(tint).border_2().border_color(outline))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        Composer::attach_files(&this.composer, paths.paths().to_vec(), cx);
+                        Composer::focus(&this.composer, window, cx);
+                    }))
+            })
             // Clicking anywhere else closes the tapback tray / menu.
             .when(self.picker_for.is_some(), |d| {
                 let close = |this: &mut Self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| this.close_menu(cx);
