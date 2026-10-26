@@ -17,3 +17,8 @@ log = "0.4"
 # Skips a startup font enumeration that blocks the UI for seconds on macOS.
 # See vendor/gpui-component/src/theme/system_font.rs (search "whatsapp-gpui patch").
 gpui-component = { path = "vendor/gpui-component" }
+# Liquid Glass panes: GPUI scenes that render part of the window into separate Metal surfaces,
+# hosted in NSGlassEffectViews. See docs/liquid-glass.md (search "whatsapp-gpui patch").
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
