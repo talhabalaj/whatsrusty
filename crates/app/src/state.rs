@@ -312,8 +312,8 @@ impl Store {
                 if !focused {
                     cx.show_system_notification(SystemNotification {
                         tag: chat_jid.into(),
-                        title: title.into(),
-                        body: body.into(),
+                        title: crate::links::strip_bidi(&title).into(),
+                        body: crate::links::strip_bidi(&body).into(),
                         actions: Vec::new(),
                     });
                 }

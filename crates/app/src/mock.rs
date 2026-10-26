@@ -116,6 +116,15 @@ fn seed() -> Fake {
             ("This is a much longer message to make sure wrapping works nicely inside the bubble, including multiple lines of text that keep going for a while so we can see how it looks.", false, None, -9 * d),
             ("Looks good on my side", true, None, -9 * d + 60),
         ]),
+        // Links: normal, bare, email, and the suspicious kinds (see links.rs).
+        ("120363000000000002@g.us", "Links 🔗", true, false, &[
+            ("Docs are at https://docs.rs/url/latest/url/ (and the intro at https://en.wikipedia.org/wiki/Rust_(programming_language)).", false, Some("Omar"), -10 * 60),
+            ("Or just www.example.com, or mail jane.doe+wa@example.co.uk!", true, None, -9 * 60),
+            ("Your account is locked, verify at \u{430}pple.com/verify", false, Some("Sara"), -8 * 60),
+            ("Login: https://google.com@evil.example/login", false, Some("Sara"), -7 * 60),
+            ("Invoice: https://files.example/\u{202E}fdp.exe", false, Some("Omar"), -6 * 60),
+            ("@15551110011 router is at http://192.168.1.1/admin, notes.txt has the rest", true, None, -5 * 60),
+        ]),
     ];
 
     let mut chats = Vec::new();

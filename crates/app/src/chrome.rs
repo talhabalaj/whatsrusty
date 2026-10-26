@@ -1,4 +1,4 @@
-//! Plain, opaque surfaces for the header, composer and status pills, like Messages.
+//! Surfaces for the header, composer and status pills, like Messages.
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,4 +22,18 @@ pub fn round_button(id: &'static str, size: f32, theme: &Theme) -> Stateful<Div>
         .justify_center()
         .hover(move |s| s.bg(hover))
         .map(|d| d.cursor_pointer())
+}
+
+/// Blur radius of the frosted bars, like Messages' header and composer.
+const BAR_BLUR: f32 = 20.;
+
+/// Frosted glass filling its parent: blurs what's drawn under it, tinted. Make it the
+/// parent's first child so the parent's own content draws on top.
+pub fn frosted(tint: Hsla) -> impl IntoElement {
+    canvas(|_, _, _| {}, move |bounds, _, window, _| {
+        window.paint_backdrop_blur(bounds, Corners::default(), px(BAR_BLUR));
+        window.paint_quad(fill(bounds, tint));
+    })
+    .absolute()
+    .inset_0()
 }

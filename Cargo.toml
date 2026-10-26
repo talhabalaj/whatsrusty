@@ -17,3 +17,9 @@ log = "0.4"
 # Skips a startup font enumeration that blocks the UI for seconds on macOS.
 # See vendor/gpui-component/src/theme/system_font.rs (search "whatsapp-gpui patch").
 gpui-component = { path = "vendor/gpui-component" }
+# In-window backdrop blur (frosted header/composer): a `BackdropBlur` scene primitive and
+# `Window::paint_backdrop_blur` in gpui-pre, drawn by gpui-pre-apple's Metal renderer.
+# See vendor/gpui-pre/src/scene.rs and vendor/gpui-pre-apple/src/metal_renderer.rs
+# (search "whatsapp-gpui patch").
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }

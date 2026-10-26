@@ -11,6 +11,7 @@ mod chrome;
 mod icons;
 mod identity;
 mod kinds;
+mod links;
 mod login_item;
 mod mentions;
 mod new_chat;

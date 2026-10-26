@@ -502,6 +502,7 @@ fn chat_row(
                 (Some(s), true, false) => format!("{s}: {}", m.text),
                 _ => m.text.clone(),
             })
+            .map(|p| crate::links::strip_bidi(&p))
             .unwrap_or_default()
     };
     let time = chat.last_message.as_ref().map(|m| sidebar_time(m.timestamp)).unwrap_or_default();
@@ -583,6 +584,7 @@ fn chat_row(
 /// Test hook: WA_DEBUG_UI="wait 1500; click 300,26; rclick 120,200; key down; type abc"
 /// drives the window with real mouse/key events (window coordinates in points).
 /// `drag x,y a.png|b.pdf` / `drop x,y` simulate dragging files from Finder.
+/// `scroll x,y dy` scrolls whatever is under the point.
 /// A reopened window (see `WA_DEBUG_REOPEN`) runs `WA_DEBUG_UI_REOPENED` instead.
 fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
     static WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -600,7 +602,8 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
             // Keystroke parsing wants 'static strings; a test hook can afford the leak.
             let arg: &'static str = Box::leak(arg.to_string().into_boxed_str());
             let _ = cx.update(|window, cx| match verb {
-                "click" | "rclick" => {
+                // "press" / "rpress": a frame between down and up, which InteractiveText needs.
+                "click" | "rclick" | "press" | "rpress" => {
                     // Hit testing uses the last drawn frame, which is stale with no screen.
                     #[cfg(feature = "snapshots")]
                     {
@@ -609,7 +612,7 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                     }
                     let Some((x, y)) = arg.split_once(',') else { return };
                     let position = point(px(x.trim().parse().unwrap_or(0.)), px(y.trim().parse().unwrap_or(0.)));
-                    let button = if verb == "rclick" { MouseButton::Right } else { MouseButton::Left };
+                    let button = if verb.starts_with('r') { MouseButton::Right } else { MouseButton::Left };
                     let modifiers = Modifiers::default();
                     window.dispatch_event(
                         PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }),
@@ -625,6 +628,11 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                         }),
                         cx,
                     );
+                    #[cfg(feature = "snapshots")]
+                    if verb.ends_with("press") {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    }
                     window.dispatch_event(
                         PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers, click_count: 1 }),
                         cx,
@@ -645,6 +653,22 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                         FileDropEvent::Submit { position }
                     };
                     window.dispatch_event(PlatformInput::FileDrop(event), cx);
+                }
+                "scroll" => {
+                    // `scroll x,y dy`: a trackpad scroll of dy points (positive scrolls up).
+                    #[cfg(feature = "snapshots")]
+                    {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    }
+                    let (at, dy) = arg.split_once(' ').unwrap_or((arg, "0"));
+                    let Some((x, y)) = at.split_once(',') else { return };
+                    let position = point(px(x.trim().parse().unwrap_or(0.)), px(y.trim().parse().unwrap_or(0.)));
+                    let delta = ScrollDelta::Pixels(point(px(0.), px(dy.trim().parse().unwrap_or(0.))));
+                    window.dispatch_event(
+                        PlatformInput::Scroll(ScrollEvent { position, delta, ..Default::default() }),
+                        cx,
+                    );
                 }
                 "key" => {
                     if let Ok(ks) = Keystroke::parse(arg) {

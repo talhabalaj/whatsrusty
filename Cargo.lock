@@ -2862,8 +2862,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df4b5f8d0c278308df2f11e0bfe0212dd77d7848ce1bdc4b9d513334414396f6"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2931,8 +2929,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-apple"
 version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e97cd068d8134b4e073321b946491760aa1e4511e486084a92e73b9174bff78a"
 dependencies = [
  "anyhow",
  "async-task",
@@ -4266,6 +4262,15 @@ name = "link-section"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
+
+[[package]]
+name = "linkify"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dfa36d52c581e9ec783a7ce2a5e0143da6237be5811a0b3153fedfdbe9f780"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "linktime-proc-macro"
@@ -9059,6 +9064,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-macos",
  "image",
+ "linkify",
  "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -9068,6 +9074,7 @@ dependencies = [
  "qrcode",
  "rodio",
  "serde_json",
+ "url",
  "wa-backend",
 ]
 

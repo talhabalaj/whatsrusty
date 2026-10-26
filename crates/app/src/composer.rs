@@ -1083,7 +1083,7 @@ impl Render for Composer {
         div()
             .relative()
             .w_full()
-            .bg(theme.window_bg)
+            .child(crate::chrome::frosted(theme.bar_tint))
             .border_t_1()
             .border_color(theme.separator)
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
@@ -1117,6 +1117,8 @@ impl Render for Composer {
             )
             .child(
                 surface(div().flex_1().min_w_0().flex().flex_col().rounded(px(17.)), &theme)
+                    // Lets the frosted bar show through a little, like Messages' field.
+                    .bg(theme.surface_bg.opacity(0.55))
                     .when_some(self.mic_notice.clone(), |d, notice| {
                         let detail = div()
                             .id("mic-settings")

@@ -16,7 +16,7 @@ use crate::composer::Composer;
 use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
 use crate::forward_picker::{ForwardEvent, ForwardPicker};
 use crate::format::{short_time, transcript_time};
-use crate::chrome::surface;
+use crate::chrome::{frosted, surface};
 use crate::icons::{Glyph, glyph};
 use crate::state::{Change, Store, StoreEvent};
 use crate::theme::Theme;
@@ -68,6 +68,8 @@ pub struct Conversation {
     menu_at: Option<Point<Pixels>>,
     /// Message whose "Delete…" confirmation is showing.
     confirm_delete: Option<ChatMessage>,
+    /// Suspicious link clicked: "This link may not be what it looks like" is showing.
+    confirm_link: Option<crate::links::Link>,
     forward: Option<(Entity<ForwardPicker>, Subscription)>,
     find: Option<Find>,
     /// A quoted message / search hit to scroll to once it's loaded.
@@ -122,6 +124,7 @@ impl Conversation {
                     this.find = None;
                     this.forward = None;
                     this.confirm_delete = None;
+                    this.confirm_link = None;
                     this.pending_jump = None;
                     this.rows.clear();
                     this.messages.clear();
@@ -155,6 +158,7 @@ impl Conversation {
             picker_for: None,
             menu_at: None,
             confirm_delete: None,
+            confirm_link: None,
             forward: None,
             find: None,
             pending_jump: None,
@@ -213,6 +217,7 @@ impl Conversation {
             self.pending_jump = None;
             self.highlight = None;
             self.confirm_delete = None;
+            self.confirm_link = None;
             self.picker_for = None;
             self.find = None;
         }
@@ -712,7 +717,7 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Voice(media) => voice_content(&self.store, m, media, from_me, last, theme, window, cx),
-            MessageBody::Text(t) => bubble(found_text(t, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme)
+            MessageBody::Text(t) => bubble(found_text(format!("text-{}", m.id).into(), t, found, &m.mentions, from_me, theme, cx), from_me, last, theme)
                 .into_any_element(),
             MessageBody::Unsupported { label } => {
                 bubble(text_content(label, true), from_me, last, theme).into_any_element()
@@ -1335,7 +1340,12 @@ impl Conversation {
                 .gap(px(2.))
                 .when(from_me, |d| d.items_end())
                 .child(frame)
-                .child(bubble(found_text(caption, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme))
+                .child(bubble(
+                    found_text(format!("caption-{}", m.id).into(), caption, found, &m.mentions, from_me, theme, cx),
+                    from_me,
+                    last,
+                    theme,
+                ))
                 .into_any_element(),
         }
     }
@@ -1414,12 +1424,24 @@ fn mention_color(from_me: bool, theme: &Theme) -> Hsla {
     if from_me { theme.bubble_out_text } else { theme.accent }
 }
 
-/// Bubble text with @mentions shown by name and find-in-chat matches highlighted (the
-/// current match stronger). Matches are found in the text as shown.
-fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::Mention], mention_color: Hsla) -> Div {
+/// Bubble text with @mentions shown by name, links clickable (see `links`) and
+/// find-in-chat matches highlighted (the current match stronger). Matches are found in
+/// the text as shown.
+fn found_text(
+    id: SharedString,
+    text: &str,
+    found: Option<(&str, bool)>,
+    mentions: &[wa_backend::Mention],
+    from_me: bool,
+    theme: &Theme,
+    cx: &Context<Conversation>,
+) -> Div {
     let (text, mentioned) = crate::mentions::display(text, mentions);
+    let linked = crate::links::linkify(&text, &mentioned);
+    let mentioned: Vec<_> = mentioned.iter().map(|r| linked.map_range(r)).collect();
+    let (text, links) = (linked.text, linked.links);
     let matches = found.map(|(query, _)| match_ranges(&text, query)).unwrap_or_default();
-    if matches.is_empty() && mentioned.is_empty() {
+    if matches.is_empty() && mentioned.is_empty() && links.is_empty() {
         return text_content(&text, false);
     }
     let current = found.is_some_and(|(_, current)| current);
@@ -1428,8 +1450,15 @@ fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::M
         color: Some(black()),
         ..Default::default()
     };
-    // Cut at every boundary so a match inside a mention gets both looks.
-    let mut cuts: Vec<usize> = matches.iter().chain(&mentioned).flat_map(|r| [r.start, r.end]).collect();
+    // Links: white on my blue bubbles, tinted on gray ones, like Messages; the warning
+    // mark of a suspicious one in amber.
+    let link_color = if from_me { theme.bubble_out_text } else { theme.accent };
+    let warn_color = if from_me { hsla(45. / 360., 1., 0.72, 1.) } else { hsla(32. / 360., 0.95, 0.48, 1.) };
+    let link_ranges: Vec<_> = links.iter().map(|l| l.range.clone()).collect();
+    let mark_ranges: Vec<_> = links.iter().filter_map(|l| l.mark.clone()).collect();
+    // Cut at every boundary so a match inside a mention or link gets both looks.
+    let mut cuts: Vec<usize> =
+        matches.iter().chain(&mentioned).chain(&link_ranges).chain(&mark_ranges).flat_map(|r| [r.start, r.end]).collect();
     cuts.sort_unstable();
     cuts.dedup();
     let inside = |ranges: &[std::ops::Range<usize>], seg: &std::ops::Range<usize>| {
@@ -1439,19 +1468,43 @@ fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::M
         .windows(2)
         .map(|w| w[0]..w[1])
         .filter_map(|seg| {
-            let style = match (inside(&matches, &seg), inside(&mentioned, &seg)) {
-                (false, false) => return None,
+            let link = links.iter().find(|l| l.range.start <= seg.start && seg.end <= l.range.end);
+            let mut style = match (inside(&matches, &seg), inside(&mentioned, &seg)) {
                 (true, m) => HighlightStyle { font_weight: m.then_some(FontWeight::SEMIBOLD), ..find_style },
                 (false, true) => HighlightStyle {
-                    color: Some(mention_color),
+                    color: Some(mention_color(from_me, theme)),
                     font_weight: Some(FontWeight::SEMIBOLD),
                     ..Default::default()
                 },
+                (false, false) if link.is_some() => HighlightStyle { color: Some(link_color), ..Default::default() },
+                (false, false) if inside(&mark_ranges, &seg) => {
+                    HighlightStyle { color: Some(warn_color), ..Default::default() }
+                }
+                (false, false) => return None,
             };
+            if let Some(link) = link {
+                let color = style.color.unwrap_or(link_color);
+                style.underline = Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(if link.suspicious() { warn_color } else { color }),
+                    wavy: link.suspicious(),
+                });
+            }
             Some((seg, style))
         })
         .collect();
-    div().text_size(px(14.)).line_height(px(19.)).child(StyledText::new(text).with_highlights(highlights))
+    let styled = StyledText::new(text).with_highlights(highlights);
+    let body = div().text_size(px(14.)).line_height(px(19.));
+    if links.is_empty() {
+        return body.child(styled);
+    }
+    let this = cx.entity().downgrade();
+    body.child(crate::links::interactive(id, styled, links, move |link, _, cx| {
+        let _ = this.update(cx, |this, cx| {
+            this.confirm_link = Some(link);
+            cx.notify();
+        });
+    }))
 }
 
 fn text_content(text: &str, italic: bool) -> Div {
@@ -1846,7 +1899,7 @@ impl Render for Conversation {
                     .left_0()
                     .right_0()
                     .h(px(HEADER_HEIGHT))
-                    .bg(theme.header_bg)
+                    .child(frosted(theme.bar_tint))
                     .border_b_1()
                     .border_color(theme.separator)
                     .flex()
@@ -1922,6 +1975,23 @@ impl Render for Conversation {
                     this.confirm_delete = None;
                     cx.notify();
                 })).child(dialog))
+            })
+            .when_some(self.confirm_link.clone(), |d, link| {
+                let close = |this: &mut Self, cx: &mut Context<Self>| {
+                    this.confirm_link = None;
+                    cx.notify();
+                };
+                let target = link.clone();
+                let sheet = crate::links::confirm_sheet(
+                    &link,
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        crate::links::open(&target, cx);
+                        close(this, cx);
+                    }),
+                    cx.listener(move |this, _, _, cx| close(this, cx)),
+                );
+                d.child(modal_backdrop("link-backdrop", cx.listener(move |this, _, _, cx| close(this, cx))).child(sheet))
             })
             .when_some(forward, |d, picker| {
                 d.child(modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {
