@@ -14,7 +14,7 @@ use crate::avatar::avatar;
 use crate::format::sidebar_time;
 use crate::icons::{Glyph, glyph};
 use crate::new_chat::NewChat;
-use crate::state::Store;
+use crate::state::{FocusComposer, Store};
 use crate::theme::Theme;
 
 const ROW_HEIGHT: f32 = 68.;
@@ -27,6 +27,8 @@ pub struct Sidebar {
     search: Entity<InputState>,
     query: String,
     scroll: UniformListScrollHandle,
+    /// The selection we last revealed in the list.
+    last_selected: Option<String>,
     /// Showing archived chats instead of the main list.
     archived_view: bool,
     /// The New Message picker, with its dismiss subscription.
@@ -42,8 +44,9 @@ impl Sidebar {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subs = vec![
-            cx.observe(&store, |this, store, cx| {
+            cx.observe_in(&store, window, |this, store, window, cx| {
                 this.watch_error(store.read(cx).last_error.clone(), cx);
+                this.reveal_selection(window, cx);
                 // Nothing left in the archive: back to the main list.
                 if this.archived_view && !store.read(cx).chats.iter().any(|c| c.archived) {
                     this.archived_view = false;
@@ -62,6 +65,7 @@ impl Sidebar {
             search,
             query: String::new(),
             scroll: UniformListScrollHandle::new(),
+            last_selected: None,
             archived_view: false,
             new_chat: None,
             new_chat_closed_at: None,
@@ -115,6 +119,32 @@ impl Sidebar {
             });
         })
         .detach();
+    }
+
+    /// A chat was selected (a click, a search result, a notification): picked from a
+    /// search, it clears the search and focuses the composer; either way the list scrolls
+    /// so the chat is in view.
+    fn reveal_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.store.read(cx).selected.clone();
+        if selected == self.last_selected {
+            return;
+        }
+        self.last_selected = selected.clone();
+        let Some(jid) = selected else { return };
+        let from_search = !self.query.is_empty();
+        if from_search {
+            self.query.clear();
+            self.search.update(cx, |s, cx| s.set_value("", window, cx));
+            let store = self.store.clone();
+            cx.defer(move |cx| store.update(cx, |_, cx| cx.emit(FocusComposer)));
+        }
+        if let Some(chat) = self.store.read(cx).chats.iter().find(|c| c.jid == jid) {
+            self.archived_view = chat.archived;
+        }
+        if let Some(ix) = self.visible_jids(cx).iter().position(|j| *j == jid) {
+            let strategy = if from_search { ScrollStrategy::Center } else { ScrollStrategy::Nearest };
+            self.scroll.scroll_to_item(ix, strategy);
+        }
     }
 
     fn matches(&self, c: &ChatSummary) -> bool {
@@ -468,7 +498,7 @@ fn chat_row(
         chat.last_message
             .as_ref()
             .map(|m| match (&m.sender_name, chat.is_group, m.from_me) {
-                (_, true, true) => format!("You: {}", m.text),
+                (_, _, true) => format!("You: {}", m.text),
                 (Some(s), true, false) => format!("{s}: {}", m.text),
                 _ => m.text.clone(),
             })
