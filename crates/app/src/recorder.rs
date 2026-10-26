@@ -26,6 +26,8 @@ struct Captured {
     /// Accumulator for the current level bar.
     level_sum: f64,
     level_n: usize,
+    /// Recent loudest bar (dBFS), decaying: the meter is relative to it.
+    peak_db: f64,
     error: Option<String>,
 }
 
@@ -39,13 +41,28 @@ impl Captured {
             self.level_n += 1;
             if self.level_n >= per_level.max(1) {
                 let rms = (self.level_sum / self.level_n as f64).sqrt();
-                // Speech sits around -30..-10 dBFS: spread that over the meter.
                 let db = 20. * rms.max(1e-6).log10();
-                self.levels.push(((db + 50.) / 45.).clamp(0.04, 1.) as f32);
+                self.levels.push(meter_level(db, &mut self.peak_db));
                 (self.level_sum, self.level_n) = (0., 0);
             }
         }
     }
+}
+
+/// The meter's reference never drops below this, so room noise stays small.
+const FLOOR_DB: f64 = -60.;
+
+/// One meter bar (0.04..=1) for a slice at `db` dBFS. Relative to the recent peak, like
+/// Messages: macOS sets the built-in microphone's gain as it likes (it can drop ~45 dB a
+/// second into a recording), so absolute levels would flatten to dots while someone talks.
+fn meter_level(db: f64, peak_db: &mut f64) -> f32 {
+    /// The peak fades by this much per bar (~33 dB/s), so a loud start doesn't mute the rest.
+    const DECAY_DB: f64 = 2.;
+    /// Below this the reference stops following, so room noise stays small.
+    /// Dynamic range shown on the meter.
+    const RANGE_DB: f64 = 30.;
+    *peak_db = db.max(*peak_db - DECAY_DB).max(FLOOR_DB);
+    ((db - (*peak_db - RANGE_DB)) / RANGE_DB).clamp(0.04, 1.) as f32
 }
 
 pub struct Recorder {
@@ -58,7 +75,7 @@ impl Recorder {
     /// Start recording right away. Failures (no microphone, access denied) show up in
     /// [`Recorder::error`]. `WA_DEBUG_FAKE_MIC` records a synthetic voice instead.
     pub fn start() -> Self {
-        let captured = Arc::new(Mutex::new(Captured::default()));
+        let captured = Arc::new(Mutex::new(Captured { peak_db: FLOOR_DB, ..Captured::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let (c, s) = (captured.clone(), stop.clone());
         let fake = std::env::var_os("WA_DEBUG_FAKE_MIC").is_some();
@@ -223,4 +240,33 @@ pub fn open_privacy_settings() {
     let _ = std::process::Command::new("/usr/bin/open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meter_recovers_after_the_microphone_gain_drops() {
+        let mut peak = FLOOR_DB;
+        // Loud for 0.7 s, then macOS turns the gain down ~45 dB while the speech goes on.
+        let loud: Vec<f32> = (0..12).map(|_| meter_level(-3., &mut peak)).collect();
+        assert!(loud.iter().all(|l| *l > 0.9), "{loud:?}");
+        let after: Vec<f32> = (0..60).map(|i| meter_level(if i % 4 == 0 { -62. } else { -48. }, &mut peak)).collect();
+        // Within ~1.5 s (25 bars) speech shows as tall bars again, pauses as shorter ones.
+        for (i, l) in after.iter().enumerate().skip(25) {
+            if i % 4 == 0 {
+                assert!(*l < 0.65, "pause {i}: {after:?}");
+            } else {
+                assert!(*l > 0.75, "speech {i}: {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn room_noise_stays_small() {
+        let mut peak = FLOOR_DB;
+        let noise: Vec<f32> = (0..50).map(|_| meter_level(-85., &mut peak)).collect();
+        assert!(noise.iter().all(|l| *l < 0.2), "{noise:?}");
+    }
 }
