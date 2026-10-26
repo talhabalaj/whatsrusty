@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const releaseOrigin = 'https://whatsapp.apps.balaj.me';
+export const releaseOrigin = 'https://whatsrusty.apps.balaj.me';
 export const releaseArchivePattern = /^WhatsRusty-\d+(?:\.\d+){0,2}-\d+(?:\.\d+){0,2}\.zip$/;
 const xml = value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]);
 

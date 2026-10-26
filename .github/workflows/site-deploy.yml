@@ -28,4 +28,4 @@ jobs:
       - run: npm ci --prefix site
       - run: npm run typecheck --prefix site
       - run: npm run deploy --prefix site
-      - run: curl --fail --retry 5 --retry-delay 3 https://whatsapp.apps.balaj.me/
+      - run: curl --fail --retry 5 --retry-delay 3 https://whatsrusty.apps.balaj.me/

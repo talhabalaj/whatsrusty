@@ -1,6 +1,6 @@
 # WhatsRusty builds and releases
 
-Same release architecture as Pufflet and Said. Xcode Cloud builds a **STAPLED_NOTARIZED_ARCHIVE** from a `v` tag, GitHub Actions verifies it on macOS, Sparkle signs the archive and feed, and GitHub Releases stores versioned downloads served through `https://whatsapp.apps.balaj.me`.
+Same release architecture as Pufflet and Said. Xcode Cloud builds a **STAPLED_NOTARIZED_ARCHIVE** from a `v` tag, GitHub Actions verifies it on macOS, Sparkle signs the archive and feed, and GitHub Releases stores versioned downloads served through `https://whatsrusty.apps.balaj.me`.
 
 ## Layout
 
@@ -8,7 +8,7 @@ Same release architecture as Pufflet and Said. Xcode Cloud builds a **STAPLED_NO
 - Shared Xcode project/scheme: `WhatsRusty.xcodeproj` / `WhatsRusty` (XcodeGen, `project.yml`). The target has no compiled sources. Its "Build Rust executable" phase (`packaging/xcode-cargo-build.sh`) runs `cargo build --locked --release --target aarch64-apple-darwin` and installs the binary as `Contents/MacOS/WhatsRusty`. Xcode adds Info.plist, the Icon Composer icon, entitlements, the embedded Sparkle.framework (SPM binary package pinned by checksum in `packaging/Sparkle`) and signing.
 - Developer team: `W7TT249CUU`; production identity `me.balaj.WhatsRusty`, Debug `me.balaj.WhatsRusty.dev` (`WhatsRusty Dev.app`).
 - `ci_scripts/ci_post_clone.sh` stamps `CURRENT_PROJECT_VERSION` from the Cloud build number and `MARKETING_VERSION` from the `vX.Y.Z` tag (`stamp-version.sh`). It installs rustup with the toolchain pinned in `ci_scripts/rust-toolchain`, runs `cargo fetch --locked`, and installs the Metal toolchain if missing; gpui compiles its shaders at build time. `ci_pre_xcodebuild.sh` requires Xcode 27, cargo and Metal.
-- Worker `whatsrusty-site`, custom domain `whatsapp.apps.balaj.me`, backed by GitHub release assets (no R2).
+- Worker `whatsrusty-site`, custom domain `whatsrusty.apps.balaj.me`, backed by GitHub release assets (no R2).
 - The Sparkle public key is committed in `packaging/Info.plist`; the private key lives in Keychain, 1Password and an Actions secret (SIGNING.md).
 - `.github/workflows/ci.yml`: on macOS, `cargo build`, `cargo clippy -D warnings` and `cargo test` for the workspace. On Linux, the release-tooling tests, the website tests/types/build and script syntax checks.
 - `.github/workflows/release.yml`: `cargo test` on macOS → Xcode Cloud build → verify, sign and publish.
@@ -82,7 +82,7 @@ Nothing below has been done yet. Order matters: the release job verifies the pub
    gh variable set CLOUDFLARE_ACCOUNT_ID --repo talhabalaj/whatsrusty --body 'dd0a87415ee63e34b183118e8bdd13c8'
    gh variable set CLOUDFLARE_CI_ENABLED --repo talhabalaj/whatsrusty --body true
    ```
-6. **DNS and first site deploy.** `site/cloudflare.config.ts` declares the custom domain `whatsapp.apps.balaj.me` on Worker `whatsrusty-site`. Deploying creates the proxied DNS record and certificate in the `balaj.me` zone, as for `pufflet.apps.balaj.me`; there should be no existing `whatsapp.apps` record. Run **Deploy website** (`site-deploy.yml`, workflow_dispatch) or `npm ci --prefix site && npm run deploy --prefix site` once. Check that `https://whatsapp.apps.balaj.me/` loads. `/appcast.xml` returns 404 "The first release is being prepared." until the first release.
+6. **DNS and first site deploy.** `site/cloudflare.config.ts` declares the custom domain `whatsrusty.apps.balaj.me` on Worker `whatsrusty-site`. Deploying creates the proxied DNS record and certificate in the `balaj.me` zone, as for `pufflet.apps.balaj.me`; there should be no existing `whatsapp.apps` record. Run **Deploy website** (`site-deploy.yml`, workflow_dispatch) or `npm ci --prefix site && npm run deploy --prefix site` once. Check that `https://whatsrusty.apps.balaj.me/` loads. `/appcast.xml` returns 404 "The first release is being prepared." until the first release.
 
 ## Publish
 

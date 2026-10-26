@@ -50,7 +50,7 @@ test('verifies every draft and public asset before latest promotion',async()=>{
   assert.deepEqual(f.events.filter(e=>e.startsWith('write:')),[`write:${f.manifest.file}`,`write:${f.manifest.file}.sha256`,'write:manifest.json','write:appcast.xml']);
   const publish=f.events.indexOf('publish'), promote=f.events.indexOf('promote');
   assert.ok(publish<promote);assert.equal(f.events.slice(publish+1,promote).filter(e=>e.includes('/releases/download/')).length,4);
-  assert.equal(result.download,`https://whatsapp.apps.balaj.me/downloads/${f.manifest.file}`);
+  assert.equal(result.download,`https://whatsrusty.apps.balaj.me/downloads/${f.manifest.file}`);
   assert.ok(existsSync(join(f.output,'publication.json')));
 });
 test('matching retries never rewrite immutable assets',async()=>{

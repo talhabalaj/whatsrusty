@@ -45,7 +45,7 @@
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 	<key>SUFeedURL</key>
-	<string>https://whatsapp.apps.balaj.me/appcast.xml</string>
+	<string>https://whatsrusty.apps.balaj.me/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>9q0PzQIIxhsgZT877jGgyo11cQVAjhI1KsygiZExj4I=</string>
 	<key>SURequireSignedFeed</key>

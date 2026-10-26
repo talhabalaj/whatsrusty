@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { releaseResponse } from '../src/releases.ts';
-const request = (path, method='GET') => new Request(`https://whatsapp.apps.balaj.me${path}`, {method});
+const request = (path, method='GET') => new Request(`https://whatsrusty.apps.balaj.me${path}`, {method});
 test('immutable downloads redirect only to the owned versioned GitHub release', async () => {
   const response = await releaseResponse(request('/downloads/WhatsRusty-1.2.3-8.zip'));
   assert.equal(response.headers.get('location'), 'https://github.com/talhabalaj/whatsrusty/releases/download/v1.2.3/WhatsRusty-1.2.3-8.zip');

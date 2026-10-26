@@ -23,7 +23,7 @@ plist="$app_path/Contents/Info.plist"
 plist_value() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
 [[ "$(plist_value CFBundleIdentifier)" == me.balaj.WhatsRusty ]]
 [[ "$(plist_value SUPublicEDKey)" == "$SPARKLE_PUBLIC_KEY" ]]
-[[ "$(plist_value SUFeedURL)" == https://whatsapp.apps.balaj.me/appcast.xml ]]
+[[ "$(plist_value SUFeedURL)" == https://whatsrusty.apps.balaj.me/appcast.xml ]]
 [[ "$(plist_value SURequireSignedFeed)" == true ]]
 [[ "$(plist_value SUVerifyUpdateBeforeExtraction)" == true ]]
 [[ -d "$app_path/Contents/Frameworks/Sparkle.framework" ]]

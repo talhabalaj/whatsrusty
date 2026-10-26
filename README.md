@@ -1,7 +1,7 @@
 # WhatsRusty
 
 A native macOS WhatsApp client in Rust with an iMessage-style UI. Website and downloads:
-[whatsapp.apps.balaj.me](https://whatsapp.apps.balaj.me).
+[whatsrusty.apps.balaj.me](https://whatsrusty.apps.balaj.me).
 
 - **UI:** [GPUI](https://www.gpui.rs/) (Zed's GPU-accelerated UI framework) via [GPUI Kit](https://gpui-kit.com) 0.8.
 - **Protocol:** [whatsapp-rust](https://github.com/jlucaso1/whatsapp-rust) 0.7 (multi-device WhatsApp Web protocol, Signal E2EE).
@@ -21,7 +21,7 @@ packaging/      Info.plist, entitlements, icon, Sparkle package, build/release s
 project.yml     XcodeGen spec for WhatsRusty.xcodeproj (wraps the cargo build into an app bundle)
 ci_scripts/     Xcode Cloud hooks (Rust toolchain install, version stamping)
 scripts/ci/     Release verification, Sparkle signing, GitHub Release publishing
-site/           whatsapp.apps.balaj.me (Cloudflare Worker): landing page, /appcast.xml, /downloads/*
+site/           whatsrusty.apps.balaj.me (Cloudflare Worker): landing page, /appcast.xml, /downloads/*
 reference/      (gitignored) Baileys + whatsapp-rust sources, for reading only
 ```
 
