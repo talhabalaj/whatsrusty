@@ -10,3 +10,4 @@ Local.xcconfig
 xcuserdata/
 *.xcarchive
 packaging/Sparkle/.swiftpm
+__pycache__/

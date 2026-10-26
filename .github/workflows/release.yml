@@ -5,14 +5,19 @@ on:
     tags: ['v*']
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Existing release tag, for example v1.1.0'
+      tag:
+        description: 'Release tag, for example v0.1.0 (for a dry run it need not exist yet)'
         required: true
         type: string
-      cloud_build_id:
-        description: 'Optional completed Xcode Cloud build ID to resume publishing'
+      ref:
+        description: 'Ref to build when the tag does not exist yet (dry run)'
         required: false
+        default: main
         type: string
+      dry_run:
+        description: 'Build, notarize and sign only; publish nothing'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -22,103 +27,79 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Xcode Cloud only archives and notarizes; the Rust tests gate the release here.
-  test:
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          persist-credentials: false
-      - name: Install the pinned Rust toolchain
-        run: |
-          toolchain="$(cat ci_scripts/rust-toolchain)"
-          rustup toolchain install "$toolchain" --profile minimal --target aarch64-apple-darwin
-          rustup default "$toolchain"
-      - run: xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
-      - run: cargo test --locked --workspace
-
-  cloud-build:
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 130
-    env:
-      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-      ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
-      XCODE_CLOUD_WORKFLOW_ID: ${{ vars.XCODE_CLOUD_WORKFLOW_ID }}
-      RELEASE_REF: ${{ inputs.ref || github.ref }}
-      CLOUD_BUILD_ID: ${{ inputs.cloud_build_id }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '22'
-      - name: Require release tag and cloud configuration
-        run: |
-          if [[ "$RELEASE_REF" != refs/tags/* ]]; then RELEASE_REF="refs/tags/$RELEASE_REF"; fi
-          [[ "$RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo 'Use a numeric v1.2.3 release tag.' >&2; exit 1; }
-          test -n "$ASC_KEY_ID" && test -n "$ASC_ISSUER_ID" && test -n "$ASC_PRIVATE_KEY" || { echo 'Configure the ASC API credentials in repository secrets.' >&2; exit 1; }
-          test -n "$XCODE_CLOUD_WORKFLOW_ID" || { echo 'Configure XCODE_CLOUD_WORKFLOW_ID in repository variables.' >&2; exit 1; }
-          printf 'RELEASE_REF=%s\n' "$RELEASE_REF" >> "$GITHUB_ENV"
-      - name: Build and notarize in Xcode Cloud
-        run: |
-          commit_sha="$(git rev-parse HEAD)"
-          command=start
-          args=()
-          if [[ -n "$CLOUD_BUILD_ID" ]]; then command=download; args+=(--build-id "$CLOUD_BUILD_ID"); fi
-          node scripts/ci/xcode-cloud.mjs "$command" \
-            --workflow-id "$XCODE_CLOUD_WORKFLOW_ID" \
-            --ref "$RELEASE_REF" --sha "$commit_sha" \
-            --output build/ci/notarized-artifact.zip \
-            --result build/ci/xcode-cloud-result.json \
-            --timeout-seconds 7200 "${args[@]}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: xcode-cloud-notarized
-          path: |
-            build/ci/notarized-artifact.zip
-            build/ci/xcode-cloud-result.json
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs: cloud-build
+  release:
+    runs-on: macos-26
+    timeout-minutes: 120
+    # Only this job can write releases, with the run's ephemeral token.
     permissions:
       contents: write
-    runs-on: macos-latest
-    timeout-minutes: 30
     env:
-      GH_TOKEN: ${{ github.token }}
-      SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
-      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: xcode-cloud-notarized
-          path: build/ci
-      - name: Verify notarization and sign update files
-        run: bash scripts/ci/package-release.sh build/ci/notarized-artifact.zip "$PWD/build/ci/xcode-cloud-result.json" build/ci/release
-      - name: Publish verified archive and signed feed to GitHub Releases
-        run: node scripts/ci/publish-release.mjs build/ci/release
-      - name: Retain release and publication evidence
+      - name: Select the newest Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - name: Install the pinned Rust toolchain
+        run: |
+          toolchain="$(cat packaging/rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --target aarch64-apple-darwin
+          rustup default "$toolchain"
+      # gpui compiles its Metal shaders at build time; newer Xcode ships the compiler separately.
+      - run: xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - run: cargo test --locked --workspace
+      - name: Import the Developer ID certificate into a temporary keychain
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          test -n "$DEVELOPER_ID_P12" && test -n "$DEVELOPER_ID_P12_PASSWORD" || { echo 'Configure DEVELOPER_ID_P12 and DEVELOPER_ID_P12_PASSWORD.' >&2; exit 1; }
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$DEVELOPER_ID_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -P "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$keychain" | grep -q 'Developer ID Application: .*(W7TT249CUU)'
+      - name: Write the App Store Connect key for notarization
+        env:
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+      - name: Build, notarize, sign and publish (dry run publishes nothing)
+        env:
+          NOTARY_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          args=("$RELEASE_TAG")
+          [[ "$DRY_RUN" != true ]] || args+=(--dry-run)
+          packaging/publish.sh "${args[@]}"
+      - name: Retain the signed release files
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: whatsrusty-release
-          path: build/ci/release/
+          path: build/release-out/
           if-no-files-found: warn
           retention-days: 30
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2>/dev/null || true
+          rm -P -f "$RUNNER_TEMP/AuthKey.p8"

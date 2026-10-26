@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local Developer ID release of WhatsRusty, outside the Xcode Cloud pipeline (see CI.md):
+# Developer ID release build of WhatsRusty, used by packaging/publish.sh locally and in CI (see CI.md):
 # xcodebuild archive -> developer-id export -> verify -> notarize + staple app -> DMG -> notarize + staple DMG.
 #
 #   packaging/release.sh                 # full pipeline -> dist/WhatsRusty-<version>.dmg (+ .zip)
@@ -9,6 +9,9 @@
 #   SIGN_IDENTITY     codesign identity (default: SHA-1 of the first
 #                     "Developer ID Application ... (W7TT249CUU)" identity in the keychain)
 #   NOTARY_PROFILE    notarytool keychain profile (default: WhatsRusty)
+#   NOTARY_KEY_PATH   App Store Connect .p8 key file; with NOTARY_KEY_ID and NOTARY_ISSUER it
+#                     replaces the keychain profile (CI)
+#   MARKETING_VERSION CFBundleShortVersionString (default: the project's MARKETING_VERSION)
 #   BUILD_NUMBER      CFBundleVersion (default: the project's CURRENT_PROJECT_VERSION)
 #   CARGO_TARGET_DIR  passed through to the cargo build phase (default: ./target)
 set -euo pipefail
@@ -19,6 +22,11 @@ cd "$ROOT"
 APP_NAME="WhatsRusty"
 TEAM_ID="W7TT249CUU"
 NOTARY_PROFILE="${NOTARY_PROFILE:-WhatsRusty}"
+if [[ -n ${NOTARY_KEY_PATH:-} ]]; then
+  NOTARY_AUTH=(--key "$NOTARY_KEY_PATH" --key-id "${NOTARY_KEY_ID:?}" --issuer "${NOTARY_ISSUER:?}")
+else
+  NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+fi
 BUILD_DIR="$ROOT/build/release"
 ARCHIVE="$BUILD_DIR/$APP_NAME.xcarchive"
 EXPORT="$BUILD_DIR/export"
@@ -35,9 +43,9 @@ done
 step() { printf '\n==> %s\n' "$*"; }
 
 # Fail before a long build if notarization can't happen.
-if [[ $NOTARIZE == 1 ]] && ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+if [[ $NOTARIZE == 1 ]] && ! xcrun notarytool history "${NOTARY_AUTH[@]}" >/dev/null 2>&1; then
   cat >&2 <<EOF
-error: no notarytool keychain profile named "$NOTARY_PROFILE".
+error: notarytool credentials don't work (profile "$NOTARY_PROFILE" or NOTARY_KEY_PATH).
 
 Store an App Store Connect API key once (Users and Access > Integrations > Team Keys), then re-run:
 
@@ -55,7 +63,8 @@ if [[ -z ${SIGN_IDENTITY:-} ]]; then
   [[ -n $SIGN_IDENTITY ]] || { echo "error: no Developer ID Application identity for $TEAM_ID" >&2; exit 1; }
 fi
 
-if [[ ! -d WhatsRusty.xcodeproj ]] || [[ project.yml -nt WhatsRusty.xcodeproj/project.pbxproj ]]; then
+# The generated project is committed; regenerate only when it is missing or stale and xcodegen is around.
+if [[ ! -d WhatsRusty.xcodeproj ]] || { [[ project.yml -nt WhatsRusty.xcodeproj/project.pbxproj ]] && command -v xcodegen >/dev/null; }; then
   step "Generating WhatsRusty.xcodeproj"
   xcodegen generate
 fi
@@ -64,6 +73,7 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 overrides=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=$SIGN_IDENTITY" "DEVELOPMENT_TEAM=$TEAM_ID")
 [[ -z ${BUILD_NUMBER:-} ]] || overrides+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
+[[ -z ${MARKETING_VERSION:-} ]] || overrides+=("MARKETING_VERSION=$MARKETING_VERSION")
 
 step "Archiving (Release, arm64)"
 xcodebuild -project WhatsRusty.xcodeproj -scheme WhatsRusty -configuration Release \
@@ -78,7 +88,7 @@ plutil -insert teamID -string "$TEAM_ID" "$BUILD_DIR/export-options.plist"
 plutil -insert signingCertificate -string "$SIGN_IDENTITY" "$BUILD_DIR/export-options.plist"
 xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT" \
   -exportOptionsPlist "$BUILD_DIR/export-options.plist"
-python3 -I "$ROOT/scripts/ci/cloud-app.py" "$EXPORT" >/dev/null
+python3 -I "$ROOT/scripts/ci/app_bundle.py" "$EXPORT" >/dev/null
 
 step "Verifying signatures"
 codesign --verify --deep --strict --verbose=2 "$APP"
@@ -93,19 +103,27 @@ for nested in Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate \
 done
 codesign --display --entitlements - --xml "$APP" > "$BUILD_DIR/entitlements.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$BUILD_DIR/entitlements.plist")" == true ]]
+for entitlement in com.apple.security.app-sandbox com.apple.security.get-task-allow; do
+  value="$(/usr/libexec/PlistBuddy -c "Print :$entitlement" "$BUILD_DIR/entitlements.plist" 2>/dev/null || true)"
+  [[ "$value" != true ]] || { echo "error: unexpected release entitlement $entitlement" >&2; exit 1; }
+done
+info() { /usr/libexec/PlistBuddy -c "Print :$1" "$APP/Contents/Info.plist"; }
+[[ "$(info CFBundleIdentifier)" == me.balaj.WhatsRusty ]]
+[[ "$(info SURequireSignedFeed)" == true && "$(info SUVerifyUpdateBeforeExtraction)" == true ]]
+[[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]
 [[ "$(lipo -archs "$APP/Contents/MacOS/$APP_NAME")" == arm64 ]]
 # Before notarization spctl reports "Unnotarized Developer ID"; that's expected.
 spctl -a -vv -t exec "$APP" || true
 
 notarize() {
   step "Notarizing $(basename "$1")"
-  xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json \
+  xcrun notarytool submit "$1" "${NOTARY_AUTH[@]}" --wait --output-format json \
     | tee "$BUILD_DIR/notary.json"
   local id status
   id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$BUILD_DIR/notary.json")"
   status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$BUILD_DIR/notary.json")"
   if [[ $status != Accepted ]]; then
-    xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" >&2 || true
+    xcrun notarytool log "$id" "${NOTARY_AUTH[@]}" >&2 || true
     echo "error: notarization $status" >&2
     exit 1
   fi
@@ -122,6 +140,7 @@ if [[ $NOTARIZE == 1 ]]; then
   # own ticket and launches offline after being dragged to /Applications.
   ditto -c -k --keepParent "$APP" "$BUILD_DIR/notarize.zip"
   notarize "$BUILD_DIR/notarize.zip"
+  cp "$BUILD_DIR/notary.json" "$BUILD_DIR/notary-app.json"
   xcrun stapler staple "$APP"
   xcrun stapler validate "$APP"
   spctl -a -vv -t exec "$APP"

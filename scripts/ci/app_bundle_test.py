@@ -3,9 +3,9 @@ import plistlib
 import runpy
 import tempfile
 import unittest
-canonical_app = runpy.run_path(str(Path(__file__).with_name('cloud-app.py')))['canonical_app']
+canonical_app = runpy.run_path(str(Path(__file__).with_name('app_bundle.py')))['canonical_app']
 
-class CloudAppTests(unittest.TestCase):
+class AppBundleTests(unittest.TestCase):
     def make(self, root, name='WhatsRusty.app', **overrides):
         app = Path(root) / name
         (app / 'Contents').mkdir(parents=True)

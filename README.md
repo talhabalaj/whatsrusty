@@ -19,7 +19,6 @@ crates/
   app/          GPUI app (cargo package `whatsapp-gpui`): sidebar, transcript, composer, QR linking, mock backend
 packaging/      Info.plist, entitlements, icon, Sparkle package, build/release scripts (see packaging/README.md)
 project.yml     XcodeGen spec for WhatsRusty.xcodeproj (wraps the cargo build into an app bundle)
-ci_scripts/     Xcode Cloud hooks (Rust toolchain install, version stamping)
 scripts/ci/     Release verification, Sparkle signing, GitHub Release publishing
 site/           whatsrusty.apps.balaj.me (Cloudflare Worker): landing page, /appcast.xml, /downloads/*
 reference/      (gitignored) Baileys + whatsapp-rust sources, for reading only
@@ -46,5 +45,5 @@ Debug data lives in `~/Library/Application Support/WhatsRustyDev/`, release data
 
 ## Releases
 
-Push a `vX.Y.Z` tag: Xcode Cloud archives and notarizes, GitHub Actions verifies, Sparkle-signs and
-publishes. See [CI.md](CI.md) and [SIGNING.md](SIGNING.md).
+Push a `vX.Y.Z` tag: GitHub Actions builds, signs, notarizes, Sparkle-signs and publishes
+(`packaging/publish.sh` does the same from a Mac). See [CI.md](CI.md) and [SIGNING.md](SIGNING.md).

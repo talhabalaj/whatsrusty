@@ -15,9 +15,10 @@ export function releaseFiles(input) {
   if (!/^[A-Za-z0-9+/]{86}==$/.test(input.signature ?? '') || Buffer.from(input.signature, 'base64').length !== 64) throw new Error('Invalid update signature.');
   if (!Number.isSafeInteger(input.bytes) || input.bytes < 1) throw new Error('Invalid archive size.');
   if (input.architecture !== 'arm64') throw new Error('The release must target Apple silicon.');
-  if (!input.cloudBuildId || !input.artifactId) throw new Error('Xcode Cloud artifact provenance is required.');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.notaryId ?? '')) throw new Error('The Apple notarization submission ID is required.');
+  if (!input.builder) throw new Error('Build provenance is required.');
   const file = `WhatsRusty-${input.version}-${input.build}.zip`;
-  const manifest = { version: input.version, build: input.build, file, sha256: input.sha256, bytes: input.bytes, minimumMacOS: input.minimumMacOS, architecture: input.architecture, notarized: true, commitSha: input.commitSha, cloudBuildId: input.cloudBuildId, artifactId: input.artifactId };
+  const manifest = { version: input.version, build: input.build, file, sha256: input.sha256, bytes: input.bytes, minimumMacOS: input.minimumMacOS, architecture: input.architecture, notarized: true, commitSha: input.commitSha, notaryId: input.notaryId, builder: input.builder };
   const minimum = input.minimumMacOS.split('.');
   while (minimum.length < 3) minimum.push('0');
   const appcast = `<?xml version="1.0" encoding="utf-8"?>

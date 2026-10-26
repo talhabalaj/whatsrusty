@@ -17,7 +17,7 @@ function fixture() {
   const keys=generateKeyPairSync('ed25519');
   const publicKey=keys.publicKey.export({type:'spki',format:'der'}).subarray(-32).toString('base64');
   const archive=Buffer.from('signed archive fixture');
-  const metadata={version:'1.1',build:'8',minimumMacOS:'26.0',bytes:archive.length,sha256:createHash('sha256').update(archive).digest('hex'),signature:sign(null,archive,keys.privateKey).toString('base64'),commitSha:'b'.repeat(40),architecture:'arm64',cloudBuildId:'build',artifactId:'artifact'};
+  const metadata={version:'1.1',build:'8',minimumMacOS:'26.0',bytes:archive.length,sha256:createHash('sha256').update(archive).digest('hex'),signature:sign(null,archive,keys.privateKey).toString('base64'),commitSha:'b'.repeat(40),architecture:'arm64',notaryId:'0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d',builder:'github-actions run 1'};
   const {manifest,appcast}=releaseFiles(metadata), feed=signedFeed(appcast,keys.privateKey);
   for(const [name,content] of Object.entries({'manifest.json':JSON.stringify(manifest),'metadata.json':JSON.stringify(metadata),[manifest.file]:archive,[`${manifest.file}.sha256`]:`${manifest.sha256}  ${manifest.file}\n`,'appcast.xml':feed})) writeFileSync(join(output,name),content);
   const assets=new Map(), events=[], hooks={};

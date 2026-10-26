@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { releaseArchivePattern, releaseFiles, releaseOrigin } from './release-files.mjs';
 
-const valid = { version: '1.1', build: '20261004.2', minimumMacOS: '27.0', sha256: 'a'.repeat(64), commitSha: 'b'.repeat(40), signature: Buffer.alloc(64, 1).toString('base64'), bytes: 1234, architecture: 'arm64', cloudBuildId: 'cloud-build', artifactId: 'notarized-artifact' };
+const valid = { version: '1.1', build: '20261004.2', minimumMacOS: '27.0', sha256: 'a'.repeat(64), commitSha: 'b'.repeat(40), signature: Buffer.alloc(64, 1).toString('base64'), bytes: 1234, architecture: 'arm64', notaryId: '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', builder: 'github-actions run 7' };
 
-test('feed and manifest reference the same immutable archive and Cloud build', () => {
+test('feed and manifest reference the same immutable archive and notarization', () => {
   const { manifest, appcast } = releaseFiles(valid);
   assert.equal(releaseOrigin, 'https://whatsrusty.apps.balaj.me');
   assert.equal(manifest.file, 'WhatsRusty-1.1-20261004.2.zip');
-  assert.equal(manifest.cloudBuildId, valid.cloudBuildId);
+  assert.equal(manifest.notaryId, valid.notaryId);
+  assert.equal(manifest.builder, valid.builder);
   assert.match(appcast, /downloads\/WhatsRusty-1\.1-20261004\.2\.zip/);
   assert.match(appcast, /<title>WhatsRusty Updates<\/title>/);
   assert.match(appcast, /<title>WhatsRusty 1\.1<\/title>/);
@@ -29,7 +30,7 @@ test('accepts renamed and immutable historical archive names without accepting u
 });
 
 test('rejects unsafe versions, invalid signatures and missing notarized provenance', () => {
-  for (const patch of [{ version: '../release' }, { build: '1\"><script>' }, { signature: 'unsigned' }, { sha256: '' }, { bytes: -1 }, { architecture: 'x86_64' }, { cloudBuildId: '' }, { artifactId: '' }, { commitSha: 'main' }]) {
+  for (const patch of [{ version: '../release' }, { build: '1\"><script>' }, { signature: 'unsigned' }, { sha256: '' }, { bytes: -1 }, { architecture: 'x86_64' }, { notaryId: '' }, { notaryId: 'not-a-uuid' }, { builder: '' }, { commitSha: 'main' }]) {
     assert.throws(() => releaseFiles({ ...valid, ...patch }));
   }
 });

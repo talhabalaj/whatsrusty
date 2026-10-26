@@ -15,7 +15,7 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: |
-          toolchain="$(cat ci_scripts/rust-toolchain)"
+          toolchain="$(cat packaging/rust-toolchain)"
           rustup toolchain install "$toolchain" --profile minimal --component clippy --target aarch64-apple-darwin
           rustup default "$toolchain"
           rustc --version
@@ -43,5 +43,4 @@ jobs:
       - run: npm run build --prefix site
       - name: Check shell script syntax
         run: |
-          for f in scripts/ci/package-release.sh packaging/*.sh; do bash -n "$f"; done
-          for f in ci_scripts/*.sh; do sh -n "$f"; done
+          for f in packaging/*.sh; do bash -n "$f"; done

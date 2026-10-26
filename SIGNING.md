@@ -13,7 +13,7 @@ CODE_SIGN_STYLE[config=Release] = Manual
 CODE_SIGN_IDENTITY[config=Release] = Developer ID Application: Talha Balaj (W7TT249CUU)
 ```
 
-Xcode Cloud uses automatic signing and Apple's Notarize post-action; Apple manages its Developer ID certificate. Signing and notarization are distinct. `packaging/release.sh` signs locally with the Keychain's Developer ID identity and notarizes with a notarytool profile. See CI.md for the release checks.
+Signing and notarization are distinct. `packaging/release.sh` signs with the Developer ID identity in the keychain (the login Keychain on a Mac, a temporary keychain in CI) and notarizes with an App Store Connect API key. See CI.md for the release checks.
 
 Entitlements (`packaging/entitlements.plist`): hardened runtime, `com.apple.security.device.audio-input` (voice messages; enforced by the hardened runtime) and `com.apple.security.network.client`. No App Sandbox, no `get-task-allow`, no library-validation or JIT exceptions. Xcode re-signs Sparkle's nested helpers (Autoupdate, Updater.app, Downloader.xpc, Installer.xpc) with the same team and hardened runtime; the release verification checks each of them.
 
@@ -36,13 +36,13 @@ No private credentials are committed to this repository. A normal local build us
 
 | Purpose | Local source | CI source |
 | --- | --- | --- |
-| Developer ID code signing | Certificate and private key in macOS Keychain | Xcode Cloud manages app signing |
-| Apple notarization/API | notarytool profile `WhatsRusty`, from Personal 1Password **WhatsRusty - App Store Connect CI** | `ASC_PRIVATE_KEY`, `ASC_KEY_ID`, `ASC_ISSUER_ID` Actions secrets |
+| Developer ID code signing | Certificate and private key in macOS Keychain | `DEVELOPER_ID_P12` (base64 .p12 of that one identity) and `DEVELOPER_ID_P12_PASSWORD` Actions secrets, imported into a temporary keychain per run |
+| Apple notarization/API | notarytool profile `WhatsRusty`, from Personal 1Password **Pufflet - App Store Connect CI** (team-wide key, shared with Pufflet) | `ASC_PRIVATE_KEY`, `ASC_KEY_ID`, `ASC_ISSUER_ID` Actions secrets |
 | Sparkle archive/feed signing | Keychain service `https://sparkle-project.org`, account `me.balaj.WhatsRusty`; recovery in Personal 1Password **WhatsRusty - Sparkle update signing** | `SPARKLE_PRIVATE_KEY` Actions secret |
-| Website deployment | Personal 1Password **WhatsRusty - Cloudflare CI token**, or the interactive `cf` login | `CLOUDFLARE_API_TOKEN` Actions secret |
-| GitHub release publishing | Existing authenticated `gh` session | Ephemeral `github.token` scoped to the publish job with `contents: write` |
+| Website deployment | Personal 1Password **Pufflet - Cloudflare CI token** (account- and `balaj.me`-scoped, shared with Pufflet), or the interactive `cf` login | `CLOUDFLARE_API_TOKEN` Actions secret |
+| GitHub release publishing | Existing authenticated `gh` session | Ephemeral `github.token` scoped to the release job with `contents: write` |
 | WhatsApp session | `session.db` in the app's data folder | Never used by CI or bundled in artifacts |
 
-The updater public key, bundle IDs, Cloudflare account ID and Cloud workflow ID are public configuration.
+The updater public key, bundle IDs and Cloudflare account ID are public configuration. Revoking the Developer ID certificate or rotating the shared App Store Connect key or Cloudflare token requires updating these secrets.
 
 https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements
