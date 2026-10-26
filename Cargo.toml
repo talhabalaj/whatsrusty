@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/wa-backend", "crates/app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+wa-backend = { path = "crates/wa-backend" }
+anyhow = "1"
+flume = "0.11"
+log = "0.4"
+
+[patch.crates-io]
+# Skips a startup font enumeration that blocks the UI for seconds on macOS.
+# See vendor/gpui-component/src/theme/system_font.rs (search "whatsapp-gpui patch").
+gpui-component = { path = "vendor/gpui-component" }

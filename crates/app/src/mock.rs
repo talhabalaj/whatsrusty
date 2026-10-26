@@ -1,0 +1,497 @@
+//! In-process fake backend so the UI can be developed without a WhatsApp session.
+//! Run with `WA_MOCK=1`.
+
+use std::thread;
+use std::time::Duration;
+
+use wa_backend::*;
+
+const ME: &str = "15550000000@s.whatsapp.net";
+
+pub fn spawn() -> BackendHandle {
+    let (cmd_tx, cmd_rx) = flume::unbounded::<Command>();
+    let (ev_tx, ev_rx) = flume::unbounded::<Event>();
+
+    thread::Builder::new()
+        .name("mock-backend".into())
+        .spawn(move || run(cmd_rx, ev_tx))
+        .expect("spawn mock backend");
+
+    BackendHandle { commands: cmd_tx, events: ev_rx }
+}
+
+struct Fake {
+    chats: Vec<ChatSummary>,
+    messages: Vec<ChatMessage>,
+    /// Older messages of the long chat that only "the phone" has, newest last.
+    phone_only: Vec<ChatMessage>,
+}
+
+const LONG_CHAT: &str = "15551110009@s.whatsapp.net";
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn msg(chat: &str, id: usize, from_me: bool, sender: Option<&str>, text: &str, ts: i64) -> ChatMessage {
+    ChatMessage {
+        id: format!("{chat}-{id}"),
+        chat_jid: chat.into(),
+        sender_jid: if from_me { ME.into() } else { sender.map_or(chat.into(), |s| format!("{s}@s.whatsapp.net")) },
+        sender_name: sender.map(String::from),
+        from_me,
+        body: MessageBody::Text(text.into()),
+        timestamp: ts,
+        status: if from_me { DeliveryStatus::Read } else { DeliveryStatus::Delivered },
+        quoted: None,
+        reactions: Vec::new(),
+        edited: false,
+    }
+}
+
+/// (jid, name, is_group, unread, [(text, from_me, sender, offset_secs)])
+type Seed<'a> = (&'a str, &'a str, bool, bool, &'a [(&'a str, bool, Option<&'a str>, i64)]);
+
+fn seed() -> Fake {
+    let n = now();
+    let h = 3600;
+    let d = 86400;
+    let mut messages = Vec::new();
+    let convo: &[Seed] = &[
+        ("15551110001@s.whatsapp.net", "Ayesha Khan", false, true, &[
+            ("Are we still on for dinner tonight?", false, None, -2 * h - 600),
+            ("Yes! 8pm works", true, None, -2 * h - 500),
+            ("I booked the table at that new place on Main St", true, None, -2 * h - 480),
+            ("Perfect 🙌", false, None, -2 * h - 300),
+            ("Should I bring anything?", false, None, -2 * h - 290),
+            ("Just yourself. And maybe that dessert you made last time 😄", true, None, -2 * h - 100),
+            ("Haha deal. See you at 8!", false, None, -300),
+        ]),
+        ("120363000000000001@g.us", "Weekend Hiking 🥾", true, false, &[
+            ("Trail conditions look great for Saturday", false, Some("Omar"), -d - 4 * h),
+            ("I'm in. Meeting at the north parking lot?", false, Some("Sara"), -d - 3 * h),
+            ("Works for me, I'll bring snacks", true, None, -d - 3 * h + 300),
+            ("Don't forget sunscreen this time 😅", false, Some("Omar"), -d - 2 * h),
+            ("That was ONE time", false, Some("Sara"), -d - 2 * h + 60),
+        ]),
+        ("15551110003@s.whatsapp.net", "Bilal", false, false, &[
+            ("Did you push the fix?", false, None, -2 * d),
+            ("Yep, it's on main now", true, None, -2 * d + 120),
+            ("Legend 🚀", false, None, -2 * d + 200),
+        ]),
+        ("15551110004@s.whatsapp.net", "Mom", false, false, &[
+            ("Call me when you're free", false, None, -4 * d),
+            ("Will do after work ❤️", true, None, -4 * d + 1800),
+        ]),
+        ("15551110005@s.whatsapp.net", "Zain Ahmed", false, false, &[
+            ("This is a much longer message to make sure wrapping works nicely inside the bubble, including multiple lines of text that keep going for a while so we can see how it looks.", false, None, -9 * d),
+            ("Looks good on my side", true, None, -9 * d + 60),
+        ]),
+    ];
+
+    let mut chats = Vec::new();
+    for (jid, name, is_group, unread, lines) in convo {
+        for (i, (text, from_me, sender, off)) in lines.iter().enumerate() {
+            messages.push(msg(jid, i, *from_me, *sender, text, n + off));
+        }
+        let last = lines.last().unwrap();
+        chats.push(ChatSummary {
+            jid: jid.to_string(),
+            name: name.to_string(),
+            is_group: *is_group,
+            last_message: Some(MessagePreview {
+                text: last.0.into(),
+                timestamp: n + last.3,
+                from_me: last.1,
+                sender_name: last.2.map(String::from),
+            }),
+            unread_count: if *unread { 1 } else { 0 },
+            pinned: false,
+            archived: false,
+            muted: false,
+            avatar: None,
+        });
+    }
+    // Media + a reply in Ayesha's chat.
+    let ayesha = "15551110001@s.whatsapp.net";
+    let mut photo = msg(ayesha, 100, false, None, "", n - 260);
+    photo.body = MessageBody::Image(ImageMedia {
+        path: None,
+        thumbnail: None,
+        width: Some(1600),
+        height: Some(900),
+        caption: Some("The view from the restaurant 😍".into()),
+        state: MediaState::Idle,
+    });
+    let mut voice = msg(ayesha, 101, false, None, "", n - 250);
+    voice.body = MessageBody::Voice(VoiceMedia {
+        path: None,
+        duration_secs: 7,
+        waveform: (0..64).map(|i| ((i as f32 * 0.45).sin().abs() * 80. + 10.) as u8).collect(),
+        ptt: true,
+        state: MediaState::Idle,
+    });
+    let mut reply = msg(ayesha, 102, true, None, "Wow that looks amazing", n - 240);
+    reply.quoted = Some(QuotedMessage {
+        id: format!("{ayesha}-100"),
+        from_me: false,
+        sender_name: Some("Ayesha Khan".into()),
+        preview: "📷 The view from the restaurant 😍".into(),
+    });
+    reply.reactions = vec![Reaction {
+        emoji: "❤️".into(),
+        sender_jid: ayesha.into(),
+        sender_name: Some("Ayesha Khan".into()),
+        from_me: false,
+        timestamp: n - 230,
+    }];
+    messages.extend([photo, voice, reply]);
+    // A few tapbacks in the group, including one of mine.
+    for m in messages.iter_mut().filter(|m| m.chat_jid == "120363000000000001@g.us") {
+        if m.id.ends_with("-3") {
+            m.reactions = vec![
+                Reaction { emoji: "😂".into(), sender_jid: "Sara@s.whatsapp.net".into(), sender_name: Some("Sara".into()), from_me: false, timestamp: n },
+                Reaction { emoji: "😂".into(), sender_jid: ME.into(), sender_name: None, from_me: true, timestamp: n },
+                Reaction { emoji: "👍".into(), sender_jid: "Ali@s.whatsapp.net".into(), sender_name: Some("Ali".into()), from_me: false, timestamp: n },
+            ];
+        }
+        if m.id.ends_with("-4") {
+            m.quoted = Some(QuotedMessage { id: format!("{}-3", m.chat_jid), from_me: false, sender_name: Some("Omar".into()), preview: "Don't forget sunscreen this time 😅".into() });
+        }
+    }
+
+    // Every other message kind, in a chat that sorts first.
+    let kinds = "15551110010@s.whatsapp.net";
+    let mut k = |i: usize, from_me: bool, body: MessageBody| {
+        let mut m = msg(kinds, 200 + i, from_me, None, "", n - 200 + i as i64 * 5);
+        m.body = body;
+        messages.push(m);
+    };
+    k(0, false, MessageBody::System { text: "📞 Missed voice call".into() });
+    k(1, false, MessageBody::Rich(RichText {
+        header: Some("Your bill is ready".into()),
+        body: "Your October bill of Rs. 1,250 is due on 5 Nov. Pay now to avoid late charges.".into(),
+        footer: Some("Jazz · Official account".into()),
+        buttons: vec!["Pay now".into(), "View bill".into()],
+    }));
+    k(2, true, MessageBody::Document(DocumentMedia {
+        path: None,
+        file_name: "Quarterly report.pdf".into(),
+        mimetype: Some("application/pdf".into()),
+        size_bytes: Some(2_400_000),
+        page_count: Some(14),
+        thumbnail: None,
+        caption: None,
+        state: MediaState::Idle,
+    }));
+    k(3, false, MessageBody::Location(LocationInfo {
+        latitude: 31.5204,
+        longitude: 74.3587,
+        name: Some("Liberty Market".into()),
+        address: Some("Gulberg III, Lahore".into()),
+        thumbnail: None,
+        live: false,
+    }));
+    k(4, false, MessageBody::Contacts(vec![ContactCard { display_name: "Hamza Ali".into(), phones: vec!["+92 300 1234567".into()] }]));
+    k(5, true, MessageBody::Poll(PollInfo {
+        question: "Dinner on Friday?".into(),
+        options: vec!["Pizza".into(), "BBQ".into(), "Chinese".into()],
+        multiple: false,
+    }));
+    k(6, false, MessageBody::Video(VideoMedia {
+        path: None,
+        thumbnail: None,
+        width: Some(1280),
+        height: Some(720),
+        duration_secs: 42,
+        caption: None,
+        gif: false,
+        round: false,
+        state: MediaState::Idle,
+    }));
+    // WA_MOCK_STICKER=<file.webp> shows that (e.g. animated) sticker instead of a failed one.
+    let sticker_path = std::env::var_os("WA_MOCK_STICKER").map(std::path::PathBuf::from);
+    let sticker_state = if sticker_path.is_some() { MediaState::Idle } else { MediaState::Failed };
+    k(7, false, MessageBody::Sticker(StickerMedia { path: sticker_path, width: None, height: None, animated: true, state: sticker_state }));
+    chats.insert(0, ChatSummary {
+        jid: kinds.into(),
+        name: "Message Kinds".into(),
+        is_group: false,
+        last_message: Some(MessagePreview { text: "Sticker".into(), timestamp: n - 165, from_me: false, sender_name: None }),
+        unread_count: 0,
+        pinned: true,
+        archived: false,
+        muted: false,
+        avatar: None,
+    });
+
+    // A message that wasn't delivered, to show "Try Again".
+    if let Some(m) = messages.iter_mut().find(|m| m.chat_jid == "15551110003@s.whatsapp.net" && m.from_me) {
+        m.status = DeliveryStatus::Failed;
+    }
+
+    // A long thread: 300 messages stored locally, 150 more only on "the phone".
+    let mut phone_only = Vec::new();
+    for i in 0..450 {
+        let ts = n - (450 - i as i64) * 1800;
+        let m = msg(LONG_CHAT, i, i % 3 == 0, None, &format!("Message #{i}"), ts);
+        if i < 150 { phone_only.push(m) } else { messages.push(m) }
+    }
+    chats.push(ChatSummary {
+        jid: LONG_CHAT.into(),
+        name: "Long Thread".into(),
+        is_group: false,
+        last_message: Some(MessagePreview { text: "Message #449".into(), timestamp: n - 1800, from_me: false, sender_name: None }),
+        unread_count: 0,
+        pinned: true,
+        archived: false,
+        muted: false,
+        avatar: None,
+    });
+    // Pad with extra contacts to exercise scrolling.
+    for i in 0..18 {
+        let jid = format!("1555200{i:04}@s.whatsapp.net");
+        let ts = n - (12 + i as i64) * d;
+        messages.push(msg(&jid, 0, false, None, "See you soon!", ts));
+        chats.push(ChatSummary {
+            jid,
+            name: ["Hamza", "Fatima Noor", "Ali Raza", "Hina", "Usman Tariq", "Mariam"][i % 6].to_string(),
+            is_group: false,
+            last_message: Some(MessagePreview { text: "See you soon!".into(), timestamp: ts, from_me: false, sender_name: None }),
+            unread_count: 0,
+            pinned: false,
+            archived: false,
+            muted: false,
+            avatar: None,
+        });
+    }
+    Fake { chats, messages, phone_only }
+}
+
+fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
+    let mut fake = seed();
+    let _ = ev.send(Event::Connection(ConnectionState::Connecting));
+    thread::sleep(Duration::from_millis(300));
+    let _ = ev.send(Event::Connection(ConnectionState::Connected { own_jid: ME.into(), push_name: Some("Me".into()) }));
+    let _ = ev.send(Event::Chats(fake.chats.clone()));
+
+    while let Ok(cmd) = cmds.recv() {
+        match cmd {
+            Command::LoadMessages { chat_jid, before, limit } => {
+                let older: Vec<_> = fake
+                    .messages
+                    .iter()
+                    .filter(|m| m.chat_jid == chat_jid && before.is_none_or(|b| m.timestamp < b))
+                    .cloned()
+                    .collect();
+                let page = older[older.len().saturating_sub(limit as usize)..].to_vec();
+                let local_more = page.len() < older.len();
+                let remote = chat_jid == LONG_CHAT && !fake.phone_only.is_empty();
+                let _ = ev.send(Event::Messages { chat_jid: chat_jid.clone(), messages: page, has_more: local_more || remote });
+                if before.is_some() && !local_more && remote {
+                    // Simulate the phone answering an on-demand request with 50 messages.
+                    let _ = ev.send(Event::HistoryLoading { chat_jid: chat_jid.clone(), loading: true, exhausted: false });
+                    thread::sleep(Duration::from_millis(1200));
+                    let batch: Vec<_> = fake.phone_only.split_off(fake.phone_only.len().saturating_sub(50));
+                    fake.messages.extend(batch.iter().cloned());
+                    let exhausted = fake.phone_only.is_empty();
+                    let _ = ev.send(Event::Messages { chat_jid: chat_jid.clone(), messages: batch, has_more: !exhausted });
+                    let _ = ev.send(Event::HistoryLoading { chat_jid, loading: false, exhausted });
+                }
+            }
+            Command::SendText { chat_jid, text, client_id, reply_to } => {
+                let mut m = msg(&chat_jid, 0, true, None, &text, now());
+                m.id = client_id;
+                m.quoted = reply_to.and_then(|id| fake.messages.iter().find(|q| q.id == id)).map(|q| QuotedMessage {
+                    id: q.id.clone(),
+                    from_me: q.from_me,
+                    sender_name: q.sender_name.clone(),
+                    preview: crate::state::body_text(&q.body).to_string(),
+                });
+                m.status = DeliveryStatus::Pending;
+                fake.messages.push(m.clone());
+                if let Some(c) = fake.chats.iter_mut().find(|c| c.jid == chat_jid) {
+                    c.last_message = Some(MessagePreview { text: text.clone(), timestamp: m.timestamp, from_me: true, sender_name: None });
+                }
+                fake.chats.sort_by_key(|c| std::cmp::Reverse(c.last_message.as_ref().map_or(0, |l| l.timestamp)));
+                let _ = ev.send(Event::MessageUpserted(m.clone()));
+                let _ = ev.send(Event::Chats(fake.chats.clone()));
+                let ev = ev.clone();
+                thread::spawn(move || {
+                    for status in [DeliveryStatus::Sent, DeliveryStatus::Delivered, DeliveryStatus::Read] {
+                        thread::sleep(Duration::from_millis(700));
+                        let _ = ev.send(Event::StatusChanged { chat_jid: m.chat_jid.clone(), message_ids: vec![m.id.clone()], status });
+                    }
+                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: true });
+                    thread::sleep(Duration::from_millis(1500));
+                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: false });
+                    let mut reply = msg(&m.chat_jid, 0, false, None, "👍", now());
+                    reply.id = format!("{}-reply", m.id);
+                    let _ = ev.send(Event::MessageUpserted(reply));
+                });
+            }
+            Command::MarkRead { chat_jid } => {
+                if let Some(c) = fake.chats.iter_mut().find(|c| c.jid == chat_jid) {
+                    c.unread_count = 0;
+                }
+                let _ = ev.send(Event::Chats(fake.chats.clone()));
+            }
+            Command::SetTyping { .. } | Command::FetchAvatar { .. } => {}
+            Command::RetrySend { chat_jid, message_id } => {
+                if let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) {
+                    m.status = DeliveryStatus::Pending;
+                    let _ = ev.send(Event::MessageUpserted(m.clone()));
+                    let _ = ev.send(Event::StatusChanged { chat_jid, message_ids: vec![message_id], status: DeliveryStatus::Sent });
+                }
+            }
+            Command::EditMessage { chat_jid, message_id, text } => {
+                if let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) {
+                    m.body = MessageBody::Text(text);
+                    m.edited = true;
+                    let _ = ev.send(Event::MessageUpserted(m.clone()));
+                }
+            }
+            Command::ListStickers => {
+                let preview = mock_photo();
+                let list = (0..10)
+                    .map(|i| StickerRef {
+                        id: format!("mock-sticker-{i}"),
+                        preview: preview.clone(),
+                        source: if i < 4 { StickerSource::Favorite } else { StickerSource::Recent },
+                        animated: false,
+                    })
+                    .collect();
+                let _ = ev.send(Event::Stickers(list));
+            }
+            Command::SendSticker { chat_jid, client_id, .. } => {
+                let mut m = msg(&chat_jid, 0, true, None, "", now());
+                m.id = client_id;
+                m.status = DeliveryStatus::Sent;
+                m.body = MessageBody::Sticker(StickerMedia { path: mock_photo(), width: None, height: None, animated: false, state: MediaState::Idle });
+                fake.messages.push(m.clone());
+                let _ = ev.send(Event::MessageUpserted(m));
+            }
+            Command::FetchProfile { jid } => {
+                let chat = fake.chats.iter().find(|c| c.jid == jid);
+                let name = chat.map_or_else(|| jid.split('@').next().unwrap_or("").to_string(), |c| c.name.clone());
+                let is_group = jid.ends_with("@g.us");
+                let participant = |n: &str, admin: bool, me: bool| Participant {
+                    jid: format!("{n}@s.whatsapp.net"),
+                    name: n.to_string(),
+                    is_admin: admin,
+                    is_me: me,
+                };
+                let _ = ev.send(Event::Profile(Profile {
+                    jid: jid.clone(),
+                    name,
+                    phone: (!is_group).then(|| format!("+{}", jid.split('@').next().unwrap_or(""))),
+                    about: (!is_group).then(|| "Busy building things 🛠️".to_string()),
+                    photo: None,
+                    is_group,
+                    description: is_group.then(|| "Weekend hikes around Margalla Hills. Bring water!".to_string()),
+                    participants: if is_group {
+                        vec![participant("Omar", true, false), participant("Me", false, true), participant("Sara", false, false), participant("Ali", false, false)]
+                    } else {
+                        Vec::new()
+                    },
+                    created_at: None,
+                }));
+            }
+            Command::React { chat_jid, message_id, emoji } => {
+                let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) else {
+                    continue;
+                };
+                m.reactions.retain(|r| !r.from_me);
+                if let Some(emoji) = emoji {
+                    m.reactions.push(Reaction { emoji, sender_jid: ME.into(), sender_name: None, from_me: true, timestamp: now() });
+                }
+                let _ = ev.send(Event::MessageUpserted(m.clone()));
+            }
+            Command::DownloadMedia { chat_jid, message_id } => {
+                let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) else {
+                    continue;
+                };
+                match &mut m.body {
+                    MessageBody::Image(img) => img.path = mock_photo(),
+                    MessageBody::Voice(v) => v.path = mock_voice(v.duration_secs),
+                    _ => continue,
+                }
+                let _ = ev.send(Event::MessageUpserted(m.clone()));
+            }
+            Command::SendImage { chat_jid, path, client_id, .. } => {
+                let mut m = msg(&chat_jid, 0, true, None, "", now());
+                m.id = client_id;
+                m.status = DeliveryStatus::Sent;
+                m.body = MessageBody::Image(ImageMedia {
+                    path: Some(path),
+                    thumbnail: None,
+                    width: None,
+                    height: None,
+                    caption: None,
+                    state: MediaState::Idle,
+                });
+                fake.messages.push(m.clone());
+                let _ = ev.send(Event::MessageUpserted(m));
+            }
+            Command::Logout => {
+                let _ = ev.send(Event::Connection(ConnectionState::AwaitingQr {
+                    code: "2@mock-qr-payload,not-a-real-session,demo".into(),
+                    valid_for_secs: 60,
+                }));
+            }
+            Command::Shutdown => break,
+        }
+    }
+}
+
+/// A real photo for the mock: a macOS wallpaper thumbnail converted to JPEG.
+fn mock_photo() -> Option<std::path::PathBuf> {
+    let out = std::env::temp_dir().join("wa-mock-photo.jpg");
+    if !out.exists() {
+        let src = "/System/Library/Desktop Pictures/.thumbnails/Big Sur Coastline.heic";
+        let ok = std::process::Command::new("sips")
+            .args(["-s", "format", "jpeg", src, "--out"])
+            .arg(&out)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// A short WAV (two-tone chirp) standing in for a decoded voice note.
+fn mock_voice(secs: u32) -> Option<std::path::PathBuf> {
+    let out = std::env::temp_dir().join("wa-mock-voice.wav");
+    if out.exists() {
+        return Some(out);
+    }
+    let rate = 16_000u32;
+    let samples: Vec<i16> = (0..rate * secs)
+        .map(|i| {
+            let t = i as f32 / rate as f32;
+            let f = if ((t * 2.) as u32).is_multiple_of(2) { 440. } else { 660. };
+            ((t * f * std::f32::consts::TAU).sin() * 6000.) as i16
+        })
+        .collect();
+    let data_len = samples.len() as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&rate.to_le_bytes());
+    wav.extend_from_slice(&(rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(&out, wav).ok()?;
+    Some(out)
+}

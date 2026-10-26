@@ -1,0 +1,162 @@
+//! Info panel for a contact or group, opened from the conversation header (or a group
+//! sender's name/avatar): photo, name, number, About; groups add the description and
+//! participants.
+
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use wa_backend::{ChatSummary, Profile};
+
+use crate::avatar::avatar;
+use crate::icons::{Glyph, glyph};
+use crate::state::Store;
+use crate::theme::Theme;
+
+pub const PANEL_WIDTH: f32 = 300.;
+
+/// Phone number from a phone-number JID ("923001234567@s.whatsapp.net" → "+923001234567").
+fn phone_from_jid(jid: &str) -> Option<String> {
+    let (user, server) = jid.split_once('@')?;
+    (server == "s.whatsapp.net" && user.chars().all(|c| c.is_ascii_digit())).then(|| format!("+{user}"))
+}
+
+fn section(title: &str, body: impl IntoElement, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .p(px(12.))
+        .rounded(px(10.))
+        .bg(theme.search_bg)
+        .child(div().text_size(px(11.)).text_color(theme.text_secondary).child(title.to_string()))
+        .child(body)
+}
+
+pub fn panel(jid: &str, store: &Entity<Store>, theme: &Theme, cx: &App) -> impl IntoElement {
+    let s = store.read(cx);
+    let profile: Option<&Profile> = s.profiles.get(jid);
+    let chat: Option<&ChatSummary> = s.chats.iter().find(|c| c.jid == jid);
+    let name = profile
+        .map(|p| p.name.clone())
+        .or_else(|| chat.map(|c| c.name.clone()))
+        .unwrap_or_else(|| jid.split('@').next().unwrap_or(jid).to_string());
+    let is_group = profile.map_or(jid.ends_with("@g.us"), |p| p.is_group);
+    let photo = s.avatar_cached(&format!("{jid}#full")).or_else(|| s.avatar_cached(jid));
+    let phone = profile.and_then(|p| p.phone.clone()).or_else(|| phone_from_jid(jid));
+    let loading = s.profile_loading(jid);
+    let close_store = store.clone();
+
+    let subtitle = if is_group {
+        profile.map(|p| format!("Group · {} participants", p.participants.len())).unwrap_or_else(|| "Group".into())
+    } else {
+        phone.clone().unwrap_or_default()
+    };
+
+    div()
+        .w(px(PANEL_WIDTH))
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(theme.window_bg)
+        .border_l_1()
+        .border_color(theme.separator)
+        .child(
+            div().h(px(52.)).flex_none().flex().items_center().justify_end().px(px(12.)).child(
+                div()
+                    .id("close-profile")
+                    .size(px(26.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|st| st.bg(theme.search_bg))
+                    .child(glyph(Glyph::Close, 12., theme.text_secondary))
+                    .on_click(move |_, _, cx| close_store.update(cx, |s, cx| s.close_profile(cx))),
+            ),
+        )
+        .child(
+            div()
+                .id("profile-scroll")
+                .flex_1()
+                .overflow_y_scroll()
+                .px(px(16.))
+                .pb(px(20.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(6.))
+                        .pb(px(4.))
+                        .child(avatar(&name, photo, 96., theme))
+                        .child(
+                            div()
+                                .pt(px(6.))
+                                .text_size(px(19.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .text_center()
+                                .child(name.clone()),
+                        )
+                        .child(div().text_size(px(12.5)).text_color(theme.text_secondary).child(subtitle)),
+                )
+                .when(!is_group, |d| {
+                    let about = profile.and_then(|p| p.about.clone());
+                    d.child(section(
+                        "About",
+                        div().text_size(px(13.)).text_color(theme.text).child(match (&about, loading) {
+                            (Some(a), _) => a.clone(),
+                            (None, true) => "Loading…".into(),
+                            (None, false) => "Not available".into(),
+                        }),
+                        theme,
+                    ))
+                    .when_some(phone.clone(), |d, ph| {
+                        d.child(section("Phone", div().text_size(px(13.)).text_color(theme.text).child(ph), theme))
+                    })
+                })
+                .when(is_group, |d| {
+                    let description = profile.and_then(|p| p.description.clone());
+                    d.when_some(description, |d, desc| {
+                        d.child(section("Description", div().text_size(px(13.)).text_color(theme.text).child(desc), theme))
+                    })
+                    .child(section(
+                        &profile.map_or("Participants".to_string(), |p| format!("{} participants", p.participants.len())),
+                        div().flex().flex_col().map(|list| match profile {
+                            None => list.child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme.text_secondary)
+                                    .child(if loading { "Loading…" } else { "Not available" }),
+                            ),
+                            Some(p) => list.children(p.participants.iter().map(|m| {
+                                let shown = if m.is_me { "You".to_string() } else { m.name.clone() };
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .py(px(5.))
+                                    .child(avatar(&m.name, s.avatar_cached(&m.jid), 30., theme))
+                                    .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(theme.text).child(shown))
+                                    .when(m.is_admin, |d| {
+                                        d.child(
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(theme.separator)
+                                                .text_size(px(10.5))
+                                                .text_color(theme.text_secondary)
+                                                .child("Admin"),
+                                        )
+                                    })
+                            })),
+                        }),
+                        theme,
+                    ))
+                }),
+        )
+}

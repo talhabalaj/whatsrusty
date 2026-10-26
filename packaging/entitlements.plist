@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the Developer ID build.
+
+  No App Sandbox (com.apple.security.app-sandbox) for now. Trade-off:
+  - Sandboxing is required for the Mac App Store and limits damage if the app
+    is compromised (it parses untrusted media/protobufs from the network).
+  - But it moves the data dir into ~/Library/Containers/<bundle id>/, which
+    would orphan the existing session/messages DBs in
+    ~/Library/Application Support/WhatsApp GPUI, and every future feature
+    (file save/open, drag-and-drop) then needs explicit entitlements.
+  Hardened runtime + notarization is all Gatekeeper requires for direct
+  distribution, so sandboxing is deferred until a migration path exists.
+
+  Without the sandbox, network.client is not enforced; it is declared so the
+  file is ready if the sandbox is turned on. audio-input IS enforced by the
+  hardened runtime: without it, microphone access (future voice notes) is
+  denied silently.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

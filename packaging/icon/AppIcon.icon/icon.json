@@ -1,0 +1,51 @@
+{
+  "fill": {
+    "automatic-gradient": "extended-srgb:0.96078,0.98431,0.96863,1.00000"
+  },
+  "groups": [
+    {
+      "name": "Checks",
+      "layers": [
+        {
+          "name": "checks",
+          "image-name": "checks.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      }
+    },
+    {
+      "name": "Bubble",
+      "layers": [
+        {
+          "name": "bubble",
+          "image-name": "bubble.svg",
+          "glass": true,
+          "fill": {
+            "automatic-gradient": "extended-srgb:0.16863,0.81961,0.39216,1.00000"
+          }
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}
