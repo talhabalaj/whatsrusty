@@ -13,6 +13,17 @@ const STICKER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24
 const PENCIL: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M15.5 4.8 L19.2 8.5 L8.6 19.1 L4.4 19.6 L4.9 15.4 Z M13.6 6.7 L17.3 10.4" fill="none" stroke="black" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>"#;
 const CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M6.5 6.5 L17.5 17.5 M17.5 6.5 L6.5 17.5" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round"/></svg>"#;
 
+const COMPOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11.5 4.5 H7 A3 3 0 0 0 4 7.5 V17 A3 3 0 0 0 7 20 H16.5 A3 3 0 0 0 19.5 17 V12.5" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round"/><path d="M18.2 3.6 L20.4 5.8 L12.6 13.6 L9.6 14.4 L10.4 11.4 Z" fill="none" stroke="black" stroke-width="1.8" stroke-linejoin="round"/></svg>"#;
+const BELL_SLASH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M7 16.5 V11 A5 5 0 0 1 14.5 6.6 M17 10.5 V16.5 L18.8 18 H6.5 M10 20.2 A2.2 2.2 0 0 0 14 20.2 M12 4.2 V3.4" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.5 4.5 L19.5 19.5" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>"#;
+const ARCHIVE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="4.6" rx="1.3" fill="none" stroke="black" stroke-width="1.8"/><path d="M5.2 9.1 V17.5 A2 2 0 0 0 7.2 19.5 H16.8 A2 2 0 0 0 18.8 17.5 V9.1 M10 13 H14" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round"/></svg>"#;
+const CHEVRON_LEFT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M15 4.5 L7.5 12 L15 19.5" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+const FORWARD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14 5 L20 11 L14 17 M19.5 11 H10.5 C6.4 11 4 13.4 4 17.5 V19" fill="none" stroke="black" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const CHEVRON_UP: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4.5 15 L12 7.5 L19.5 15" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const CHEVRON_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4.5 9 L12 16.5 L19.5 9" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const ARROW_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 19.5 L5.5 13 M12 19.5 L18.5 13 M12 19.2 V4.5" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const MAGNIFIER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="black" stroke-width="2.2"/><path d="M15 15 L20 20" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round"/></svg>"#;
+
 #[derive(Clone, Copy)]
 pub enum Glyph {
     ArrowUp,
@@ -24,6 +35,15 @@ pub enum Glyph {
     Smile,
     Sticker,
     Pencil,
+    Compose,
+    BellSlash,
+    Archive,
+    ChevronLeft,
+    Forward,
+    ChevronUp,
+    ChevronDown,
+    ArrowDown,
+    Magnifier,
 }
 
 pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
@@ -37,6 +57,15 @@ pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
         Glyph::Smile => SMILE,
         Glyph::Sticker => STICKER,
         Glyph::Pencil => PENCIL,
+        Glyph::Compose => COMPOSE,
+        Glyph::BellSlash => BELL_SLASH,
+        Glyph::Archive => ARCHIVE,
+        Glyph::ChevronLeft => CHEVRON_LEFT,
+        Glyph::Forward => FORWARD,
+        Glyph::ChevronUp => CHEVRON_UP,
+        Glyph::ChevronDown => CHEVRON_DOWN,
+        Glyph::ArrowDown => ARROW_DOWN,
+        Glyph::Magnifier => MAGNIFIER,
     };
     Icon::default().data(svg.as_bytes()).size(px(size)).text_color(color)
 }

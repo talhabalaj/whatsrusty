@@ -1064,6 +1064,11 @@ fn context_info(m: &wa::Message) -> Option<&wa::ContextInfo> {
     None
 }
 
+/// The message carries WhatsApp's "Forwarded" mark.
+pub fn is_forwarded(msg: &wa::Message) -> bool {
+    context_info(unwrap_message(msg)).is_some_and(|ci| ci.is_forwarded == Some(true))
+}
+
 /// The quoted message of a reply, if this message is one.
 pub fn quoted_of(msg: &wa::Message) -> Option<QuotedRef> {
     let ci = context_info(unwrap_message(msg))?;
@@ -2001,6 +2006,9 @@ mod tests {
         };
         assert_eq!(quoted_of(&forwarded), None);
         assert_eq!(quoted_of(&text("plain")), None);
+        assert!(is_forwarded(&forwarded));
+        assert!(!is_forwarded(&text("plain")));
+        assert!(!is_forwarded(&voice_reply));
     }
 
     fn reaction(id: Option<&str>, text: Option<&str>, ts: Option<i64>) -> wa::Message {

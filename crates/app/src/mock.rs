@@ -46,6 +46,8 @@ fn msg(chat: &str, id: usize, from_me: bool, sender: Option<&str>, text: &str, t
         quoted: None,
         reactions: Vec::new(),
         edited: false,
+        forwarded: false,
+        deleted: false,
     }
 }
 
@@ -265,7 +267,70 @@ fn seed() -> Fake {
             avatar: None,
         });
     }
+    // Forwarded and deleted messages, and replies to messages far up the long thread
+    // (one stored but not loaded, one only on "the phone").
+    let hiking = "120363000000000001@g.us";
+    let mut fwd = msg(hiking, 50, false, Some("Sara"), "Trail closed after 4pm on weekends, plan accordingly!", n - d - h);
+    fwd.forwarded = true;
+    let mut gone = msg(hiking, 51, false, Some("Omar"), "", n - d - h + 120);
+    gone.body = MessageBody::Unsupported { label: "🚫 This message was deleted".into() };
+    gone.deleted = true;
+    messages.extend([fwd, gone]);
+    for (i, (target, text)) in [(200, "Still relevant 😅"), (40, "Remember this one?")].into_iter().enumerate() {
+        let mut m = msg(LONG_CHAT, 500 + i, true, None, text, n - 900 + i as i64 * 60);
+        m.quoted = Some(QuotedMessage {
+            id: format!("{LONG_CHAT}-{target}"),
+            from_me: target % 3 == 0,
+            sender_name: None,
+            preview: format!("Message #{target}"),
+        });
+        messages.push(m);
+    }
+    // Chat-list states: a muted group, more unread, a third pin, archived chats.
+    for c in chats.iter_mut() {
+        match c.jid.as_str() {
+            "120363000000000001@g.us" => (c.muted, c.unread_count) = (true, 4),
+            "15551110003@s.whatsapp.net" => c.unread_count = 2,
+            "15551110004@s.whatsapp.net" => c.pinned = true,
+            "15552000016@s.whatsapp.net" | "15552000017@s.whatsapp.net" => c.archived = true,
+            _ => {}
+        }
+    }
+    sort_chats(&mut chats);
     Fake { chats, messages, phone_only }
+}
+
+impl Fake {
+    fn update_chat(&mut self, jid: &str, f: impl FnOnce(&mut ChatSummary), ev: &flume::Sender<Event>) {
+        if let Some(c) = self.chats.iter_mut().find(|c| c.jid == jid) {
+            f(c);
+        }
+        sort_chats(&mut self.chats);
+        let _ = ev.send(Event::Chats(self.chats.clone()));
+    }
+}
+
+/// Pinned first, then most recent activity (like the real backend).
+fn sort_chats(chats: &mut [ChatSummary]) {
+    chats.sort_by_key(|c| (!c.pinned, std::cmp::Reverse(c.last_message.as_ref().map_or(i64::MAX, |l| l.timestamp))));
+}
+
+/// People in "my address book" for the New Message picker: everyone with a 1:1 chat,
+/// plus a few without one.
+fn mock_contacts(chats: &[ChatSummary]) -> Vec<Contact> {
+    let phone = |jid: &str| Some(format!("+{}", jid.split('@').next().unwrap_or("")));
+    let mut list: Vec<Contact> = chats
+        .iter()
+        .filter(|c| !c.is_group)
+        .map(|c| Contact { jid: c.jid.clone(), name: c.name.clone(), phone: phone(&c.jid), saved: true })
+        .collect();
+    for (user, name) in [("15553330001", "Nadia Hussain"), ("15553330002", "Imran Sheikh"), ("15553330003", "Sana Malik")] {
+        let jid = format!("{user}@s.whatsapp.net");
+        list.push(Contact { phone: phone(&jid), jid, name: name.into(), saved: true });
+    }
+    list.sort_by_key(|c| c.name.to_lowercase());
+    list.dedup_by(|a, b| a.jid == b.jid);
+    list
 }
 
 fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
@@ -274,8 +339,58 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
     thread::sleep(Duration::from_millis(300));
     let _ = ev.send(Event::Connection(ConnectionState::Connected { own_jid: ME.into(), push_name: Some("Me".into()) }));
     let _ = ev.send(Event::Chats(fake.chats.clone()));
+    // WA_MOCK_GROUP_TYPING=1: two people keep typing in the hiking group.
+    if std::env::var_os("WA_MOCK_GROUP_TYPING").is_some() {
+        let ev = ev.clone();
+        thread::spawn(move || {
+            for who in ["Omar", "Sara"] {
+                thread::sleep(Duration::from_millis(1500));
+                let _ = ev.send(Event::Typing {
+                    chat_jid: "120363000000000001@g.us".into(),
+                    sender_name: Some(who.into()),
+                    typing: true,
+                    sender_jid: Some(format!("{who}@s.whatsapp.net")),
+                });
+            }
+        });
+    }
+    // WA_MOCK_INCOMING="<jid>|<secs>": a message from them arrives after that long.
+    let (incoming_tx, incoming) = flume::unbounded::<String>();
+    let _keep_open = incoming_tx.clone();
+    if let Ok(spec) = std::env::var("WA_MOCK_INCOMING")
+        && let Some((jid, secs)) = spec.split_once('|')
+    {
+        let (jid, secs) = (jid.to_string(), secs.parse().unwrap_or(5));
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(secs));
+            let _ = incoming_tx.send(jid);
+        });
+    }
 
-    while let Ok(cmd) = cmds.recv() {
+    loop {
+        let next = flume::Selector::new()
+            .recv(&cmds, |c| c.map(Ok))
+            .recv(&incoming, |j| j.map(Err))
+            .wait();
+        let cmd = match next {
+            Ok(Ok(cmd)) => cmd,
+            Ok(Err(jid)) => {
+                let text = "Are you there? 👀";
+                let mut m = msg(&jid, 0, false, None, text, now());
+                m.id = format!("{jid}-incoming-{}", now());
+                fake.messages.push(m.clone());
+                if let Some(c) = fake.chats.iter_mut().find(|c| c.jid == jid) {
+                    c.unread_count += 1;
+                    c.last_message = Some(MessagePreview { text: text.into(), timestamp: m.timestamp, from_me: false, sender_name: None });
+                }
+                sort_chats(&mut fake.chats);
+                eprintln!("mock: incoming message in {jid}");
+                let _ = ev.send(Event::MessageUpserted(m));
+                let _ = ev.send(Event::Chats(fake.chats.clone()));
+                continue;
+            }
+            Err(_) => break,
+        };
         match cmd {
             Command::LoadMessages { chat_jid, before, limit } => {
                 let older: Vec<_> = fake
@@ -322,15 +437,16 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                         thread::sleep(Duration::from_millis(700));
                         let _ = ev.send(Event::StatusChanged { chat_jid: m.chat_jid.clone(), message_ids: vec![m.id.clone()], status });
                     }
-                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: true });
+                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: true, sender_jid: None });
                     thread::sleep(Duration::from_millis(1500));
-                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: false });
+                    let _ = ev.send(Event::Typing { chat_jid: m.chat_jid.clone(), sender_name: None, typing: false, sender_jid: None });
                     let mut reply = msg(&m.chat_jid, 0, false, None, "👍", now());
                     reply.id = format!("{}-reply", m.id);
                     let _ = ev.send(Event::MessageUpserted(reply));
                 });
             }
             Command::MarkRead { chat_jid } => {
+                eprintln!("mock: MarkRead {chat_jid}");
                 if let Some(c) = fake.chats.iter_mut().find(|c| c.jid == chat_jid) {
                     c.unread_count = 0;
                 }
@@ -338,9 +454,18 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
             }
             Command::SetTyping { .. } | Command::FetchAvatar { .. } => {}
             Command::RetrySend { chat_jid, message_id } => {
+                // Like the backend: a resend moves to the end with the current time.
                 if let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) {
-                    m.status = DeliveryStatus::Pending;
+                    (m.status, m.timestamp) = (DeliveryStatus::Pending, now());
+                    let m = m.clone();
                     let _ = ev.send(Event::MessageUpserted(m.clone()));
+                    let text = crate::state::body_text(&m.body).to_string();
+                    fake.update_chat(
+                        &chat_jid,
+                        |c| c.last_message = Some(MessagePreview { text, timestamp: m.timestamp, from_me: true, sender_name: None }),
+                        &ev,
+                    );
+                    thread::sleep(Duration::from_millis(600));
                     let _ = ev.send(Event::StatusChanged { chat_jid, message_ids: vec![message_id], status: DeliveryStatus::Sent });
                 }
             }
@@ -438,6 +563,107 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     code: "2@mock-qr-payload,not-a-real-session,demo".into(),
                     valid_for_secs: 60,
                 }));
+            }
+            Command::DeleteMessage { chat_jid, message_id, for_everyone } => {
+                let Some(pos) = fake.messages.iter().position(|m| m.chat_jid == chat_jid && m.id == message_id) else {
+                    continue;
+                };
+                if for_everyone {
+                    let m = &mut fake.messages[pos];
+                    m.body = MessageBody::Unsupported { label: "🚫 This message was deleted".into() };
+                    (m.deleted, m.reactions, m.quoted) = (true, Vec::new(), None);
+                    let _ = ev.send(Event::MessageUpserted(m.clone()));
+                } else {
+                    fake.messages.remove(pos);
+                    let _ = ev.send(Event::MessagesRemoved { chat_jid, message_ids: vec![message_id] });
+                }
+            }
+            Command::ForwardMessage { chat_jid, message_id, to_chat_jid, client_id } => {
+                let Some(src) = fake.messages.iter().find(|m| m.chat_jid == chat_jid && m.id == message_id) else {
+                    continue;
+                };
+                let mut m = msg(&to_chat_jid, 0, true, None, "", now());
+                (m.id, m.body, m.forwarded, m.status) = (client_id, src.body.clone(), true, DeliveryStatus::Sent);
+                let text = crate::state::body_text(&m.body).to_string();
+                fake.messages.push(m.clone());
+                eprintln!("mock: forwarded {message_id} to {to_chat_jid}");
+                let _ = ev.send(Event::MessageUpserted(m.clone()));
+                fake.update_chat(
+                    &to_chat_jid,
+                    |c| c.last_message = Some(MessagePreview { text, timestamp: m.timestamp, from_me: true, sender_name: None }),
+                    &ev,
+                );
+            }
+            Command::SearchMessages { chat_jid, query } => {
+                let needle = query.trim().to_lowercase();
+                let hits = fake
+                    .messages
+                    .iter()
+                    .chain(fake.phone_only.iter())
+                    .filter(|m| m.chat_jid == chat_jid && !m.deleted && !needle.is_empty())
+                    .filter(|m| crate::state::body_text(&m.body).to_lowercase().contains(&needle))
+                    .map(|m| SearchHit { id: m.id.clone(), timestamp: m.timestamp })
+                    .collect::<Vec<_>>();
+                let mut hits = hits;
+                hits.sort_by_key(|h| h.timestamp);
+                // Like the store, a search over the whole chat takes a moment.
+                thread::sleep(Duration::from_millis(150));
+                let _ = ev.send(Event::SearchResults { chat_jid, query, hits });
+            }
+            Command::SetPinned { chat_jid, pinned } => {
+                if pinned && fake.chats.iter().filter(|c| c.pinned && c.jid != chat_jid).count() >= 3 {
+                    let _ = ev.send(Event::Error("You can only pin up to 3 chats".into()));
+                    continue;
+                }
+                fake.update_chat(&chat_jid, |c| c.pinned = pinned, &ev);
+            }
+            Command::SetMuted { chat_jid, until } => fake.update_chat(&chat_jid, |c| c.muted = until > now(), &ev),
+            Command::SetArchived { chat_jid, archived } => fake.update_chat(
+                &chat_jid,
+                |c| {
+                    c.archived = archived;
+                    c.pinned &= !archived;
+                },
+                &ev,
+            ),
+            Command::MarkUnread { chat_jid } => {
+                eprintln!("mock: MarkUnread {chat_jid}");
+                fake.update_chat(&chat_jid, |c| c.unread_count = c.unread_count.max(1), &ev)
+            }
+            Command::ListContacts => {
+                let _ = ev.send(Event::Contacts(mock_contacts(&fake.chats)));
+            }
+            Command::LookupPhone { phone } => {
+                // Numbers ending in 0 "aren't on WhatsApp".
+                let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+                let (jid, error) = match digits.len() {
+                    0..8 => (None, Some("Enter the full number with country code".to_string())),
+                    _ if digits.ends_with('0') => (None, None),
+                    _ => (Some(format!("{digits}@s.whatsapp.net")), None),
+                };
+                thread::sleep(Duration::from_millis(400));
+                let _ = ev.send(Event::PhoneLookup { phone, jid, error });
+            }
+            Command::OpenChat { jid } => {
+                if !fake.chats.iter().any(|c| c.jid == jid) {
+                    let name = mock_contacts(&fake.chats)
+                        .into_iter()
+                        .find(|c| c.jid == jid)
+                        .map_or_else(|| format!("+{}", jid.split('@').next().unwrap_or("")), |c| c.name);
+                    let at = fake.chats.iter().take_while(|c| c.pinned).count();
+                    fake.chats.insert(at, ChatSummary {
+                        jid,
+                        name,
+                        is_group: false,
+                        last_message: None,
+                        unread_count: 0,
+                        pinned: false,
+                        archived: false,
+                        muted: false,
+                        avatar: None,
+                    });
+                    let _ = ev.send(Event::Chats(fake.chats.clone()));
+                }
             }
             Command::Shutdown => break,
         }

@@ -22,10 +22,18 @@ qrcode = { version = "0.14", default-features = false }
 dirs = "6"
 env_logger = "0.11"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSGeometry", "NSNotification", "NSOperation", "block2"] }
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSGeometry", "NSNotification", "NSOperation", "block2", "NSBundle", "NSError"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2", "NSApplication", "NSDockTile"] }
 objc2-av-kit = { version = "0.3", default-features = false, features = ["std", "AVPlayerView", "objc2-app-kit", "objc2-av-foundation"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVAsset"] }
 block2 = "0.6"
 rodio = { version = "0.23", default-features = false, features = ["playback", "wav"] }
+# Only for the `snapshots` feature (gpui-kit's own test-support pulls in a conflicting gpui-fast).
+gpui-pre = { version = "0.3.10", optional = true, features = ["test-support"] }
+gpui-pre-macos = { version = "0.3.10", optional = true, features = ["test-support"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
+[features]
+# Debug builds whose WA_DEBUG_UI script can save window snapshots ("shot <file.png>"),
+# rendered offscreen, so they work with the screen locked.
+snapshots = ["dep:gpui-pre", "dep:gpui-pre-macos", "dep:image"]

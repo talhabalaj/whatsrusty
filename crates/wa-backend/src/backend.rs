@@ -26,7 +26,7 @@ use whatsapp_rust::{ErrorChainExt as _, Jid, SendOptions, UploadOptions};
 
 use crate::extract::{
     DELETED_LABEL, Extracted, MediaKind, QuotedRef, StoredMedia, classify, document_name, expiration_of, fallback_name,
-    is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
+    is_forwarded, is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
 };
 use crate::media::{
     TempFile, avatar_file, create_private_dir_all, create_private_file, documents_dir, ext_for_mime, media_file,
@@ -34,10 +34,14 @@ use crate::media::{
     temp_path, write_atomic,
 };
 use crate::media_retry;
+use message_actions::{ForwardJob, delete_message, deleted_elsewhere, forward_message};
 use crate::profile;
 use crate::stickers::{self, Candidate, FetchError};
 use crate::store::{ChatMeta, LocalProfile, NewMessage, NewQuote, NewReaction, OldestRef, OwnReaction, RawMessage, Store};
 use crate::types::*;
+
+mod chat_list;
+mod message_actions;
 
 const CHATS_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Consecutive QR sessions without a scan before backing off for `QR_BACKOFF`, so an
@@ -504,7 +508,18 @@ async fn supervise(shared: Arc<Shared>, cmd_rx: flume::Receiver<Command>) {
         let shared = shared.clone();
         tokio::spawn(async move {
             loop {
-                shared.chats_dirty.notified().await;
+                // Also wake when a timed mute ends, so the chat stops showing as muted.
+                let mute_ends = shared.store(|s| s.next_mute_expiry(now_secs())).flatten();
+                match mute_ends {
+                    Some(t) => {
+                        let wait = Duration::from_secs((t - now_secs()).clamp(0, 86_400) as u64 + 1);
+                        tokio::select! {
+                            _ = shared.chats_dirty.notified() => {}
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                    }
+                    None => shared.chats_dirty.notified().await,
+                }
                 tokio::time::sleep(CHATS_DEBOUNCE).await;
                 shared.emit_chats();
                 let stale = std::mem::take(&mut *shared.stale.lock().unwrap_or_else(|e| e.into_inner()));
@@ -711,6 +726,7 @@ impl EventHandler for Forwarder {
             EventKind::ContactUpdate,
             EventKind::PushNameUpdate,
             EventKind::PinUpdate,
+            EventKind::DeleteMessageForMeUpdate,
             EventKind::MuteUpdate,
             EventKind::ArchiveUpdate,
             EventKind::MarkChatAsReadUpdate,
@@ -1047,7 +1063,7 @@ impl Session {
                     ReceiptType::Read | ReceiptType::Played => DeliveryStatus::Read,
                     ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
                         // Read on another of our devices.
-                        shared.store(|s| s.set_unread(&chat, 0));
+                        shared.store(|s| s.clear_unread(&chat));
                         shared.mark_chats_dirty();
                         return;
                     }
@@ -1067,10 +1083,12 @@ impl Session {
                 let sender = p.source.sender.to_non_ad_string();
                 let result = shared.store(|s| Ok((s.canonical(&chat)?, s.sender_display_name(&sender, None)?)));
                 if let Some((chat_jid, name)) = result {
+                    let sender_jid = shared.store(|s| s.canonical(&sender)).unwrap_or(sender);
                     shared.emit(Event::Typing {
                         chat_jid,
                         sender_name: Some(name),
                         typing: matches!(p.state, ChatPresence::Composing),
+                        sender_jid: Some(sender_jid),
                     });
                 }
             }
@@ -1089,6 +1107,7 @@ impl Session {
                 shared.store(|s| s.set_contact_name(&c.jid.to_non_ad_string(), name));
                 shared.mark_chats_dirty();
             }
+            E::DeleteMessageForMeUpdate(d) => deleted_elsewhere(shared, d),
             E::PinUpdate(p) => {
                 let pinned_at = if p.action.pinned == Some(true) { p.timestamp.timestamp().max(1) } else { 0 };
                 shared.store(|s| s.set_pinned(&p.jid.to_non_ad_string(), pinned_at));
@@ -1109,14 +1128,10 @@ impl Session {
             }
             E::MarkChatAsReadUpdate(m) => {
                 let jid = m.jid.to_non_ad_string();
-                if m.action.read == Some(true) {
-                    shared.store(|s| s.set_unread(&jid, 0));
-                } else {
-                    shared.store(|s| {
-                        let n = s.unread_count(&jid)?;
-                        s.set_unread(&jid, n.max(1))
-                    });
-                }
+                shared.store(|s| match m.action.read == Some(true) {
+                    true => s.clear_unread(&jid),
+                    false => s.set_marked_unread(&jid, true),
+                });
                 shared.mark_chats_dirty();
             }
             E::GroupUpdate(g) => {
@@ -1202,11 +1217,15 @@ impl Session {
                     quoted: quoted_of(&m.message).map(|q| shared.own().quote(q)),
                     expires_at,
                 };
+                let forwarded = is_forwarded(&m.message);
                 shared.store(|s| {
                     let inserted = s.insert_message(&msg, true)?;
+                    if inserted && forwarded {
+                        s.set_forwarded(&msg.chat_jid, &msg.id)?;
+                    }
                     if msg.from_me {
                         // Replying from the phone reads the chat.
-                        s.set_unread(&msg.chat_jid, 0)?;
+                        s.clear_unread(&msg.chat_jid)?;
                     }
                     // Not for one deleted before it arrived (its content is gone).
                     if inserted
@@ -1398,6 +1417,9 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
             muted_until: conv.mute_end_time.map(|t| normalize_mute(t as i64)),
             last_activity: conv.conversation_timestamp.or(conv.last_msg_timestamp).map(|t| t as i64),
         })?;
+        if let Some(marked) = conv.marked_as_unread {
+            s.set_marked_unread(&chat, marked)?;
+        }
 
         if !conv.messages.is_empty() {
             with_messages.push(chat.clone());
@@ -1407,13 +1429,6 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
             let Some(key) = wmi.key.as_option() else { continue };
             let Some(id) = &key.id else { continue };
             let ts = wmi.message_timestamp.unwrap_or(0) as i64;
-            let Some(msg) = wmi.message.as_option() else {
-                // A message deleted for everyone is only a stub with its own id.
-                if matches!(wmi.message_stub_type, Some(StubType::REVOKE | StubType::ADMIN_REVOKE)) {
-                    s.revoke(&chat, id, DELETED_LABEL)?;
-                }
-                continue;
-            };
             let from_me = key.from_me == Some(true);
             let participant = key.participant.as_deref().or(wmi.participant.as_deref());
             let sender = if from_me {
@@ -1423,13 +1438,36 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
             } else {
                 chat.clone()
             };
+            let Some(msg) = wmi.message.as_option() else {
+                // A message deleted for everyone is only a stub with its own id: keep
+                // its place in the transcript, like a revoke received live.
+                if matches!(wmi.message_stub_type, Some(StubType::REVOKE | StubType::ADMIN_REVOKE)) {
+                    let stub = NewMessage {
+                        chat_jid: chat.clone(),
+                        id: id.clone(),
+                        sender_jid: sender,
+                        wire_chat: conv.id.clone(),
+                        wire_sender: participant.map(str::to_owned),
+                        push_name: wmi.push_name.clone(),
+                        from_me,
+                        body: MessageBody::Unsupported { label: DELETED_LABEL.to_owned() },
+                        timestamp: ts,
+                        status: if from_me { web_status(wmi.status) } else { DeliveryStatus::Delivered },
+                        media: None,
+                        quoted: None,
+                        expires_at: None,
+                    };
+                    message_actions::store_revoked(s, &stub)?;
+                }
+                continue;
+            };
             match classify(msg) {
                 Extracted::Body(body) => {
                     let expires_at = history_expiry(wmi, msg, ts);
                     if expires_at.is_some_and(|t| t <= now) {
                         continue;
                     }
-                    s.insert_message(
+                    let inserted = s.insert_message(
                         &NewMessage {
                             chat_jid: chat.clone(),
                             id: id.clone(),
@@ -1447,6 +1485,9 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
                         },
                         false,
                     )?;
+                    if inserted && is_forwarded(msg) {
+                        s.set_forwarded(&chat, id)?;
+                    }
                 }
                 Extracted::Edit { target_id, body } => {
                     s.apply_edit(&chat, &target_id, &body, ts)?;
@@ -1588,6 +1629,7 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 }
                 Ok((unread, pending))
             });
+            chat_list::sync_marked_read(shared, session, &chat_jid);
             match (queued, session) {
                 (Some((_, pending)), Some(session)) if pending > 0 => {
                     send_receipts(shared, session, Some(&chat_jid)).await
@@ -1621,8 +1663,26 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
             send_sticker(shared, session, chat_jid, sticker_id, client_id, reply_to).await
         }
         Command::FetchProfile { jid } => fetch_profile(shared, session, jid),
+        Command::DeleteMessage { chat_jid, message_id, for_everyone } => {
+            delete_message(shared, session, &chat_jid, &message_id, for_everyone)
+        }
+        Command::ForwardMessage { chat_jid, message_id, to_chat_jid, client_id } => {
+            forward_message(shared, session, &chat_jid, &message_id, to_chat_jid, client_id).await
+        }
+        Command::SearchMessages { chat_jid, query } => {
+            let hits = shared.store(|s| s.search_messages(&chat_jid, &query)).unwrap_or_default();
+            shared.emit(Event::SearchResults { chat_jid, query, hits });
+        }
+        Command::SetPinned { .. }
+        | Command::SetMuted { .. }
+        | Command::SetArchived { .. }
+        | Command::MarkUnread { .. }
+        | Command::ListContacts
+        | Command::LookupPhone { .. }
+        | Command::OpenChat { .. } => chat_list::chat_command(shared, session, cmd).await,
     }
 }
+
 
 /// `Command::FetchProfile`: answer from the store (or a recent fetch) right away, then
 /// queue a server refresh unless a recent one is cached.
@@ -2089,6 +2149,8 @@ enum SendJob {
         sticker: Box<StickerJob>,
         reply_to: Option<String>,
     },
+    /// A copy of a stored message, marked forwarded.
+    Forward { chat_jid: String, canonical: String, id: String, forward: Box<ForwardJob> },
     /// Not a message: no status of its own (see [`Shared::finish_reaction`]).
     React(Box<ReactJob>),
     /// Not a message either (see [`Shared::finish_edit`]).
@@ -2107,7 +2169,8 @@ impl SendJob {
         match self {
             SendJob::Text { chat_jid, canonical, id, .. }
             | SendJob::Image { chat_jid, canonical, id, .. }
-            | SendJob::Sticker { chat_jid, canonical, id, .. } => Some((chat_jid, canonical, id)),
+            | SendJob::Sticker { chat_jid, canonical, id, .. }
+            | SendJob::Forward { chat_jid, canonical, id, .. } => Some((chat_jid, canonical, id)),
             SendJob::React(_) | SendJob::Edit(_) => None,
         }
     }
@@ -2475,6 +2538,10 @@ impl Session {
                     proto.context_info = MessageField::some(ctx);
                 }
                 let message = wa::Message { sticker_message: MessageField::some(proto), ..Default::default() };
+                self.send(&chat_jid, message, id).await
+            }
+            SendJob::Forward { chat_jid, id, forward, .. } => {
+                let message = self.forward_content(&chat_jid, &id, *forward).await?;
                 self.send(&chat_jid, message, id).await
             }
             SendJob::React(_) => unreachable!("reactions are sent by `send_reaction`"),
@@ -3090,6 +3157,8 @@ async fn retry_send(shared: &Arc<Shared>, session: Option<&Arc<Session>>, chat_j
         if !s.reset_failed(&canonical, &id, now_secs())? {
             return Ok(None);
         }
+        // A resend goes to the end of the conversation, like a new message.
+        s.restamp(&canonical, &id, now_secs())?;
         s.get_message(&canonical, &id)
     });
     let Some(Some(msg)) = reset else {

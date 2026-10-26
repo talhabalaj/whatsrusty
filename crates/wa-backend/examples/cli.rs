@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         .init();
     let handle = wa_backend::spawn(BackendConfig {
         data_dir: "/tmp/wa-backend-test".into(),
-        device_name: "WhatsApp GPUI (CLI)".into(),
+        device_name: "WhatsRusty (CLI)".into(),
     })?;
 
     let deadline = std::env::var("WA_CLI_SECONDS")

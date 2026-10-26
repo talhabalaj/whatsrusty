@@ -1,6 +1,8 @@
 //! Transcript + floating header/composer, styled after Messages.app.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +13,8 @@ use wa_backend::{ChatMessage, DeliveryStatus, ImageMedia, MediaState, MessageBod
 use crate::audio::AudioPlayer;
 use crate::avatar::avatar;
 use crate::composer::Composer;
+use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
+use crate::forward_picker::{ForwardEvent, ForwardPicker};
 use crate::format::{short_time, transcript_time};
 use crate::chrome::surface;
 use crate::icons::{Glyph, glyph};
@@ -27,6 +31,19 @@ const HEADER_HEIGHT: f32 = 52.;
 const COMPOSER_CLEARANCE: f32 = 78.;
 const IMAGE_MAX_W: f32 = 260.;
 const IMAGE_MAX_H: f32 = 340.;
+/// How long a message flashes after jumping to it.
+const HIGHLIGHT: Duration = Duration::from_millis(1600);
+/// Page size while paging back to a quoted message or search hit.
+const JUMP_PAGE: u32 = 500;
+/// Pages a jump may request before giving up (each may be a fetch from the phone).
+const JUMP_MAX_PAGES: u32 = 12;
+
+actions!(conversation, [FindInChat]);
+
+pub fn init(cx: &mut App) {
+    // Also over text fields' own ⌘F (bound later in the same context, so this one wins).
+    cx.bind_keys([KeyBinding::new("cmd-f", FindInChat, None), KeyBinding::new("cmd-f", FindInChat, Some("Input"))]);
+}
 
 #[derive(Clone)]
 enum Row {
@@ -47,7 +64,47 @@ pub struct Conversation {
     is_group: bool,
     /// Message whose tapback tray is open.
     picker_for: Option<String>,
+    /// Where its context menu opened (right-click), in window coordinates.
+    menu_at: Option<Point<Pixels>>,
+    /// Message whose "Delete…" confirmation is showing.
+    confirm_delete: Option<ChatMessage>,
+    forward: Option<(Entity<ForwardPicker>, Subscription)>,
+    find: Option<Find>,
+    /// A quoted message / search hit to scroll to once it's loaded.
+    pending_jump: Option<Jump>,
+    /// Message flashing after a jump (id, animation generation).
+    highlight: Option<(String, usize)>,
+    highlight_gen: usize,
+    /// Scrolled up from the end (kept by the list's scroll handler).
+    away: Rc<Cell<bool>>,
+    /// Messages that arrived while scrolled up (the scroll-to-bottom badge).
+    unseen: usize,
+    /// A short-lived status pill ("Forwarded to …").
+    notice: Option<String>,
+    _timers: Vec<Task<()>>,
     _subs: Vec<Subscription>,
+}
+
+struct Jump {
+    id: String,
+    /// Known for search hits: page back until the transcript reaches it.
+    timestamp: Option<i64>,
+    flash: bool,
+    pages: u32,
+}
+
+struct Find {
+    bar: Entity<FindBar>,
+    query: String,
+    /// Matches oldest first: (id, timestamp).
+    matches: Vec<(String, i64)>,
+    current: Option<usize>,
+    /// The store's answer for `query` is in (older messages included).
+    searched: bool,
+    /// Scrolled to a match for this query already.
+    jumped: bool,
+    _debounce: Option<Task<()>>,
+    _sub: Subscription,
 }
 
 impl Conversation {
@@ -62,6 +119,10 @@ impl Conversation {
                     }
                 }
                 StoreEvent::AccountReset => {
+                    this.find = None;
+                    this.forward = None;
+                    this.confirm_delete = None;
+                    this.pending_jump = None;
                     this.rows.clear();
                     this.messages.clear();
                     this.thumbs.clear();
@@ -73,6 +134,14 @@ impl Conversation {
         ];
         let list = ListState::new(0, ListAlignment::Bottom, px(800.));
         list.set_follow_mode(FollowMode::Tail);
+        let away = Rc::new(Cell::new(false));
+        let (flag, view) = (away.clone(), cx.entity_id());
+        list.set_scroll_handler(move |ev, _, cx| {
+            let now_away = ev.visible_range.end < ev.count && !ev.is_following_tail;
+            if flag.replace(now_away) != now_away {
+                cx.notify(view);
+            }
+        });
         let mut this = Self {
             store,
             composer,
@@ -83,9 +152,21 @@ impl Conversation {
             chat_jid: None,
             is_group: false,
             // Test hook: open the tapback tray for a message id.
-            picker_for: std::env::var("WA_DEBUG_PICKER").ok(),
+            picker_for: None,
+            menu_at: None,
+            confirm_delete: None,
+            forward: None,
+            find: None,
+            pending_jump: None,
+            highlight: None,
+            highlight_gen: 0,
+            away,
+            unseen: 0,
+            notice: None,
+            _timers: Vec::new(),
             _subs: subs,
         };
+        this.debug_hooks(window, cx);
         // A reopened window starts on whatever chat the store already has selected.
         this.rebuild(Change::Appended, cx);
         this
@@ -94,8 +175,18 @@ impl Conversation {
     fn sync_header(&mut self, cx: &mut Context<Self>) {
         let selected = self.store.read(cx).selected.clone();
         if selected != self.chat_jid {
-            self.chat_jid = selected;
+            // `rebuild` notices the switch (and resets per-chat state) itself.
             self.rebuild(Change::Appended, cx);
+        } else {
+            if self.find.is_some() {
+                // Search results from the store come in through here.
+                self.refresh_matches(cx);
+            }
+            // A history fetch finishing (no transcript change) lets a jump page on.
+            let h = self.store.read(cx).selected_history();
+            if self.pending_jump.is_some() && !h.page_pending && !h.fetching_remote {
+                self.try_jump(cx);
+            }
         }
         cx.notify();
     }
@@ -109,6 +200,7 @@ impl Conversation {
         let old_first = self.messages.first().map(|m| m.id.clone());
         let old_first_row = self.rows.iter().position(|r| matches!(r, Row::Message { .. }));
         let old_keys = row_keys(&self.rows, &self.messages);
+        let old_newest = self.messages.last().map(|m| m.timestamp);
         let old_messages: HashMap<String, ChatMessage> =
             if switched { HashMap::new() } else { self.messages.iter().map(|m| (m.id.clone(), m.clone())).collect() };
         self.messages = self.chat_jid.as_ref().and_then(|j| store.messages.get(j)).cloned().unwrap_or_default();
@@ -116,6 +208,13 @@ impl Conversation {
         self.rows = build_rows(&self.messages, typing);
         if switched {
             self.thumbs.clear();
+            self.unseen = 0;
+            self.away.set(false);
+            self.pending_jump = None;
+            self.highlight = None;
+            self.confirm_delete = None;
+            self.picker_for = None;
+            self.find = None;
         }
         for m in &self.messages {
             let thumb = match &m.body {
@@ -184,9 +283,25 @@ impl Conversation {
                 }
                 if change == Change::Appended && following {
                     self.list.scroll_to_end();
+                } else if change == Change::Appended {
+                    // New arrivals only, not older messages a history reload filled in.
+                    self.unseen += self
+                        .messages
+                        .iter()
+                        .filter(|m| !m.from_me && !old_messages.contains_key(&m.id))
+                        .filter(|m| old_newest.is_none_or(|t| m.timestamp >= t))
+                        .count();
+                }
+                // Who's typing may have changed (group names).
+                if matches!(self.rows.last(), Some(Row::Typing)) {
+                    self.list.remeasure_items(new - 1..new);
                 }
             }
         }
+        if self.find.is_some() {
+            self.refresh_matches(cx);
+        }
+        self.try_jump(cx);
         // Test hook: once the first page is in, jump to the top to exercise history
         // paging without a mouse.
         static DEBUG_SCROLLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -201,12 +316,324 @@ impl Conversation {
         cx.notify();
     }
 
-    fn reveal_message(&mut self, id: &str) {
-        if let Some(row) =
-            self.rows.iter().position(|r| matches!(r, Row::Message { ix, .. } if self.messages[*ix].id == id))
-        {
-            self.list.scroll_to_reveal_item(row);
+    fn row_of(&self, id: &str) -> Option<usize> {
+        self.rows.iter().position(|r| matches!(r, Row::Message { ix, .. } if self.messages[*ix].id == id))
+    }
+
+    /// Scroll to a message (a reply's original, a search hit), paging older history in
+    /// until it's loaded.
+    fn jump_to(&mut self, id: String, timestamp: Option<i64>, flash: bool, cx: &mut Context<Self>) {
+        self.pending_jump = Some(Jump { id, timestamp, flash, pages: 0 });
+        self.try_jump(cx);
+    }
+
+    fn try_jump(&mut self, cx: &mut Context<Self>) {
+        let Some(jump) = &self.pending_jump else { return };
+        if let Some(row) = self.row_of(&jump.id) {
+            // Rows above may not be measured yet (just paged in): anchor on the row before
+            // it, which keeps some context above, instead of revealing by height.
+            self.list.scroll_to(ListOffset { item_ix: row.saturating_sub(1), offset_in_item: px(0.) });
+            // Programmatic scrolls don't reach the scroll handler.
+            if row + 3 < self.rows.len() {
+                self.away.set(true);
+            }
+            if jump.flash {
+                self.flash(jump.id.clone(), cx);
+            }
+            self.pending_jump = None;
+            cx.notify();
+            return;
         }
+        // A search hit inside the loaded range that isn't here was deleted meanwhile.
+        let oldest = self.messages.first().map(|m| m.timestamp);
+        if jump.timestamp.zip(oldest).is_some_and(|(t, o)| t >= o) {
+            self.pending_jump = None;
+            return;
+        }
+        let (store, view) = (self.store.clone(), cx.entity().downgrade());
+        let exhausted = jump.pages >= JUMP_MAX_PAGES;
+        cx.defer(move |cx| {
+            if !exhausted && store.update(cx, |s, cx| s.load_older_by(JUMP_PAGE, true, cx)) {
+                let _ = view.update(cx, |this, _| this.pending_jump.as_mut().map(|j| j.pages += 1));
+                return;
+            }
+            // Still loading: the next store update tries again.
+            let h = store.read(cx).selected_history();
+            if exhausted || (!h.page_pending && !h.fetching_remote) {
+                let _ = view.update(cx, |this, cx| {
+                    if this.pending_jump.take().is_some() {
+                        this.show_notice("That message isn't available.", cx);
+                    }
+                });
+            }
+        });
+    }
+
+    fn flash(&mut self, id: String, cx: &mut Context<Self>) {
+        self.highlight_gen += 1;
+        let generation = self.highlight_gen;
+        self.highlight = Some((id, generation));
+        self._timers.retain(|t| !t.is_ready());
+        self._timers.push(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HIGHLIGHT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.highlight.as_ref().is_some_and(|(_, g)| *g == generation) {
+                    this.highlight = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn show_notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.notice = Some(text.clone());
+        self._timers.retain(|t| !t.is_ready());
+        self._timers.push(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(2500)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.notice.as_deref() == Some(text.as_str()) {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.list.set_follow_mode(FollowMode::Tail);
+        self.away.set(false);
+        self.unseen = 0;
+        cx.notify();
+    }
+
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_jid.is_none() {
+            return;
+        }
+        if let Some(find) = &self.find {
+            find.bar.update(cx, |b, cx| b.focus(window, cx));
+            return;
+        }
+        let bar = cx.new(|cx| FindBar::new(window, cx));
+        let sub = cx.subscribe_in(&bar, window, |this, _, ev: &FindEvent, window, cx| this.on_find(ev, window, cx));
+        bar.update(cx, |b, cx| b.focus(window, cx));
+        self.find = Some(Find {
+            bar,
+            query: String::new(),
+            matches: Vec::new(),
+            current: None,
+            searched: false,
+            jumped: false,
+            _debounce: None,
+            _sub: sub,
+        });
+        cx.notify();
+    }
+
+    fn on_find(&mut self, ev: &FindEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        match ev {
+            FindEvent::Query(q) => {
+                let query = q.trim().to_string();
+                if query == find.query {
+                    return;
+                }
+                (find.query, find.searched, find.jumped, find.current) = (query.clone(), false, false, None);
+                // The store scan decodes every message of the chat: not on every keystroke.
+                let store = self.store.clone();
+                find._debounce = Some(cx.spawn(async move |_, cx| {
+                    cx.background_executor().timer(Duration::from_millis(200)).await;
+                    store.update(cx, |s, _| s.search(&query));
+                }));
+                self.refresh_matches(cx);
+            }
+            FindEvent::Older | FindEvent::Newer => {
+                let older = matches!(ev, FindEvent::Older);
+                let n = find.matches.len();
+                if n == 0 {
+                    return;
+                }
+                let next = match find.current {
+                    None => n - 1,
+                    Some(i) if older => (i + n - 1) % n,
+                    Some(i) => (i + 1) % n,
+                };
+                find.current = Some(next);
+                find.jumped = true;
+                let (id, ts) = find.matches[next].clone();
+                self.update_find_status(cx);
+                self.jump_to(id, Some(ts), false, cx);
+            }
+            FindEvent::Close => {
+                self.find = None;
+                Composer::focus(&self.composer, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Recompute matches: the loaded transcript, plus the store's hits for older ones.
+    fn refresh_matches(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        let mut matches: Vec<(String, i64)> = Vec::new();
+        if !find.query.is_empty() {
+            let mut seen = HashSet::new();
+            for m in &self.messages {
+                if find_text(m).is_some_and(|t| !match_ranges(t, &find.query).is_empty()) {
+                    seen.insert(m.id.clone());
+                    matches.push((m.id.clone(), m.timestamp));
+                }
+            }
+            if let Some((chat, query, hits)) = &self.store.read(cx).search_results
+                && Some(chat) == self.chat_jid.as_ref()
+                && query.trim() == find.query
+            {
+                find.searched = true;
+                matches.extend(hits.iter().filter(|h| !seen.contains(&h.id)).map(|h| (h.id.clone(), h.timestamp)));
+            }
+            matches.sort_by_key(|(_, ts)| *ts);
+        }
+        let current_id = find.current.and_then(|i| find.matches.get(i)).map(|(id, _)| id.clone());
+        find.current = match current_id {
+            Some(id) => matches.iter().position(|(m, _)| *m == id),
+            None => None,
+        };
+        find.matches = matches;
+        // Start from the newest match, like Messages.
+        if find.current.is_none() && !find.jumped && !find.matches.is_empty() {
+            let i = find.matches.len() - 1;
+            find.current = Some(i);
+            find.jumped = true;
+            let (id, ts) = find.matches[i].clone();
+            self.update_find_status(cx);
+            self.jump_to(id, Some(ts), false, cx);
+            return;
+        }
+        self.update_find_status(cx);
+    }
+
+    fn update_find_status(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &self.find else { return };
+        let status = (find.searched || !find.matches.is_empty()).then(|| {
+            let n = find.matches.len();
+            // Counted from the newest, the one shown first.
+            (find.current.map(|i| n - 1 - i), n)
+        });
+        find.bar.update(cx, |b, cx| b.set_status(status, cx));
+        cx.notify();
+    }
+
+    /// The query to highlight in a message, and whether it's the current match.
+    fn find_highlight(&self, id: &str) -> Option<(&str, bool)> {
+        let find = self.find.as_ref().filter(|f| !f.query.is_empty())?;
+        let current = find.current.and_then(|i| find.matches.get(i)).is_some_and(|(m, _)| m == id);
+        Some((find.query.as_str(), current))
+    }
+
+    fn open_forward(&mut self, message: ChatMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let picker = cx.new(|cx| ForwardPicker::new(store, message, window, cx));
+        let sub = cx.subscribe_in(&picker, window, |this, picker, ev: &ForwardEvent, window, cx| {
+            if let ForwardEvent::Picked(jid, name) = ev {
+                let message = picker.read(cx).message.clone();
+                let jid = jid.clone();
+                this.store.update(cx, |s, cx| s.forward(&message, jid, cx));
+                this.show_notice(format!("Forwarded to {name}"), cx);
+            }
+            this.forward = None;
+            Composer::focus(&this.composer, window, cx);
+            cx.notify();
+        });
+        self.picker_for = None;
+        self.forward = Some((picker, sub));
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.picker_for = None;
+        self.menu_at = None;
+        cx.notify();
+    }
+
+    /// Test hooks: WA_DEBUG_FIND="<query>", WA_DEBUG_PICKER (tapback tray) / WA_DEBUG_MENU / WA_DEBUG_FORWARD / WA_DEBUG_DELETE /
+    /// WA_DEBUG_JUMP="<message id>", WA_DEBUG_SCROLL_UP=1 (needs WA_DEBUG_SELECT).
+    fn debug_hooks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hooks = [
+            "WA_DEBUG_PICKER",
+            "WA_DEBUG_MENU",
+            "WA_DEBUG_FIND",
+            "WA_DEBUG_FORWARD",
+            "WA_DEBUG_DELETE",
+            "WA_DEBUG_JUMP",
+            "WA_DEBUG_SCROLL_UP",
+            "WA_DEBUG_ACT",
+        ];
+        let set: Vec<(&str, String)> = hooks.iter().filter_map(|k| Some((*k, std::env::var(k).ok()?))).collect();
+        if set.is_empty() {
+            return;
+        }
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(2500)).await;
+            for (key, value) in set {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        let find_message = |this: &Self| this.messages.iter().find(|m| m.id == value).cloned();
+                        match key {
+                            "WA_DEBUG_FIND" => {
+                                this.open_find(window, cx);
+                                if let Some(f) = &this.find {
+                                    f.bar.update(cx, |b, cx| b.set_query(&value, window, cx));
+                                }
+                            }
+                            "WA_DEBUG_FORWARD" => {
+                                if let Some(m) = find_message(this) {
+                                    this.open_forward(m, window, cx);
+                                }
+                            }
+                            "WA_DEBUG_DELETE" => this.confirm_delete = find_message(this),
+                            "WA_DEBUG_PICKER" => this.picker_for = Some(value.clone()),
+                            // "<id>|everyone", "<id>|me", "<id>|retry", "<id>|fwd:<chat>"
+                            "WA_DEBUG_ACT" => {
+                                for act in value.split(',') {
+                                    let Some((id, what)) = act.split_once('|') else { continue };
+                                    let Some(m) = this.messages.iter().find(|m| m.id == id).cloned() else { continue };
+                                    match what {
+                                        "everyone" | "me" => this.store.read(cx).delete_message(&m, what == "everyone"),
+                                        "retry" => this.store.update(cx, |s, cx| s.retry_send(&m, cx)),
+                                        _ => {
+                                            if let Some(to) = what.strip_prefix("fwd:") {
+                                                this.store.update(cx, |s, cx| s.forward(&m, to.to_string(), cx));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "WA_DEBUG_MENU" => {
+                                // Right-click near the message's bubble.
+                                if let Some(row) = this.row_of(&value) {
+                                    let at = this.list.bounds_for_item(row).map_or(point(px(640.), px(420.)), |b| {
+                                        point(b.origin.x + px(260.), b.origin.y + b.size.height - px(10.))
+                                    });
+                                    this.picker_for = Some(value.clone());
+                                    this.menu_at = Some(at);
+                                }
+                            }
+                            "WA_DEBUG_JUMP" => this.jump_to(value.clone(), None, true, cx),
+                            _ => {
+                                this.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+                                this.away.set(true);
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+            }
+        })
+        .detach();
     }
 
     fn render_row(&self, ix: usize, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -225,12 +652,7 @@ impl Conversation {
             Some(Row::Message { ix, first, last, show_name, status }) => {
                 self.render_message(&self.messages[*ix], *first, *last, *show_name, status.as_ref(), theme, window, cx)
             }
-            Some(Row::Typing) => div()
-                .pt(px(8.))
-                .px(px(16.))
-                .when(self.is_group, |d| d.pl(px(52.)))
-                .child(typing_bubble(theme))
-                .into_any_element(),
+            Some(Row::Typing) => self.typing_row(theme, cx),
             None => div().into_any_element(),
         }
     }
@@ -257,8 +679,16 @@ impl Conversation {
             return crate::kinds::system_line(text, theme).into_any_element();
         }
         let thumb = self.thumbs.get(&m.id).cloned();
+        let found = self.find_highlight(&m.id);
         let content: AnyElement = match &m.body {
-            MessageBody::Image(media) => self.image_content(m, media, from_me, last, theme, cx),
+            _ if m.deleted => bubble(
+                text_content(if from_me { "You deleted this message" } else { "This message was deleted" }, true),
+                from_me,
+                last,
+                theme,
+            )
+            .into_any_element(),
+            MessageBody::Image(media) => self.image_content(m, media, from_me, last, found, theme, cx),
             MessageBody::Video(v) => crate::kinds::video(&self.store, m, v, thumb, theme, cx).into_any_element(),
             MessageBody::Document(d) => {
                 bubble(div().child(crate::kinds::document(&self.store, m, d, from_me, theme)), from_me, last, theme)
@@ -282,7 +712,7 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Voice(media) => voice_content(&self.store, m, media, from_me, last, theme, window, cx),
-            MessageBody::Text(t) => bubble(text_content(t, false), from_me, last, theme).into_any_element(),
+            MessageBody::Text(t) => bubble(found_text(t, found), from_me, last, theme).into_any_element(),
             MessageBody::Unsupported { label } => {
                 bubble(text_content(label, true), from_me, last, theme).into_any_element()
             }
@@ -315,6 +745,7 @@ impl Conversation {
         let react_button = hover_button(format!("react-{}", m.id), Glyph::Smile).on_click(cx.listener(
             move |this, _, _, cx| {
                 this.picker_for = Some(react_id.clone());
+                this.menu_at = None;
                 cx.notify();
             },
         ));
@@ -324,7 +755,7 @@ impl Conversation {
         let quoted_who = m.quoted.as_ref().map(|q| {
             if q.from_me { "You".to_string() } else { q.sender_name.clone().unwrap_or_else(|| "message".into()) }
         });
-        let header = (show_sender || quoted_who.is_some()).then(|| {
+        let header = (show_sender || quoted_who.is_some() || m.forwarded).then(|| {
             div()
                 .flex()
                 .items_center()
@@ -345,15 +776,46 @@ impl Conversation {
                             .child(who),
                     )
                 })
+                .when(m.forwarded, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .italic()
+                            .child(glyph(Glyph::Forward, 10., theme.text_secondary))
+                            .child("Forwarded"),
+                    )
+                })
         });
 
         let picker_open = self.picker_for.as_deref() == Some(m.id.as_str());
+        let flash = self.highlight.as_ref().filter(|(id, _)| *id == m.id).map(|(_, g)| *g);
         let bubble_area = div()
             .relative()
             .when(!m.reactions.is_empty(), |d| d.pt(px(14.)))
             .child(content)
             .when(!m.reactions.is_empty(), |d| d.child(reaction_pill(&m.reactions, from_me, theme)))
-            .when(picker_open, |d| d.child(self.reaction_picker(m, from_me, theme, cx)));
+            .when_some(flash, |d, generation| {
+                // A brief glow over the bubble the transcript jumped to.
+                let glow = theme.accent;
+                d.child(
+                    div()
+                        .absolute()
+                        .inset(px(-3.))
+                        .rounded(px(BUBBLE_RADIUS + 3.))
+                        .border_2()
+                        .border_color(glow)
+                        .bg(glow.opacity(0.18))
+                        .with_animation(
+                            SharedString::from(format!("flash-{}-{generation}", m.id)),
+                            Animation::new(HIGHLIGHT).with_easing(ease_in_out),
+                            |d, t| d.opacity(if t < 0.5 { 1. } else { 2. * (1. - t) }),
+                        ),
+                )
+            })
+            .when(picker_open && !m.deleted, |d| d.child(self.reaction_picker(m, from_me, theme, cx)))
+            .when(picker_open && self.menu_at.is_some(), |d| d.child(self.message_menu(m, theme, cx)));
 
         let right_click_id = m.id.clone();
         let row = div()
@@ -412,7 +874,9 @@ impl Conversation {
                                 })),
                         )
                     })
-                    .child(div().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button)),
+                    .when(!m.deleted, |d| {
+                        d.child(div().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button))
+                    }),
             )
             .when(m.edited, |d| {
                 d.child(
@@ -443,11 +907,12 @@ impl Conversation {
                         }),
                 )
             })
-            // Right-click opens the tapback tray (which also offers Reply), like Messages.
+            // Right-click opens the tapback tray and the message's menu, like Messages.
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     this.picker_for = Some(right_click_id.clone());
+                    this.menu_at = Some(ev.position);
                     cx.notify();
                 }),
             );
@@ -507,10 +972,7 @@ impl Conversation {
                     .truncate()
                     .cursor_pointer()
                     .child(q.preview.replace('\n', " "))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.reveal_message(&id);
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(move |this, _, _, cx| this.jump_to(id.clone(), None, true, cx))),
             )
     }
 
@@ -541,8 +1003,7 @@ impl Conversation {
                     .child(*emoji)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.store.update(cx, |s, _| s.react(&target, emoji));
-                        this.picker_for = None;
-                        cx.notify();
+                        this.close_menu(cx);
                     }))
             }))
             .child(div().w(px(1.)).h(px(20.)).mx(px(2.)).bg(theme.separator))
@@ -560,9 +1021,8 @@ impl Conversation {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let target = target.clone();
                         this.store.update(cx, |s, cx| s.set_replying_to(Some(target), cx));
-                        this.picker_for = None;
+                        this.close_menu(cx);
                         Composer::focus(&this.composer, window, cx);
-                        cx.notify();
                     }))
             })
             .when(Store::can_edit(m), |tray| {
@@ -578,16 +1038,12 @@ impl Conversation {
                         .hover(|s| s.bg(theme.search_bg))
                         .child(glyph(Glyph::Pencil, 15., theme.text_secondary))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.picker_for = None;
+                            this.close_menu(cx);
                             Composer::start_edit(&this.composer, target.clone(), window, cx);
-                            cx.notify();
                         })),
                 )
             })
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.picker_for = None;
-                cx.notify();
-            }));
+            .occlude();
         deferred(
             div()
                 .absolute()
@@ -599,12 +1055,224 @@ impl Conversation {
         .with_priority(1)
     }
 
+    /// The right-click menu: Reply, Copy, Forward…, Edit, Delete…, at the cursor.
+    fn message_menu(&self, m: &ChatMessage, theme: &Theme, cx: &mut Context<Self>) -> Deferred {
+        let at = self.menu_at.unwrap_or_default();
+        let item = |key: &str, label: &'static str, destructive: bool| {
+            let (fg, hover_bg) = (if destructive { theme.failed } else { theme.text }, theme.accent);
+            div()
+                .id(SharedString::from(format!("menu-{key}-{}", m.id)))
+                .h(px(24.))
+                .mx(px(5.))
+                .px(px(9.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .text_size(px(13.))
+                .text_color(fg)
+                .hover(move |s| s.bg(hover_bg).text_color(white()))
+                .child(label)
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        if !m.deleted {
+            let target = m.clone();
+            items.push(
+                item("reply", "Reply", false)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.store.update(cx, |s, cx| s.set_replying_to(Some(target.clone()), cx));
+                        this.close_menu(cx);
+                        Composer::focus(&this.composer, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if let Some(text) = copy_text(m) {
+            items.push(
+                item("copy", "Copy", false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.close_menu(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if Store::can_forward(m) {
+            let target = m.clone();
+            items.push(
+                item("forward", "Forward…", false)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_menu(cx);
+                        this.open_forward(target.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if Store::can_edit(m) {
+            let target = m.clone();
+            items.push(
+                item("edit", "Edit", false)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_menu(cx);
+                        Composer::start_edit(&this.composer, target.clone(), window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        // A queued send would still go out after its row is gone: no Delete while sending.
+        let sending = m.from_me && m.status == DeliveryStatus::Pending;
+        if !items.is_empty() && !sending {
+            items.push(div().h(px(1.)).mx(px(10.)).my(px(4.)).bg(theme.separator).into_any_element());
+        }
+        let target = m.clone();
+        items.extend((!sending).then(|| {
+            item("delete", "Delete…", true)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    this.confirm_delete = Some(target.clone());
+                    cx.notify();
+                }))
+                .into_any_element()
+        }));
+        deferred(
+            anchored().position(at).snap_to_window_with_margin(px(8.)).child(
+                surface(div(), theme)
+                    .id(SharedString::from(format!("menu-{}", m.id)))
+                    .occlude()
+                    .min_w(px(180.))
+                    .py(px(5.))
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .children(items),
+            ),
+        )
+        .with_priority(2)
+    }
+
+    /// "Delete Message?" alert: for everyone (my recent messages) and/or just for me.
+    fn delete_dialog(&self, m: &ChatMessage, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let everyone = Store::can_delete_for_everyone(m);
+        let detail = if everyone {
+            "Delete it for everyone in this chat, or only on your devices."
+        } else {
+            "It will be deleted on your devices. Others in the chat can still see it."
+        };
+        let button = |key: &'static str, label: &'static str, primary: bool, destructive: bool| {
+            let fg = if primary { white() } else if destructive { theme.failed } else { theme.text };
+            div()
+                .id(key)
+                .h(px(28.))
+                .w_full()
+                .rounded(px(7.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg)
+                .map(|d| if primary { d.bg(theme.failed) } else { d.bg(theme.search_bg) })
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .child(label)
+        };
+        let delete = |for_everyone: bool| {
+            let target = m.clone();
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
+                this.store.read(cx).delete_message(&target, for_everyone);
+                this.confirm_delete = None;
+                cx.notify();
+            })
+        };
+        surface(div(), theme)
+            .id("delete-dialog")
+            .occlude()
+            .w(px(280.))
+            .p(px(18.))
+            .rounded(px(12.))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(theme.text).child("Delete Message?"))
+            .child(
+                div()
+                    .pb(px(8.))
+                    .text_size(px(11.5))
+                    .line_height(px(15.))
+                    .text_center()
+                    .text_color(theme.text_secondary)
+                    .child(detail),
+            )
+            .when(everyone, |d| d.child(button("delete-everyone", "Delete for Everyone", true, true).on_click(delete(true))))
+            .child(button("delete-me", "Delete for Me", !everyone, true).on_click(delete(false)))
+            .child(button("delete-cancel", "Cancel", false, false).on_click(cx.listener(|this, _, _, cx| {
+                this.confirm_delete = None;
+                cx.notify();
+            })))
+    }
+
+    /// Who's typing in this chat (JID, display name), for group typing labels.
+    fn typists(&self, cx: &App) -> Vec<(String, String)> {
+        let Some(jid) = &self.chat_jid else { return Vec::new() };
+        self.store
+            .read(cx)
+            .typists
+            .get(jid)
+            .map(|list| {
+                list.iter()
+                    .map(|(j, n)| (j.clone(), n.clone().unwrap_or_else(|| j.split('@').next().unwrap_or("").to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn typing_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let typists = if self.is_group { self.typists(cx) } else { Vec::new() };
+        let first = typists.first().cloned();
+        let photo = first.as_ref().and_then(|(jid, _)| self.photo_for(jid, cx));
+        div()
+            .pt(px(8.))
+            .px(px(16.))
+            .flex()
+            .flex_col()
+            .when(!typists.is_empty(), |d| {
+                d.child(
+                    div()
+                        .pl(px(50.))
+                        .pb(px(2.))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_secondary)
+                        .child(names_label(&typists)),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(10.))
+                    .when(self.is_group, |d| {
+                        d.child(match &first {
+                            Some((_, name)) => avatar(name, photo, 28., theme),
+                            None => div().size(px(28.)).flex_none().into_any_element(),
+                        })
+                    })
+                    .child(typing_bubble(theme)),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn image_content(
         &self,
         m: &ChatMessage,
         media: &ImageMedia,
         from_me: bool,
         last: bool,
+        found: Option<(&str, bool)>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -666,7 +1334,7 @@ impl Conversation {
                 .gap(px(2.))
                 .when(from_me, |d| d.items_end())
                 .child(frame)
-                .child(bubble(text_content(caption, false), from_me, last, theme))
+                .child(bubble(found_text(caption, found), from_me, last, theme))
                 .into_any_element(),
         }
     }
@@ -701,6 +1369,61 @@ fn reaction_pill(reactions: &[wa_backend::Reaction], from_me: bool, theme: &Them
         .when(reactions.len() > 1, |d| {
             d.child(div().pl(px(2.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).child(reactions.len().to_string()))
         })
+}
+
+/// Text (or a caption) to copy: what the bubble shows in words.
+fn copy_text(m: &ChatMessage) -> Option<String> {
+    if m.deleted {
+        return None;
+    }
+    let text = match &m.body {
+        MessageBody::Rich(r) => Some(r.body.as_str()),
+        _ => find_text(m),
+    };
+    text.filter(|t| !t.trim().is_empty()).map(str::to_string)
+}
+
+/// The words find-in-chat searches: text and captions (like the store's search).
+fn find_text(m: &ChatMessage) -> Option<&str> {
+    if m.deleted {
+        return None;
+    }
+    match &m.body {
+        MessageBody::Text(t) => Some(t),
+        MessageBody::Image(i) => i.caption.as_deref(),
+        MessageBody::Video(v) => v.caption.as_deref(),
+        MessageBody::Document(d) => d.caption.as_deref(),
+        MessageBody::Rich(r) => Some(&r.body),
+        _ => None,
+    }
+}
+
+/// "Omar", "Omar and Sara", "Omar and 2 others".
+fn names_label(typists: &[(String, String)]) -> String {
+    match typists {
+        [] => String::new(),
+        [(_, a)] => a.clone(),
+        [(_, a), (_, b)] => format!("{a} and {b}"),
+        [(_, a), rest @ ..] => format!("{a} and {} others", rest.len()),
+    }
+}
+
+/// Bubble text with find-in-chat matches highlighted (the current match stronger).
+fn found_text(text: &str, found: Option<(&str, bool)>) -> Div {
+    let Some((query, current)) = found else { return text_content(text, false) };
+    let ranges = match_ranges(text, query);
+    if ranges.is_empty() {
+        return text_content(text, false);
+    }
+    let style = HighlightStyle {
+        background_color: Some(if current { hsla(48. / 360., 1., 0.55, 1.) } else { hsla(52. / 360., 1., 0.7, 0.75) }),
+        color: Some(black()),
+        ..Default::default()
+    };
+    div()
+        .text_size(px(14.))
+        .line_height(px(19.))
+        .child(StyledText::new(text.to_string()).with_highlights(ranges.into_iter().map(|r| (r, style))))
 }
 
 fn text_content(text: &str, italic: bool) -> Div {
@@ -880,6 +1603,63 @@ fn typing_bubble(theme: &Theme) -> impl IntoElement {
         .child(div().absolute().left(px(-7.)).bottom(px(-8.)).size(px(5.)).rounded_full().bg(theme.bubble_in))
 }
 
+/// A dimmed layer over the conversation for a dialog; clicking it calls `dismiss`.
+fn modal_backdrop(id: &'static str, dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(black().opacity(0.18))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, dismiss)
+}
+
+/// Round "jump to the latest" button over the transcript's bottom-right, with a count
+/// of messages that arrived while scrolled up.
+fn scroll_button(unseen: usize, bottom: f32, theme: &Theme, cx: &mut Context<Conversation>) -> impl IntoElement {
+    div()
+        .absolute()
+        .right(px(18.))
+        .bottom(px(bottom + 10.))
+        .child(
+            surface(div().id("scroll-to-bottom"), theme)
+                .relative()
+                .size(px(34.))
+                .rounded_full()
+                .shadow_md()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.search_bg))
+                .child(glyph(Glyph::ArrowDown, 15., theme.text_secondary))
+                .when(unseen > 0, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(-7.))
+                            .right(px(-5.))
+                            .min_w(px(18.))
+                            .h(px(18.))
+                            .px(px(5.))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(white())
+                            .child(if unseen > 99 { "99+".to_string() } else { unseen.to_string() }),
+                    )
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.scroll_to_bottom(cx))),
+        )
+}
+
 /// Identity of each row for diffing: rows with equal keys are the same list item.
 #[derive(PartialEq)]
 enum RowKey {
@@ -906,7 +1686,7 @@ fn row_keys(rows: &[Row], messages: &[ChatMessage]) -> Vec<RowKey> {
 
 fn build_rows(messages: &[ChatMessage], typing: bool) -> Vec<Row> {
     let mut rows = Vec::with_capacity(messages.len() + 8);
-    let last_mine = messages.iter().rposition(|m| m.from_me);
+    let last_mine = messages.iter().rposition(|m| m.from_me && !m.deleted);
     for (ix, m) in messages.iter().enumerate() {
         let prev = ix.checked_sub(1).map(|p| &messages[p]);
         let next = messages.get(ix + 1);
@@ -956,6 +1736,14 @@ impl Render for Conversation {
                 .into_any_element();
         };
         let typing = store.typing.contains(&chat.jid);
+        let typists = if self.is_group { self.typists(cx) } else { Vec::new() };
+        let typing_label = match typists.as_slice() {
+            _ if !typing => None,
+            [] => Some("typing…".to_string()),
+            t @ [_] => Some(format!("{} is typing…", names_label(t))),
+            t => Some(format!("{} are typing…", names_label(t))),
+        };
+        let store = self.store.read(cx);
         let profile_open = store.profile_open.clone();
         let history = store.selected_history();
         let loading_older = history.page_pending || history.fetching_remote;
@@ -967,6 +1755,16 @@ impl Render for Conversation {
         }
         let view = cx.entity();
         let store_handle = self.store.clone();
+        let find_bar = self.find.as_ref().map(|f| f.bar.clone());
+        let top = HEADER_HEIGHT + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
+        let bottom = COMPOSER_CLEARANCE + if replying { 44. } else { 0. };
+        let away = self.away.get();
+        if !away {
+            self.unseen = 0;
+        }
+        let unseen = self.unseen;
+        let confirm = self.confirm_delete.clone();
+        let forward = self.forward.as_ref().map(|(p, _)| p.clone());
 
         let pane = div()
             .flex_1()
@@ -987,12 +1785,12 @@ impl Render for Conversation {
                     view.update(cx, |this, cx| this.render_row(ix, &theme, window, cx))
                 })
                 .size_full()
-                .pt(px(HEADER_HEIGHT))
-                .pb(px(COMPOSER_CLEARANCE + if replying { 44. } else { 0. })),
+                .pt(px(top))
+                .pb(px(bottom)),
             )
             .when(loading_older, |d| {
                 d.child(
-                    div().absolute().top(px(HEADER_HEIGHT + 10.)).left_0().right_0().flex().justify_center().child(
+                    div().absolute().top(px(top + 10.)).left_0().right_0().flex().justify_center().child(
                         surface(div().px(px(10.)).py(px(4.)).rounded_full(), &theme)
                             .text_size(px(11.))
                             .text_color(theme.text_secondary)
@@ -1037,12 +1835,56 @@ impl Render for Conversation {
                                     .text_color(theme.text)
                                     .child(chat.name.clone()),
                             )
-                            .when(typing, |d| {
-                                d.child(div().text_size(px(11.)).text_color(theme.text_secondary).child("typing…"))
+                            .when_some(typing_label, |d, label| {
+                                d.child(div().text_size(px(11.)).text_color(theme.text_secondary).child(label))
                             }),
                     ),
             )
-            .child(div().absolute().bottom_0().left_0().right_0().child(self.composer.clone()));
+            .when_some(find_bar, |d, bar| d.child(div().absolute().top(px(HEADER_HEIGHT)).left_0().right_0().child(bar)))
+            .when_some(self.notice.clone(), |d, text| {
+                d.child(
+                    div().absolute().top(px(top + 10.)).left_0().right_0().flex().justify_center().child(
+                        surface(div().px(px(12.)).py(px(5.)).rounded_full(), &theme)
+                            .shadow_sm()
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .child(text),
+                    ),
+                )
+            })
+            .when(away, |d| d.child(scroll_button(unseen, bottom, &theme, cx)))
+            .child(div().absolute().bottom_0().left_0().right_0().child(self.composer.clone()))
+            // Clicking anywhere else closes the tapback tray / menu.
+            .when(self.picker_for.is_some(), |d| {
+                let close = |this: &mut Self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| this.close_menu(cx);
+                d.child(
+                    deferred(
+                        div()
+                            .id("menu-backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, cx.listener(close))
+                            .on_mouse_down(MouseButton::Right, cx.listener(close))
+                            .on_scroll(cx.listener(|this, _, _, cx| this.close_menu(cx))),
+                    )
+                    .with_priority(0),
+                )
+            })
+            .when_some(confirm, |d, m| {
+                let dialog = self.delete_dialog(&m, &theme, cx);
+                d.child(modal_backdrop("delete-backdrop", cx.listener(|this, _, _, cx| {
+                    this.confirm_delete = None;
+                    cx.notify();
+                })).child(dialog))
+            })
+            .when_some(forward, |d, picker| {
+                d.child(modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {
+                    this.forward = None;
+                    Composer::focus(&this.composer, window, cx);
+                    cx.notify();
+                })).child(picker))
+            });
         div()
             .size_full()
             .flex()

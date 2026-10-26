@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::chrome::{round_button, surface};
 use crate::icons::{Glyph, glyph};
-use crate::state::{Store, StoreEvent, body_text};
+use crate::state::{FocusComposer, Store, StoreEvent, body_text};
 use crate::theme::Theme;
 
 /// Height of the + button and of the single-line message field.
@@ -58,6 +58,10 @@ impl Composer {
             cx.observe_in(&store, window, |this, _, window, cx| {
                 this.sync_chat(window, cx);
                 cx.notify();
+            }),
+            // A chat was just picked in New Message.
+            cx.subscribe_in(&store, window, |this, _, _: &FocusComposer, window, cx| {
+                this.input.update(cx, |s, cx| s.focus(window, cx));
             }),
             cx.subscribe_in(&store, window, |this, _, ev: &StoreEvent, window, cx| {
                 if matches!(ev, StoreEvent::AccountReset) {

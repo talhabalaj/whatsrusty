@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
 use wa_backend::{
-    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, MessageBody,
+    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, MessageBody, SearchHit,
 };
 
 /// Emitted when the visible transcript changes, so the conversation view can
@@ -57,6 +57,11 @@ pub struct Store {
     pub chats: Vec<ChatSummary>,
     pub messages: HashMap<String, Vec<ChatMessage>>,
     pub typing: HashSet<String>,
+    /// Who is typing in each chat (JID, name), for group typing indicators. `typing` holds
+    /// the chats with anyone in here (or a 1:1 typing indicator without a sender).
+    pub typists: HashMap<String, Vec<(String, Option<String>)>>,
+    /// Latest answer to `search`: (chat, query, hits oldest first).
+    pub search_results: Option<(String, String, Vec<SearchHit>)>,
     pub selected: Option<String>,
     pub last_error: Option<String>,
     pub history: HashMap<String, History>,
@@ -83,9 +88,19 @@ pub struct Store {
     /// Messages sent from this window recently, so the transcript can animate them in once.
     pub just_sent: HashMap<String, Instant>,
     requested: HashSet<String>,
+    /// Contacts for the New Message picker (after `request_contacts`).
+    pub contacts: Vec<wa_backend::Contact>,
+    /// Answers to phone-number checks: chat JID (`None` = not on WhatsApp) or the error.
+    pub phone_lookups: HashMap<String, Result<Option<String>, String>>,
+    /// The user closed the conversation (Mark as Unread on it): don't auto-select another.
+    stay_deselected: bool,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
+
+/// Ask the composer to take keyboard focus (a chat was just picked in New Message).
+pub struct FocusComposer;
+impl EventEmitter<FocusComposer> for Store {}
 
 impl Store {
     pub fn new(backend: BackendHandle, cx: &mut Context<Self>) -> Self {
@@ -106,6 +121,8 @@ impl Store {
             chats: Vec::new(),
             messages: HashMap::new(),
             typing: HashSet::new(),
+            typists: HashMap::new(),
+            search_results: None,
             selected: None,
             last_error: None,
             history: HashMap::new(),
@@ -121,6 +138,9 @@ impl Store {
             profile_requested_at: HashMap::new(),
             just_sent: HashMap::new(),
             requested: HashSet::new(),
+            contacts: Vec::new(),
+            phone_lookups: HashMap::new(),
+            stay_deselected: false,
         }
     }
 
@@ -151,6 +171,7 @@ impl Store {
                 }
                 self.chats = chats;
                 if self.selected.is_none()
+                    && !self.stay_deselected
                     && let Some(first) = self.chats.first().map(|c| c.jid.clone())
                 {
                     self.select(first, cx);
@@ -202,7 +223,7 @@ impl Store {
                 let chat_jid = m.chat_jid.clone();
                 let from_me = m.from_me;
                 if !from_me {
-                    self.typing.remove(&chat_jid);
+                    self.set_typist(&chat_jid, Some(&m.sender_jid), None, false);
                 }
                 if media_settled(&m.body) {
                     self.media_requested.remove(&(chat_jid.clone(), m.id.clone()));
@@ -247,12 +268,8 @@ impl Store {
                     cx.emit(StoreEvent::TranscriptChanged { chat_jid, change: Change::Updated });
                 }
             }
-            Event::Typing { chat_jid, typing, .. } => {
-                if typing {
-                    self.typing.insert(chat_jid.clone());
-                } else {
-                    self.typing.remove(&chat_jid);
-                }
+            Event::Typing { chat_jid, sender_name, typing, sender_jid } => {
+                self.set_typist(&chat_jid, sender_jid.as_deref(), sender_name, typing);
                 let change = if typing { Change::Appended } else { Change::Updated };
                 cx.emit(StoreEvent::TranscriptChanged { chat_jid, change });
             }
@@ -281,6 +298,13 @@ impl Store {
                     });
                 }
                 log::debug!("notify {message_id}");
+            }
+            Event::Contacts(list) => self.contacts = list,
+            Event::PhoneLookup { phone, jid, error } => {
+                self.phone_lookups.insert(phone, error.map_or(Ok(jid), Err));
+            }
+            Event::SearchResults { chat_jid, query, hits } => {
+                self.search_results = Some((chat_jid, query, hits));
             }
             Event::Error(e) => {
                 log::error!("backend: {e}");
@@ -311,6 +335,7 @@ impl Store {
             }
         }
         self.selected = Some(jid.clone());
+        self.stay_deselected = false;
         // Note: no `dismiss_system_notification` here. GPUI's macOS implementation makes a
         // synchronous XPC call to usernotificationsd on the main thread, which can block the
         // UI indefinitely (observed hanging at startup when the first chat is auto-selected).
@@ -321,17 +346,25 @@ impl Store {
     /// Request the page before the oldest loaded message of the selected chat.
     /// Called when the transcript is scrolled near its top.
     pub fn load_older(&mut self, cx: &mut Context<Self>) {
-        let Some(jid) = self.selected.clone() else { return };
-        let Some(oldest) = self.messages.get(&jid).and_then(|m| m.first()).map(|m| m.timestamp) else { return };
+        self.load_older_by(100, false, cx);
+    }
+
+    /// Like `load_older`, with a page of `limit` messages (bigger when jumping back to a
+    /// quoted message or search hit). `force` skips the pause after an empty answer (an
+    /// explicit jump, not scrolling). Returns whether a page was requested.
+    pub fn load_older_by(&mut self, limit: u32, force: bool, cx: &mut Context<Self>) -> bool {
+        let Some(jid) = self.selected.clone() else { return false };
+        let Some(oldest) = self.messages.get(&jid).and_then(|m| m.first()).map(|m| m.timestamp) else { return false };
         let h = self.history.entry(jid.clone()).or_default();
-        if !h.has_more || h.page_pending || h.fetching_remote || h.retry_after.is_some_and(|t| Instant::now() < t) {
-            return;
+        if !h.has_more || h.page_pending || h.fetching_remote || (!force && h.retry_after.is_some_and(|t| Instant::now() < t)) {
+            return false;
         }
         h.page_pending = true;
         h.older_pending = true;
         h.retry_after = None;
-        self.send(Command::LoadMessages { chat_jid: jid, before: Some(oldest), limit: 100 });
+        self.send(Command::LoadMessages { chat_jid: jid, before: Some(oldest), limit });
         cx.notify();
+        true
     }
 
     /// The window became active: acknowledge the conversation on screen.
@@ -352,6 +385,9 @@ impl Store {
         }
         if self.typing.remove(&from) {
             self.typing.insert(to.clone());
+        }
+        if let Some(t) = self.typists.remove(&from) {
+            self.typists.insert(to.clone(), t);
         }
         self.media_requested = std::mem::take(&mut self.media_requested)
             .into_iter()
@@ -378,7 +414,12 @@ impl Store {
         self.history.clear();
         self.requested.clear();
         self.selected = None;
+        self.stay_deselected = false;
+        self.contacts.clear();
+        self.phone_lookups.clear();
         self.typing.clear();
+        self.typists.clear();
+        self.search_results = None;
         self.avatars.clear();
         self.avatar_requested.clear();
         self.avatar_loading.clear();
@@ -555,11 +596,15 @@ impl Store {
             return;
         }
         // Show "Sending…" right away; the backend confirms with MessageUpserted/StatusChanged.
+        // It goes to the end of the conversation, like a new message.
         if let Some(list) = self.messages.get_mut(&message.chat_jid)
-            && let Some(m) = list.iter_mut().find(|m| m.id == message.id)
+            && let Some(pos) = list.iter().position(|m| m.id == message.id)
         {
+            let mut m = list.remove(pos);
             m.status = DeliveryStatus::Pending;
-            cx.emit(StoreEvent::TranscriptChanged { chat_jid: message.chat_jid.clone(), change: Change::Updated });
+            m.timestamp = m.timestamp.max(chrono::Utc::now().timestamp());
+            upsert(list, m);
+            cx.emit(StoreEvent::TranscriptChanged { chat_jid: message.chat_jid.clone(), change: Change::Appended });
         }
         self.send(Command::RetrySend { chat_jid: message.chat_jid.clone(), message_id: message.id.clone() });
         cx.notify();
@@ -617,6 +662,134 @@ impl Store {
         self.send(Command::Logout);
     }
 
+    pub fn set_pinned(&self, chat_jid: &str, pinned: bool) {
+        self.send(Command::SetPinned { chat_jid: chat_jid.to_string(), pinned });
+    }
+
+    /// `until`: unix time, `i64::MAX` = always, `0` = unmute.
+    pub fn set_muted(&self, chat_jid: &str, until: i64) {
+        self.send(Command::SetMuted { chat_jid: chat_jid.to_string(), until });
+    }
+
+    pub fn set_archived(&self, chat_jid: &str, archived: bool) {
+        self.send(Command::SetArchived { chat_jid: chat_jid.to_string(), archived });
+    }
+
+    pub fn mark_read(&self, chat_jid: &str) {
+        self.send(Command::MarkRead { chat_jid: chat_jid.to_string() });
+    }
+
+    /// Like WhatsApp, marking the open conversation unread closes it (otherwise it would
+    /// be read again right away).
+    pub fn mark_unread(&mut self, chat_jid: &str, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(chat_jid) {
+            self.deselect(cx);
+        }
+        self.send(Command::MarkUnread { chat_jid: chat_jid.to_string() });
+    }
+
+    pub fn deselect(&mut self, cx: &mut Context<Self>) {
+        if self.selected.take().is_some() {
+            self.stay_deselected = true;
+            self.replying_to = None;
+            cx.notify();
+        }
+    }
+
+    pub fn request_contacts(&self) {
+        self.send(Command::ListContacts);
+    }
+
+    /// Check a typed phone number; the answer lands in `phone_lookups[phone]`.
+    pub fn lookup_phone(&mut self, phone: &str, cx: &mut Context<Self>) {
+        self.phone_lookups.remove(phone);
+        self.send(Command::LookupPhone { phone: phone.to_string() });
+        cx.notify();
+    }
+
+    /// Open (or start) the chat with `jid` from New Message and focus the composer.
+    pub fn open_chat(&mut self, jid: String, cx: &mut Context<Self>) {
+        if !self.chats.iter().any(|c| c.jid == jid) {
+            self.send(Command::OpenChat { jid: jid.clone() });
+        }
+        self.select(jid, cx);
+        cx.emit(FocusComposer);
+    }
+
+    /// Track who is typing; `sender` is `None` for indicators without one (1:1 chats).
+    fn set_typist(&mut self, chat_jid: &str, sender: Option<&str>, name: Option<String>, typing: bool) {
+        let list = self.typists.entry(chat_jid.to_string()).or_default();
+        match (sender, typing) {
+            (Some(jid), true) => {
+                list.retain(|(j, _)| j != jid);
+                list.push((jid.to_string(), name));
+            }
+            (Some(jid), false) => list.retain(|(j, _)| j != jid),
+            (None, _) => list.clear(),
+        }
+        let anyone = !list.is_empty() || (sender.is_none() && typing);
+        if list.is_empty() {
+            self.typists.remove(chat_jid);
+        }
+        if anyone {
+            self.typing.insert(chat_jid.to_string());
+        } else {
+            self.typing.remove(chat_jid);
+        }
+    }
+
+    /// Delete for everyone (my own, recent messages) or just for me.
+    pub fn delete_message(&self, message: &ChatMessage, for_everyone: bool) {
+        self.send(Command::DeleteMessage {
+            chat_jid: message.chat_jid.clone(),
+            message_id: message.id.clone(),
+            for_everyone,
+        });
+    }
+
+    /// Whether "Delete for Everyone" is still possible (WhatsApp's time limit).
+    pub fn can_delete_for_everyone(m: &ChatMessage) -> bool {
+        let age = chrono::Utc::now().timestamp() - m.timestamp;
+        m.from_me
+            && !m.deleted
+            && matches!(m.status, DeliveryStatus::Sent | DeliveryStatus::Delivered | DeliveryStatus::Read)
+            && age < wa_backend::REVOKE_WINDOW_SECS
+    }
+
+    /// Text and media messages can be forwarded (not deleted / view-once / other kinds).
+    pub fn can_forward(m: &ChatMessage) -> bool {
+        !m.deleted
+            && matches!(
+                m.body,
+                MessageBody::Text(_)
+                    | MessageBody::Image(_)
+                    | MessageBody::Video(_)
+                    | MessageBody::Document(_)
+                    | MessageBody::Voice(_)
+                    | MessageBody::Sticker(_)
+            )
+    }
+
+    pub fn forward(&mut self, message: &ChatMessage, to_chat_jid: String, cx: &mut Context<Self>) {
+        let client_id = wa_backend::new_message_id();
+        self.send(Command::ForwardMessage {
+            chat_jid: message.chat_jid.clone(),
+            message_id: message.id.clone(),
+            to_chat_jid,
+            client_id,
+        });
+        cx.notify();
+    }
+
+    /// Search the selected chat's stored messages; the answer lands in `search_results`.
+    pub fn search(&mut self, query: &str) {
+        let Some(chat_jid) = self.selected.clone() else { return };
+        self.search_results = None;
+        if !query.trim().is_empty() {
+            self.send(Command::SearchMessages { chat_jid, query: query.to_string() });
+        }
+    }
+
     pub fn shutdown(&self) {
         self.send(Command::Shutdown);
     }
@@ -672,10 +845,18 @@ fn media_settled(body: &MessageBody) -> bool {
 
 /// Insert keeping timestamp order; replace an existing message with the same id.
 fn upsert(list: &mut Vec<ChatMessage>, m: ChatMessage) {
-    if let Some(existing) = list.iter_mut().find(|x| x.id == m.id) {
-        let status = merge_status(existing.status, m.status);
-        *existing = m;
-        existing.status = status;
+    if let Some(pos) = list.iter().position(|x| x.id == m.id) {
+        let status = merge_status(list[pos].status, m.status);
+        if list[pos].timestamp == m.timestamp {
+            list[pos] = m;
+            list[pos].status = status;
+            return;
+        }
+        // Restamped (a resend): move it to its new place.
+        list.remove(pos);
+        let m = ChatMessage { status, ..m };
+        let pos = list.partition_point(|x| x.timestamp <= m.timestamp);
+        list.insert(pos, m);
         return;
     }
     let pos = list.partition_point(|x| x.timestamp <= m.timestamp);

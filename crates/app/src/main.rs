@@ -2,11 +2,17 @@ mod audio;
 mod avatar;
 mod composer;
 mod conversation;
+mod dock;
 mod emoji_complete;
+mod find_bar;
+mod forward_picker;
 mod format;
 mod chrome;
 mod icons;
+mod identity;
 mod kinds;
+mod login_item;
+mod new_chat;
 mod mock;
 mod pairing;
 mod profile;
@@ -14,6 +20,7 @@ mod sidebar;
 mod state;
 mod text_replace;
 mod theme;
+mod updater;
 mod video_player;
 
 use gpui_kit::*;
@@ -46,6 +53,8 @@ impl Root {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.store.read(cx).mark_selected_read();
+                    // Launch at Login may have been changed in System Settings meanwhile.
+                    refresh_menus(cx);
                 }
             }),
         ];
@@ -99,6 +108,9 @@ impl Render for Root {
             }))
             .text_color(theme.text)
             .on_action(cx.listener(|this, _: &Logout, _, cx| this.store.read(cx).logout()))
+            .on_action(cx.listener(|this, _: &conversation::FindInChat, window, cx| {
+                this.conversation.update(cx, |c, cx| c.open_find(window, cx))
+            }))
             .child(body)
             .when_some(banner, |d, text| {
                 d.child(
@@ -159,12 +171,9 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>) -> impl Into
         )
 }
 
-fn data_dir() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("WhatsApp GPUI")
-}
 
 fn live_backend() -> wa_backend::BackendHandle {
-    let config = wa_backend::BackendConfig { data_dir: data_dir(), device_name: "WhatsApp GPUI".into() };
+    let config = wa_backend::BackendConfig { data_dir: identity::data_dir(), device_name: identity::APP_NAME.into() };
     wa_backend::spawn(config).unwrap_or_else(|e| {
         eprintln!("failed to start WhatsApp backend: {e:#}");
         std::process::exit(1);
@@ -216,12 +225,12 @@ fn headless_logout() -> i32 {
     code
 }
 
-/// Log to stderr and to `~/Library/Logs/WhatsApp GPUI/whatsapp-gpui.log` (the app launched
+/// Log to stderr and to `~/Library/Logs/WhatsRusty/WhatsRusty.log` (the app launched
 /// from Finder has no terminal). The file is restarted when it grows past 5 MB.
 fn init_logging() {
     use std::io::Write;
-    let dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join("Library/Logs/WhatsApp GPUI");
-    let path = dir.join("whatsapp-gpui.log");
+    let dir = identity::log_dir();
+    let path = dir.join(format!("{}.log", identity::APP_NAME));
     let file = std::fs::create_dir_all(&dir).ok().and_then(|_| {
         let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 << 20);
         std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(&path).ok()
@@ -246,6 +255,27 @@ fn init_logging() {
         .init();
 }
 
+/// Rebuilt when a checkmark changes (Launch at Login).
+fn refresh_menus(cx: &mut App) {
+    let mut items = Vec::new();
+    if updater::is_available() {
+        items.extend([MenuItem::action("Check for Updates…", updater::CheckForUpdates), MenuItem::separator()]);
+    }
+    if login_item::is_available() {
+        items.extend([
+            MenuItem::action("Launch at Login", login_item::ToggleLaunchAtLogin).checked(login_item::is_enabled()),
+            MenuItem::separator(),
+        ]);
+    }
+    items.extend([
+        MenuItem::action("Log Out", Logout),
+        MenuItem::separator(),
+        MenuItem::action("Close Window", CloseWindow),
+        MenuItem::action("Quit", Quit),
+    ]);
+    cx.set_menus(vec![Menu { name: identity::APP_NAME.into(), items, disabled: false }]);
+}
+
 struct MainStore(Entity<Store>);
 impl gpui_kit::Global for MainStore {}
 
@@ -260,7 +290,7 @@ fn open_main_window(store: Entity<Store>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some("WhatsApp".into()),
+            title: Some(identity::APP_NAME.into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(18.), px(18.))),
         }),
@@ -274,6 +304,10 @@ fn open_main_window(store: Entity<Store>, cx: &mut App) {
 }
 
 fn main() {
+    // Never in mock mode: a mock run must not move the real data folders.
+    if std::env::var_os("WA_MOCK").is_none() {
+        identity::migrate_legacy_dirs();
+    }
     init_logging();
 
     if std::env::args().any(|a| a == "--logout") {
@@ -294,6 +328,7 @@ fn main() {
         gpui_kit::init(cx);
         audio::AudioPlayer::init(cx);
         text_replace::TextReplacements::init(cx);
+        conversation::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| {
@@ -305,18 +340,12 @@ fn main() {
                 });
             }
         });
-        cx.set_menus(vec![Menu {
-            name: "WhatsApp GPUI".into(),
-            items: vec![
-                MenuItem::action("Log Out", Logout),
-                MenuItem::separator(),
-                MenuItem::action("Close Window", CloseWindow),
-                MenuItem::action("Quit", Quit),
-            ],
-            disabled: false,
-        }]);
+        updater::init(cx);
+        login_item::init(cx);
+        refresh_menus(cx);
 
         let store = Store::create(backend.clone(), cx);
+        dock::track(&store, cx);
         // Clicking a notification opens that conversation.
         let notified_store = store.clone();
         cx.on_system_notification_response(move |response, cx| {

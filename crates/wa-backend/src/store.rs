@@ -23,6 +23,11 @@ use crate::types::{
     PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
+mod chat_list;
+mod message_actions;
+
+pub use chat_list::{ChatFlags, LastMessageKey};
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS chats (
     jid           TEXT PRIMARY KEY,
@@ -165,6 +170,21 @@ const MIGRATIONS: &[&str] = &[
         last_sent_ms INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS messages_stickers ON messages (ts) WHERE kind = 7;
+    "#,
+    // 7: delete for me, forwarded mark.
+    r#"
+    -- Messages deleted for me: never stored again (re-delivery, history sync).
+    CREATE TABLE IF NOT EXISTS deleted_for_me (
+        chat_jid   TEXT NOT NULL,
+        id         TEXT NOT NULL,
+        deleted_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_jid, id)
+    );
+    ALTER TABLE messages ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0;
+    "#,
+    // 8: chats marked unread by hand (so reading them tells the phone, too).
+    r#"
+    ALTER TABLE chats ADD COLUMN marked_unread INTEGER NOT NULL DEFAULT 0;
     "#,
 ];
 
@@ -638,7 +658,7 @@ fn caption_of(body: &MessageBody) -> Option<Option<String>> {
 
 const MESSAGE_COLS: &str = "chat_jid, id, sender_jid, push_name, from_me, kind, text, ts, status, rowid, \
     media, media_path, media_state, quoted_id, quoted_sender, quoted_from_me, quoted_preview, wire_chat, wire_sender, \
-    payload, edit_ts, revoked";
+    payload, edit_ts, revoked, forwarded";
 
 struct MessageRow {
     chat_jid: String,
@@ -657,6 +677,7 @@ struct MessageRow {
     /// When the shown content was last edited; `None` = never.
     edit_ts: Option<i64>,
     revoked: bool,
+    forwarded: bool,
 }
 
 struct StoredQuote {
@@ -698,6 +719,7 @@ impl MessageRow {
             wire_sender: row.get(18)?,
             edit_ts: row.get(20)?,
             revoked: row.get(21)?,
+            forwarded: row.get(22)?,
         })
     }
 }
@@ -996,6 +1018,7 @@ impl Store {
             params![lid, pn],
         )?;
         c.execute("UPDATE messages SET chat_jid = ?2 WHERE chat_jid = ?1", params![lid, pn])?;
+        c.execute("UPDATE OR IGNORE deleted_for_me SET chat_jid = ?2 WHERE chat_jid = ?1", params![lid, pn])?;
         c.execute("UPDATE messages SET sender_jid = ?2 WHERE sender_jid = ?1", params![lid, pn])?;
         c.execute("UPDATE messages SET quoted_sender = ?2 WHERE quoted_sender = ?1", params![lid, pn])?;
         c.execute("UPDATE OR IGNORE avatars SET jid = ?2 WHERE jid = ?1", params![lid, pn])?;
@@ -1091,6 +1114,9 @@ impl Store {
     pub fn insert_message(&self, m: &NewMessage, count_unread: bool) -> Result<bool> {
         let chat = self.canonical(&m.chat_jid)?;
         let sender = self.canonical(&m.sender_jid)?;
+        if self.is_deleted_for_me(&chat, &m.id)? {
+            return Ok(false);
+        }
         self.ensure_chat(&chat)?;
         let (kind, text, payload) = body_to_row(&m.body);
         let status = status_to_i64(m.status);
@@ -2027,6 +2053,8 @@ impl Store {
             body: r.body,
             timestamp: r.ts,
             status: r.status,
+            forwarded: r.forwarded,
+            deleted: r.revoked,
         })
     }
 
@@ -2977,7 +3005,13 @@ mod tests {
             s.set_media_path(ALICE, "vo", Some(&file)).unwrap();
             s.insert_message(&image_msg(ALICE, "normal", ALICE, 11), true).unwrap();
             // As schema 3 left it.
-            s.conn.execute_batch("ALTER TABLE pending_edits DROP COLUMN stored_at; PRAGMA user_version = 3").unwrap();
+            s.conn
+                .execute_batch(
+                    "ALTER TABLE pending_edits DROP COLUMN stored_at; ALTER TABLE messages DROP COLUMN forwarded;
+                     DROP TABLE deleted_for_me; ALTER TABLE chats DROP COLUMN marked_unread;
+                     PRAGMA user_version = 3",
+                )
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         let raw = s.raw_message(ALICE, "vo").unwrap().unwrap();

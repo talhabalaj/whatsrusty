@@ -208,6 +208,17 @@ pub struct ChatMessage {
     pub reactions: Vec<Reaction>,
     /// The text/caption was edited after sending (shown as "Edited").
     pub edited: bool,
+    /// Sent with WhatsApp's "Forwarded" mark.
+    pub forwarded: bool,
+    /// Deleted for everyone: `body` is only a placeholder ("This message was deleted").
+    pub deleted: bool,
+}
+
+/// One message of a chat matching [`Command::SearchMessages`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchHit {
+    pub id: String,
+    pub timestamp: Timestamp,
 }
 
 /// A sticker I can send from the sticker panel. See [`Command::ListStickers`].
@@ -308,7 +319,7 @@ pub enum Event {
     ChatMerged { from: String, to: String },
     StatusChanged { chat_jid: String, message_ids: Vec<String>, status: DeliveryStatus },
     /// Someone is typing in `chat_jid`.
-    Typing { chat_jid: String, sender_name: Option<String>, typing: bool },
+    Typing { chat_jid: String, sender_name: Option<String>, typing: bool, sender_jid: Option<String> },
     /// Answer to [`Command::ListStickers`] (and pushed again when it changes).
     Stickers(Vec<StickerRef>),
     /// Answer to [`Command::FetchProfile`].
@@ -320,6 +331,15 @@ pub enum Event {
     /// history sync / offline catch-up older than a minute, chat not muted.
     Notify { chat_jid: String, message_id: String, title: String, body: String },
     Error(String),
+    /// Answer to [`Command::SearchMessages`]: every stored message of `chat_jid` whose
+    /// text or caption contains `query`, oldest first.
+    SearchResults { chat_jid: String, query: String, hits: Vec<SearchHit> },
+    /// Answer to [`Command::ListContacts`], sorted by name.
+    Contacts(Vec<Contact>),
+    /// Answer to [`Command::LookupPhone`] (`phone` as asked). `jid` is the chat to open,
+    /// `None` when the number isn't on WhatsApp; `error` when the check itself failed
+    /// (offline, invalid number).
+    PhoneLookup { phone: String, jid: Option<String>, error: Option<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -364,12 +384,58 @@ pub enum Command {
     SetTyping { chat_jid: String, typing: bool },
     Logout,
     Shutdown,
+    /// Delete a message. `for_everyone` revokes one of my own messages (WhatsApp allows
+    /// this for about 2½ days, see [`REVOKE_WINDOW_SECS`]); the backend sends it, then
+    /// emits `MessageUpserted` with `deleted: true` (or `Event::Error`). Otherwise it's
+    /// removed from this account only (synced to my other devices): `MessagesRemoved`.
+    DeleteMessage { chat_jid: String, message_id: String, for_everyone: bool },
+    /// Send a copy of a stored message to `to_chat_jid`, marked "Forwarded". Same
+    /// lifecycle as `SendText` in the target chat (media is reused or re-uploaded).
+    ForwardMessage { chat_jid: String, message_id: String, to_chat_jid: String, client_id: String },
+    /// Find stored messages of a chat by text (case-insensitive); answered by
+    /// `Event::SearchResults`.
+    SearchMessages { chat_jid: String, query: String },
+    /// Pin / unpin a chat (synced through WhatsApp app state). WhatsApp allows 3 pins;
+    /// a 4th is refused with `Event::Error`. Applied locally right away (`Chats`), and
+    /// reverted + `Event::Error` if the phone can't be told.
+    SetPinned { chat_jid: String, pinned: bool },
+    /// Mute until a time (`i64::MAX` = always), or unmute with `0`. Same lifecycle as
+    /// `SetPinned`. Muted chats don't notify and don't count towards the Dock badge.
+    SetMuted { chat_jid: String, until: Timestamp },
+    /// Archive / unarchive. Archiving a pinned chat unpins it, like WhatsApp.
+    SetArchived { chat_jid: String, archived: bool },
+    /// "Mark as Unread" (shows the unread dot; synced). `MarkRead` undoes it.
+    MarkUnread { chat_jid: String },
+    /// My contacts for the New Message picker; answered by `Event::Contacts`.
+    ListContacts,
+    /// Is this phone number (digits with country code, any formatting) on WhatsApp?
+    /// Answered by `Event::PhoneLookup`.
+    LookupPhone { phone: String },
+    /// Make sure a 1:1 chat exists in the chat list (New Message to someone without a
+    /// chat yet); a `Chats` update follows.
+    OpenChat { jid: String },
 }
+
+/// Someone I can start a chat with (New Message picker).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contact {
+    /// Phone-number JID when known (`...@s.whatsapp.net`), else the LID.
+    pub jid: String,
+    /// Saved contact name, or their WhatsApp name.
+    pub name: String,
+    /// Display form, e.g. "+92 300 1234567".
+    pub phone: Option<String>,
+    /// In my address book (not just someone I've seen in a group).
+    pub saved: bool,
+}
+
+/// How long after sending a message can still be deleted for everyone.
+pub const REVOKE_WINDOW_SECS: i64 = 60 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     /// Directory for the whatsapp-rust session DB and the app's message store,
-    /// e.g. `~/Library/Application Support/WhatsApp GPUI`.
+    /// e.g. `~/Library/Application Support/WhatsRusty`.
     pub data_dir: PathBuf,
     /// Device name shown in the phone's "Linked devices" list.
     pub device_name: String,
