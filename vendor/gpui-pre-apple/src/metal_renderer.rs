@@ -164,8 +164,6 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    /// whatsapp-gpui patch: where the scene being encoded lands on its texture.
-    viewport_origin: Point<ScaledPixels>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -486,7 +484,6 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
-            viewport_origin: Point::default(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -735,32 +732,11 @@ impl MetalRenderer {
         self.encode_scene(scene, &mut writer, &command_buffer, texture, viewport_size, alpha)?;
         // Snapshots show panes where the window would: composite them over the main scene.
         for pane in scene.panes() {
-            let bounds = pane.descriptor().bounds;
-            let pane_size = size(
-                DevicePixels(bounds.size.width.0 as i32),
-                DevicePixels(bounds.size.height.0 as i32),
-            );
-            self.encode_scene_at(&pane.scene, &mut writer, &command_buffer, texture, pane_size, bounds.origin)?;
+            let absolute = window_space_copy(&pane.scene, pane.descriptor().bounds.origin);
+            self.encode_scene(&absolute, &mut writer, &command_buffer, texture, viewport_size, -1.)?;
         }
         self.release_on_completion(&command_buffer, writer);
         Ok(command_buffer)
-    }
-
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-    /// Draws a pane's scene onto `texture` at `origin` (for snapshots and fallbacks).
-    fn encode_scene_at(
-        &mut self,
-        scene: &Scene,
-        writer: &mut InstanceBufferWriter,
-        command_buffer: &metal::CommandBufferRef,
-        texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
-        origin: Point<ScaledPixels>,
-    ) -> Result<()> {
-        self.viewport_origin = origin;
-        let result = self.encode_scene(scene, writer, command_buffer, texture, viewport_size, -1.);
-        self.viewport_origin = Point::default();
-        result
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -907,9 +883,8 @@ impl MetalRenderer {
         // A negative alpha loads the texture instead of clearing it (pane composited onto
         // the main texture).
         let clear = (clear_alpha >= 0.).then(|| metal::MTLClearColor::new(0., 0., 0., clear_alpha));
-        let origin = self.viewport_origin;
         let mut command_encoder =
-            new_command_encoder_for_texture(command_buffer, texture, viewport_size, origin, clear);
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear);
 
         for batch in scene.batches() {
             match batch {
@@ -934,7 +909,6 @@ impl MetalRenderer {
                         command_buffer,
                         texture,
                         viewport_size,
-                        origin,
                         None,
                     );
 
@@ -1464,7 +1438,6 @@ fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
-    origin: Point<ScaledPixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -1483,14 +1456,59 @@ fn new_command_encoder_for_texture<'a>(
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {
-        originX: origin.x.0 as f64,
-        originY: origin.y.0 as f64,
+        originX: 0.0,
+        originY: 0.0,
         width: i32::from(viewport_size.width) as f64,
         height: i32::from(viewport_size.height) as f64,
         znear: 0.0,
         zfar: 1.0,
     });
     command_encoder
+}
+
+/// whatsapp-gpui patch: a pane's scene moved back from pane-local to window coordinates,
+/// keeping its draw order, so snapshots can draw it over the main scene.
+#[cfg(any(test, feature = "test-support"))]
+fn window_space_copy(scene: &Scene, origin: Point<ScaledPixels>) -> Scene {
+    use gpui::Primitive;
+    let back = point(ScaledPixels(-origin.x.0), ScaledPixels(-origin.y.0));
+    let mut copy = Scene::default();
+    for p in &scene.shadows {
+        if let Primitive::Shadow(p) = Primitive::Shadow(*p).translated(back) {
+            copy.shadows.push(p);
+        }
+    }
+    for p in &scene.quads {
+        if let Primitive::Quad(p) = Primitive::Quad(*p).translated(back) {
+            copy.quads.push(p);
+        }
+    }
+    for p in &scene.paths {
+        if let Primitive::Path(p) = Primitive::Path(p.clone()).translated(back) {
+            copy.paths.push(p);
+        }
+    }
+    for p in &scene.underlines {
+        if let Primitive::Underline(p) = Primitive::Underline(*p).translated(back) {
+            copy.underlines.push(p);
+        }
+    }
+    for p in &scene.monochrome_sprites {
+        if let Primitive::MonochromeSprite(p) = Primitive::MonochromeSprite(*p).translated(back) {
+            copy.monochrome_sprites.push(p);
+        }
+    }
+    for p in &scene.polychrome_sprites {
+        if let Primitive::PolychromeSprite(p) = Primitive::PolychromeSprite(*p).translated(back) {
+            copy.polychrome_sprites.push(p);
+        }
+    }
+    for p in &scene.surfaces {
+        if let Primitive::Surface(p) = Primitive::Surface(p.clone()).translated(back) {
+            copy.surfaces.push(p);
+        }
+    }
+    copy
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
