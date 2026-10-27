@@ -31,7 +31,7 @@ fn section(title: &str, body: impl IntoElement, theme: &Theme) -> Div {
         .child(body)
 }
 
-pub fn panel(jid: &str, store: &Entity<Store>, theme: &Theme, cx: &App) -> impl IntoElement {
+pub fn panel(jid: &str, store: &Entity<Store>, glass_on: bool, theme: &Theme, cx: &App) -> impl IntoElement {
     let s = store.read(cx);
     let profile: Option<&Profile> = s.profiles.get(jid);
     let chat: Option<&ChatSummary> = s.chats.iter().find(|c| c.jid == jid);
@@ -61,18 +61,26 @@ pub fn panel(jid: &str, store: &Entity<Store>, theme: &Theme, cx: &App) -> impl 
         .border_l_1()
         .border_color(theme.separator)
         .child(
-            div().h(px(52.)).flex_none().flex().items_center().justify_end().px(px(12.)).child(
-                div()
+            div().h(px(52.)).flex_none().flex().items_center().justify_end().px(px(12.)).child({
+                let close = div()
                     .id("close-profile")
-                    .size(px(26.))
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|st| st.bg(theme.search_bg))
-                    .child(glyph(Glyph::Close, 12., theme.text_secondary))
-                    .on_click(move |_, _, cx| close_store.update(cx, |s, cx| s.close_profile(cx))),
-            ),
+                    .on_click(move |_, _, cx| close_store.update(cx, |s, cx| s.close_profile(cx)));
+                if glass_on {
+                    // A glass circle, like the header's buttons.
+                    let close = close.child(glyph(Glyph::Close, 12., theme.text));
+                    crate::glass::circle_button("close-profile", 28., theme.search_bg, close).into_any_element()
+                } else {
+                    close
+                        .size(px(26.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|st| st.bg(theme.search_bg))
+                        .child(glyph(Glyph::Close, 12., theme.text_secondary))
+                        .into_any_element()
+                }
+            }),
         )
         .child(
             div()

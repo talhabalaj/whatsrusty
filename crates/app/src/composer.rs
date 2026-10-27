@@ -307,6 +307,10 @@ impl Composer {
             return;
         }
         let text = state.read(cx).value().to_string();
+        // A shortcut at the very end ("… <3" sent right away) expands too.
+        let text = crate::text_replace::TextReplacements::expand(cx, &format!("{text} "))
+            .map(|t| t[..t.len() - 1].to_string())
+            .unwrap_or(text);
         if text.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
@@ -774,6 +778,8 @@ impl Composer {
         let recents: Vec<_> = stickers.iter().filter(|s| s.source == wa_backend::StickerSource::Recent).cloned().collect();
         crate::chrome::surface(div(), theme)
             .id("sticker-panel")
+            // Clicks and scrolling stay in the panel, not the transcript under it.
+            .occlude()
             .absolute()
             .bottom_full()
             .right(px(14.))
@@ -970,6 +976,8 @@ fn is_video(path: &Path) -> bool {
 /// The suggestion popover above the field (emoji, @mentions).
 fn popup(theme: &Theme) -> Div {
     surface(div(), theme)
+        // Clicks and scrolling stay in the list, not the transcript under it.
+        .occlude()
         .absolute()
         .bottom_full()
         .left(px(56.))

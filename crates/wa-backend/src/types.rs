@@ -406,6 +406,9 @@ pub enum Command {
     FetchAvatar { jid: String },
     MarkRead { chat_jid: String },
     SetTyping { chat_jid: String, typing: bool },
+    /// Whether the app is in front. WhatsApp keeps the phone's notifications quiet while
+    /// a linked device is online, so it's only online then, like WhatsApp Web.
+    SetActive { active: bool },
     Logout,
     Shutdown,
     /// Delete a message. `for_everyone` revokes one of my own messages (WhatsApp allows

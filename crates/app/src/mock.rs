@@ -94,6 +94,8 @@ fn seed() -> Fake {
             ("Should I bring anything?", false, None, -2 * h - 290),
             ("Just yourself. And maybe that dessert you made last time 😄", true, None, -2 * h - 100),
             ("Haha deal. See you at 8!", false, None, -300),
+            ("❤️", true, None, -280),
+            ("😂😂😂", false, None, -270),
         ]),
         ("120363000000000001@g.us", "Weekend Hiking 🥾", true, false, &[
             ("Trail conditions look great for Saturday", false, Some("Omar"), -d - 4 * h),
@@ -571,6 +573,7 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 }
                 let _ = ev.send(Event::Chats(fake.chats.clone()));
             }
+            Command::SetActive { active } => eprintln!("mock: SetActive {active}"),
             Command::SetTyping { .. } | Command::FetchAvatar { .. } => {}
             Command::RetrySend { chat_jid, message_id } => {
                 // Like the backend: a resend moves to the end with the current time.

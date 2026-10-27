@@ -97,6 +97,8 @@ pub struct Sidebar {
     cursor: Option<Target>,
     /// Whether the list had key focus this frame (rows draw the cursor's ring then).
     list_focused: bool,
+    /// Liquid Glass is on in this window (as of this frame).
+    glass_on: bool,
     /// The New Message picker, with its dismiss subscription.
     new_chat: Option<(Entity<NewChat>, Subscription)>,
     /// When the picker was last dismissed: the click on the compose button that closes it
@@ -151,6 +153,7 @@ impl Sidebar {
             list_focus: cx.focus_handle(),
             cursor: None,
             list_focused: false,
+            glass_on: false,
             new_chat: None,
             new_chat_closed_at: None,
             shown_error: None,
@@ -603,12 +606,22 @@ impl Sidebar {
             .items_center()
             .gap(px(4.))
             .rounded(px(6.))
-            .hover(|s| s.bg(theme.search_bg))
+            .cursor_pointer()
+            // On glass the circle shows the hover.
+            .when(!self.glass_on, |d| d.hover(|s| s.bg(theme.search_bg)))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.archived_view = false;
                 cx.notify();
             }))
-            .child(glyph(Glyph::ChevronLeft, 15., theme.accent))
+            .map(|d| {
+                if self.glass_on {
+                    // Back as a glass circle, like the toolbar's New Message button.
+                    let back = div().id("archived-back-glass").child(glyph(Glyph::ChevronLeft, 13., theme.text));
+                    d.gap(px(8.)).child(crate::glass::circle_button("sidebar-archived-back", 28., theme.search_bg, back))
+                } else {
+                    d.child(glyph(Glyph::ChevronLeft, 15., theme.accent))
+                }
+            })
             .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("Archived"))
     }
 
@@ -767,6 +780,7 @@ impl Render for Sidebar {
         let error = self.store.read(cx).last_error.clone();
         let glass_on = crate::glass::enabled(window);
         self.list_focused = self.list_focus.is_focused(window);
+        self.glass_on = glass_on;
         if !self.list_focused {
             self.cursor = None;
         }
@@ -782,7 +796,8 @@ impl Render for Sidebar {
             .flex_none()
             .flex()
             .flex_col()
-            .when(glass_on, |d| d.absolute().top_0().left_0().right_0())
+            // With glass it floats over the list: clicks stop here (scrolling goes through).
+            .when(glass_on, |d| d.absolute().top_0().left_0().right_0().block_mouse_except_scroll())
             .child(self.header(glass_on, &theme, cx))
             .child(self.search_field(glass_on, &theme));
         let content = div()
@@ -845,6 +860,7 @@ fn error_toast(text: String, theme: &Theme, store: Entity<Store>) -> impl IntoEl
     div()
         .id("sidebar-error")
         .absolute()
+        .occlude()
         .bottom(px(12.))
         .left(px(12.))
         .right(px(12.))
@@ -1199,6 +1215,27 @@ pub fn run_debug_ui_script<T: 'static>(var: &str, window: &mut Window, cx: &mut 
                         PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers, click_count: 1 }),
                         cx,
                     );
+                }
+                // "select x1,y1 x2,y2": press, move with the button down, release.
+                "select" => {
+                    #[cfg(feature = "snapshots")]
+                    {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    }
+                    let (from, to) = arg.split_once(' ').unwrap_or((arg, arg));
+                    let (from, to) = (parse_point(from), parse_point(to));
+                    let modifiers = Modifiers::default();
+                    let button = MouseButton::Left;
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent { button, position: from, modifiers, click_count: 1, first_mouse: false }),
+                        cx,
+                    );
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent { position: to, pressed_button: Some(button), modifiers }),
+                        cx,
+                    );
+                    window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button, position: to, modifiers, click_count: 1 }), cx);
                 }
                 "drag" | "drop" => {
                     let (at, files) = arg.split_once(' ').unwrap_or((arg, ""));

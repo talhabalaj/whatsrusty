@@ -132,6 +132,11 @@ pub struct Store {
     stay_deselected: bool,
     /// Unsent text and attachments per chat.
     pub drafts: HashMap<String, Draft>,
+    /// A window of ours is in front, as last told to the backend: WhatsApp keeps the
+    /// phone's notifications quiet while we're online, so we are only then.
+    app_active: bool,
+    /// Going inactive waits a moment (moving between our own windows passes through it).
+    _inactive_after: Option<gpui_kit::Task<()>>,
     pub main_window: Option<AnyWindowHandle>,
     /// Chats popped out into mini windows.
     pub popped: HashMap<String, Popped>,
@@ -195,6 +200,8 @@ impl Store {
             phone_lookups: HashMap::new(),
             stay_deselected: false,
             drafts: HashMap::new(),
+            app_active: false,
+            _inactive_after: None,
             main_window: None,
             popped: HashMap::new(),
         }
@@ -759,6 +766,9 @@ impl Store {
     /// Show the previous (`-1`) / next (`1`) photo in the lightbox's chat, skipping ones not
     /// downloaded yet (the nearby ones are fetched, so stepping again reaches them).
     pub fn step_lightbox(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.lightbox.is_none() {
+            return;
+        }
         let (chat, photos) = self.lightbox_photos();
         let Some(chat) = chat.map(String::from) else { return };
         let Some(pos) = self.lightbox_pos(&photos) else { return };
@@ -803,6 +813,7 @@ impl Store {
     }
 
     pub fn close_lightbox(&mut self, cx: &mut Context<Self>) {
+        self.lightbox_id = None;
         if self.lightbox.take().is_some() {
             cx.notify();
         }
@@ -918,6 +929,30 @@ impl Store {
     /// Animation start for a message this window just sent (cleared after a second).
     pub fn sent_at(&self, id: &str) -> Option<Instant> {
         self.just_sent.get(id).copied().filter(|t| t.elapsed().as_millis() < 1200)
+    }
+
+    /// One of our windows was activated or deactivated: online while one is in front.
+    pub fn window_activation_changed(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self._inactive_after = None;
+            if !self.app_active {
+                self.app_active = true;
+                self.send(Command::SetActive { active: true });
+            }
+            return;
+        }
+        if !self.app_active {
+            return;
+        }
+        self._inactive_after = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.app_active && cx.active_window().is_none() {
+                    s.app_active = false;
+                    s.send(Command::SetActive { active: false });
+                }
+            });
+        }));
     }
 
     pub fn set_typing_in(&self, chat_jid: &str, typing: bool) {

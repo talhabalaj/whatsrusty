@@ -9074,6 +9074,7 @@ dependencies = [
  "raw-window-handle",
  "rodio",
  "serde_json",
+ "unicode-segmentation",
  "url",
  "wa-backend",
 ]

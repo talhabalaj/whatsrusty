@@ -62,7 +62,9 @@ impl Root {
             }),
             // Coming back to the window counts as reading the open conversation.
             cx.observe_window_activation(window, |this, window, cx| {
-                if window.is_window_active() {
+                let active = window.is_window_active();
+                this.store.update(cx, |s, cx| s.window_activation_changed(active, cx));
+                if active {
                     this.store.read(cx).mark_selected_read();
                     // Launch at Login may have been changed in System Settings meanwhile.
                     refresh_menus(cx);
@@ -189,26 +191,23 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
     let step_button = |delta: isize| {
         let store = store.clone();
         let (id, icon) = if delta < 0 { ("lightbox-prev", icons::Glyph::ChevronLeft) } else { ("lightbox-next", icons::Glyph::ChevronRight) };
+        // Only the circle takes clicks (a full-height strip would sit under ✕).
         div()
             .id(id)
             .absolute()
             .top_0()
             .bottom_0()
+            .my_auto()
             .map(|d| if delta < 0 { d.left(px(12.)) } else { d.right(px(12.)) })
+            .size(px(36.))
+            .rounded_full()
+            .bg(white().opacity(0.15))
+            .hover(|s| s.bg(white().opacity(0.25)))
+            .cursor_pointer()
             .flex()
             .items_center()
-            .child(
-                div()
-                    .size(px(36.))
-                    .rounded_full()
-                    .bg(white().opacity(0.15))
-                    .hover(|s| s.bg(white().opacity(0.25)))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icons::glyph(icon, 16., white())),
-            )
+            .justify_center()
+            .child(icons::glyph(icon, 16., white()))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 store.update(cx, |s, cx| s.step_lightbox(delta, cx));
@@ -217,9 +216,15 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
     let (prev, next) = (store.read(cx).lightbox_can_step(-1), store.read(cx).lightbox_can_step(1));
     let (prev, next) = (prev.then(|| step_button(-1)), next.then(|| step_button(1)));
     let keys = store.clone();
-    let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| store.update(cx, |s, cx| s.close_lightbox(cx));
+    // A click is offered to everything under the pointer: closing stops it here.
+    let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        store.update(cx, |s, cx| s.close_lightbox(cx))
+    };
     div()
         .id("lightbox")
+        // Clicks (on ✕ too) mustn't reach what's under the viewer.
+        .occlude()
         .track_focus(focus)
         .on_key_down(move |ev: &KeyDownEvent, _, cx| {
             match ev.keystroke.key.as_str() {
@@ -270,7 +275,11 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
 /// pauses. `key`: which window's player (`None`: the main window).
 fn video_overlay(video: state::OpenVideo, key: Option<String>, store: Entity<Store>, focus: &FocusHandle) -> impl IntoElement {
     let (keys, close_store) = (store.clone(), store.clone());
-    let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| close_store.update(cx, |s, cx| s.close_video(cx));
+    // A click is offered to everything under the pointer: closing stops it here.
+    let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        close_store.update(cx, |s, cx| s.close_video(cx))
+    };
     let toggle_key = key.clone();
     let (w, h) = match (video.width, video.height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => (w as f32, h as f32),
@@ -278,6 +287,8 @@ fn video_overlay(video: state::OpenVideo, key: Option<String>, store: Entity<Sto
     };
     div()
         .id("video")
+        // Clicks (on ✕ too) mustn't reach what's under the player.
+        .occlude()
         .absolute()
         .inset_0()
         .bg(black().opacity(0.88))
