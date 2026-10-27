@@ -9074,6 +9074,7 @@ dependencies = [
  "objc2-avf-audio",
  "objc2-foundation 0.3.2",
  "qrcode",
+ "raw-window-handle",
  "rodio",
  "serde_json",
  "url",

@@ -440,8 +440,11 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 }
                 sort_chats(&mut fake.chats);
                 eprintln!("mock: incoming message in {jid}");
+                let title = fake.chats.iter().find(|c| c.jid == jid).map_or_else(|| jid.clone(), |c| c.name.clone());
+                let notify = Event::Notify { chat_jid: jid.clone(), message_id: m.id.clone(), title, body: text.into() };
                 let _ = ev.send(Event::MessageUpserted(m));
                 let _ = ev.send(Event::Chats(fake.chats.clone()));
+                let _ = ev.send(notify);
                 continue;
             }
             Err(_) => break,

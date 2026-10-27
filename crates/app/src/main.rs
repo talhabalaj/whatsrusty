@@ -14,6 +14,7 @@ mod kinds;
 mod links;
 mod login_item;
 mod mentions;
+mod mini;
 mod new_chat;
 mod mock;
 mod pairing;
@@ -30,7 +31,7 @@ use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use wa_backend::ConnectionState;
 
-use crate::conversation::Conversation;
+use crate::conversation::{ChatBinding, Conversation};
 use crate::sidebar::Sidebar;
 use crate::state::Store;
 use crate::theme::Theme;
@@ -49,7 +50,7 @@ struct Root {
 impl Root {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
-        let conversation = cx.new(|cx| Conversation::new(store.clone(), window, cx));
+        let conversation = cx.new(|cx| Conversation::new(store.clone(), ChatBinding::Selected, window, cx));
         // Menus, popovers and text fields from gpui-component follow light / dark mode too.
         gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
         let subs = vec![
@@ -103,19 +104,23 @@ impl Render for Root {
             _ => None,
         };
 
-        let lightbox = store.lightbox.clone();
+        // A photo opened from a mini window shows there instead.
+        let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.is_none());
         div()
             .size_full()
             .relative()
             .font_family(".SystemUIFont")
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && this.store.read(cx).lightbox.is_some() {
+                let store = this.store.read(cx);
+                if ev.keystroke.key == "escape" && store.lightbox.is_some() && store.lightbox_in.is_none() {
                     this.store.update(cx, |s, cx| s.close_lightbox(cx));
                     cx.stop_propagation();
                 }
             }))
             .text_color(theme.text)
             .on_action(cx.listener(|this, _: &Logout, _, cx| this.store.read(cx).logout()))
+            // ⌘W through this window closes this one (the app-level handler is the fallback).
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(cx.listener(|this, _: &conversation::FindInChat, window, cx| {
                 this.conversation.update(cx, |c, cx| c.open_find(window, cx))
             }))
@@ -296,9 +301,11 @@ struct MainStore(Entity<Store>);
 impl gpui_kit::Global for MainStore {}
 
 /// Bring the main window forward, or open a new one if it was closed (⌘W / red button).
+/// Mini chat windows don't count.
 fn open_main_window(store: Entity<Store>, cx: &mut App) {
-    if let Some(window) = cx.windows().into_iter().next() {
-        let _ = window.update(cx, |_, window, _| window.activate_window());
+    if let Some(window) = store.read(cx).main_window
+        && window.update(cx, |_, window, _| window.activate_window()).is_ok()
+    {
         cx.activate(true);
         return;
     }
@@ -313,8 +320,10 @@ fn open_main_window(store: Entity<Store>, cx: &mut App) {
         window_min_size: Some(size(px(720.), px(480.))),
         ..Default::default()
     };
-    if let Err(e) = gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Root::new(store, window, cx))) {
-        log::error!("opening the main window failed: {e:#}");
+    let s = store.clone();
+    match gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Root::new(s, window, cx))) {
+        Ok((handle, _)) => store.update(cx, |s, _| s.main_window = Some(handle)),
+        Err(e) => log::error!("opening the main window failed: {e:#}"),
     }
     cx.activate(true);
 }
@@ -354,9 +363,11 @@ fn main() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| {
-            // `active_window` can be None right after activation; there's only one GPUI window.
+            // `active_window` can be None right after activation; then only a lone window is
+            // a safe guess (never close the main window for a mini one, or vice versa).
             // Deferred: when dispatched through the window, that window is leased right now.
-            if let Some(window) = cx.active_window().or_else(|| cx.windows().into_iter().next()) {
+            let windows = cx.windows();
+            if let Some(window) = cx.active_window().or_else(|| (windows.len() == 1).then(|| windows[0])) {
                 cx.defer(move |cx| {
                     let _ = window.update(cx, |_, window, _| window.remove_window());
                 });
@@ -402,6 +413,17 @@ fn main() {
             })
             .detach();
         }
+        // WA_DEBUG_POPOUT="<jid>,<jid>": pop those chats out into mini windows.
+        if let Ok(list) = std::env::var("WA_DEBUG_POPOUT") {
+            let store = debug_store.clone();
+            cx.spawn(async move |cx| {
+                for jid in list.split(',').filter(|j| !j.is_empty()) {
+                    cx.background_executor().timer(std::time::Duration::from_millis(1000)).await;
+                    cx.update(|cx| mini::pop_out(&store, jid.to_string(), cx));
+                }
+            })
+            .detach();
+        }
         if let Ok(jid) = std::env::var("WA_DEBUG_PROFILE") {
             let store = debug_store.clone();
             cx.spawn(async move |cx| {
@@ -429,7 +451,12 @@ fn main() {
             let store = debug_store.clone();
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(std::time::Duration::from_millis(close)).await;
-                cx.update(|cx| cx.dispatch_action(&CloseWindow));
+                // The main window itself (a mini window may be the key one).
+                cx.update(|cx| {
+                    if let Some(window) = store.read(cx).main_window {
+                        let _ = window.update(cx, |_, window, _| window.remove_window());
+                    }
+                });
                 cx.background_executor().timer(std::time::Duration::from_millis(reopen)).await;
                 cx.update(|cx| open_main_window(store, cx));
             })

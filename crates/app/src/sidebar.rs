@@ -370,6 +370,8 @@ fn chat_menu(
 ) -> PopupMenu {
     let jid = chat.jid.clone();
     let mut menu = menu.min_w(px(180.));
+    let j = jid.clone();
+    menu = menu.item(menu_item(store, "Pop Out", move |s, cx| crate::mini::pop_out(s, j.clone(), cx))).separator();
     if !chat.archived {
         let pinned = chat.pinned;
         let j = jid.clone();
@@ -589,6 +591,12 @@ fn chat_row(
 fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
     static WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let var = if WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 { "WA_DEBUG_UI" } else { "WA_DEBUG_UI_REOPENED" };
+    run_debug_ui_script(var, window, cx);
+}
+
+/// Runs the `WA_DEBUG_UI`-style script in env var `var` against `window` (mini windows
+/// use `WA_DEBUG_UI_MINI`).
+pub fn run_debug_ui_script<T: 'static>(var: &str, window: &mut Window, cx: &mut Context<T>) {
     let Ok(script) = std::env::var(var) else { return };
     cx.spawn_in(window, async move |_, cx| {
         cx.background_executor().timer(Duration::from_millis(2000)).await;
