@@ -148,6 +148,8 @@ fn seed() -> Fake {
             archived: false,
             muted: false,
             avatar: None,
+            community: None,
+            is_community: false,
         });
     }
     // Media + a reply in Ayesha's chat.
@@ -184,6 +186,20 @@ fn seed() -> Fake {
         timestamp: n - 230,
     }];
     messages.extend([photo, voice, reply]);
+    // Photos sent together (an album), then one more a few minutes later (on its own).
+    let bilal = "15551110003@s.whatsapp.net";
+    for (i, at) in [-200, -198, -197, -195, -194, -20].into_iter().enumerate() {
+        let mut p = msg(bilal, 300 + i, false, None, "", n + at);
+        p.body = MessageBody::Image(ImageMedia {
+            path: None,
+            thumbnail: None,
+            width: Some(if i % 2 == 0 { 1600 } else { 900 }),
+            height: Some(if i % 2 == 0 { 900 } else { 1600 }),
+            caption: None,
+            state: MediaState::Idle,
+        });
+        messages.push(p);
+    }
     // A few tapbacks in the group, including one of mine.
     for m in messages.iter_mut().filter(|m| m.chat_jid == "120363000000000001@g.us") {
         if m.id.ends_with("-3") {
@@ -261,6 +277,8 @@ fn seed() -> Fake {
         archived: false,
         muted: false,
         avatar: None,
+        community: None,
+        is_community: false,
     });
 
     // A message that wasn't delivered, to show "Try Again".
@@ -285,6 +303,46 @@ fn seed() -> Fake {
         archived: false,
         muted: false,
         avatar: None,
+        community: None,
+        is_community: false,
+    });
+    // A community: its own (empty) parent chat, and two of its groups.
+    let community = wa_backend::CommunityRef { jid: "120363000000000900@g.us".into(), name: "Ticker Analysts".into() };
+    for (i, (jid, name, text, ago)) in [
+        ("120363000000000901@g.us", "Ticker Analysts", "Market opens late tomorrow", 3 * h),
+        ("120363000000000902@g.us", "TA · Daily Picks", "NVDA looks strong into earnings", 2 * h),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ts = n - ago;
+        messages.push(msg(jid, 0, false, Some("Najam Ilyas"), text, ts));
+        chats.push(ChatSummary {
+            jid: jid.into(),
+            name: name.into(),
+            is_group: true,
+            last_message: Some(MessagePreview { text: text.into(), timestamp: ts, from_me: false, sender_name: Some("Najam Ilyas".into()) }),
+            unread_count: if i == 1 { 2 } else { 0 },
+            pinned: false,
+            archived: false,
+            muted: false,
+            avatar: None,
+            community: Some(community.clone()),
+            is_community: false,
+        });
+    }
+    chats.push(ChatSummary {
+        jid: community.jid.clone(),
+        name: community.name.clone(),
+        is_group: true,
+        last_message: None,
+        unread_count: 0,
+        pinned: false,
+        archived: false,
+        muted: false,
+        avatar: None,
+        community: None,
+        is_community: true,
     });
     // Pad with extra contacts to exercise scrolling.
     for i in 0..18 {
@@ -301,6 +359,8 @@ fn seed() -> Fake {
             archived: false,
             muted: false,
             avatar: None,
+            community: None,
+            is_community: false,
         });
     }
     // Forwarded and deleted messages, and replies to messages far up the long thread
@@ -725,6 +785,8 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                         archived: false,
                         muted: false,
                         avatar: None,
+                        community: None,
+                        is_community: false,
                     });
                     let _ = ev.send(Event::Chats(fake.chats.clone()));
                 }

@@ -156,7 +156,8 @@ impl NotificationCenter {
         });
         self.center
             .requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+                // Badge too: macOS hides the app's Dock badge without it.
+                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound | UNAuthorizationOptions::Badge,
                 &completion,
             );
     }

@@ -26,6 +26,8 @@ use crate::theme::Theme;
 const GROUP_GAP_SECS: i64 = 5 * 60;
 /// A centered timestamp is shown when the conversation resumes after this gap.
 const SEPARATOR_GAP_SECS: i64 = 60 * 60;
+/// Photos sent one after another within this (and without captions) show as one album.
+const ALBUM_GAP_SECS: i64 = 30;
 use crate::kinds::BUBBLE_RADIUS;
 const HEADER_HEIGHT: f32 = 52.;
 /// The mini window's header, its traffic lights inside it.
@@ -87,7 +89,8 @@ impl ChatBinding {
 #[derive(Clone)]
 enum Row {
     Separator(i64),
-    Message { ix: usize, first: bool, last: bool, show_name: bool, status: Option<(String, bool)> },
+    /// `messages[ix..ix + span]`: more than one for an album of photos.
+    Message { ix: usize, span: usize, first: bool, last: bool, show_name: bool, status: Option<(String, bool)> },
     Typing,
 }
 
@@ -337,9 +340,11 @@ impl Conversation {
                         self.list.splice(prefix..old - suffix, new - prefix - suffix);
                     }
                     for (row_ix, row) in self.rows.iter().enumerate() {
-                        if let Row::Message { ix, .. } = row
+                        if let Row::Message { ix, span, .. } = row
                             && (row_ix < prefix || row_ix >= new - suffix)
-                            && old_messages.get(&self.messages[*ix].id).is_some_and(|m| m != &self.messages[*ix])
+                            && self.messages[*ix..*ix + *span]
+                                .iter()
+                                .any(|now| old_messages.get(&now.id).is_some_and(|m| m != now))
                         {
                             self.list.remeasure_items(row_ix..row_ix + 1);
                         }
@@ -381,7 +386,9 @@ impl Conversation {
     }
 
     fn row_of(&self, id: &str) -> Option<usize> {
-        self.rows.iter().position(|r| matches!(r, Row::Message { ix, .. } if self.messages[*ix].id == id))
+        self.rows.iter().position(
+            |r| matches!(r, Row::Message { ix, span, .. } if self.messages[*ix..*ix + *span].iter().any(|m| m.id == id)),
+        )
     }
 
     /// Scroll to a message (a reply's original, a search hit), paging older history in
@@ -834,8 +841,9 @@ impl Conversation {
                 .font_weight(FontWeight::MEDIUM)
                 .child(transcript_time(*ts))
                 .into_any_element(),
-            Some(Row::Message { ix, first, last, show_name, status }) => {
-                self.render_message(&self.messages[*ix], *first, *last, *show_name, status.as_ref(), theme, window, cx)
+            Some(Row::Message { ix, span, first, last, show_name, status }) => {
+                let album = &self.messages[*ix..*ix + *span];
+                self.render_message(album, *first, *last, *show_name, status.as_ref(), theme, window, cx)
             }
             Some(Row::Typing) => self.typing_row(theme, cx),
             None => div().into_any_element(),
@@ -843,9 +851,10 @@ impl Conversation {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `album`: the row's message, or the photos of an album (actions apply to the first).
     fn render_message(
         &self,
-        m: &ChatMessage,
+        album: &[ChatMessage],
         first: bool,
         last: bool,
         show_name: bool,
@@ -854,6 +863,7 @@ impl Conversation {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let m = &album[0];
         let from_me = m.from_me;
         let show_sender = self.is_group && !from_me && show_name;
         let gutter = self.is_group && !from_me;
@@ -866,6 +876,7 @@ impl Conversation {
         let thumb = self.thumbs.get(&m.id).cloned();
         let found = self.find_highlight(&m.id);
         let content: AnyElement = match &m.body {
+            _ if album.len() > 1 => self.album_content(album, theme, cx),
             _ if m.deleted => bubble(
                 text_content(if from_me { "You deleted this message" } else { "This message was deleted" }, true),
                 from_me,
@@ -975,13 +986,16 @@ impl Conversation {
                 })
         });
 
+        let reactions: Vec<_> = album.iter().flat_map(|m| m.reactions.iter().cloned()).collect();
         let picker_open = self.picker_for.as_deref() == Some(m.id.as_str());
         let flash = self.highlight.as_ref().filter(|(id, _)| *id == m.id).map(|(_, g)| *g);
         let bubble_area = div()
             .relative()
-            .when(!m.reactions.is_empty(), |d| d.pt(px(14.)))
+            // Shrinks in a narrow (mini) window so long text wraps instead of overflowing.
+            .min_w_0()
+            .when(!reactions.is_empty(), |d| d.pt(px(14.)))
             .child(content)
-            .when(!m.reactions.is_empty(), |d| d.child(reaction_pill(&m.reactions, from_me, theme)))
+            .when(!reactions.is_empty(), |d| d.child(reaction_pill(&reactions, from_me, theme)))
             .when_some(flash, |d, generation| {
                 // A brief glow over the bubble the transcript jumped to.
                 let glow = theme.accent;
@@ -1018,6 +1032,7 @@ impl Conversation {
             .when_some(m.quoted.clone(), |d, q| d.child(self.quote_preview(&q, from_me, gutter, theme, cx)))
             .child(
                 div()
+                    .max_w_full()
                     .flex()
                     .items_end()
                     .gap(px(10.))
@@ -1061,7 +1076,7 @@ impl Conversation {
                         )
                     })
                     .when(!m.deleted, |d| {
-                        d.child(div().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button))
+                        d.child(div().flex_none().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button))
                     }),
             )
             .when(m.edited, |d| {
@@ -1451,6 +1466,92 @@ impl Conversation {
             .into_any_element()
     }
 
+    /// Photos sent together: a grid of up to four (the last one counting the rest),
+    /// each opening in the photo viewer.
+    fn album_content(&self, album: &[ChatMessage], theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        const GAP: f32 = 3.;
+        // Rounded containers don't clip their children, so each photo rounds its own
+        // corners: the album's outer ones like a bubble, the inner ones slightly.
+        let r = |outer: bool| px(if outer { BUBBLE_RADIUS } else { 4. });
+        let half = (IMAGE_MAX_W - GAP) / 2.;
+        let more = album.len().saturating_sub(4);
+        let mini = self.binding.fixed().map(String::from);
+        // `corners`: which of top-left, top-right, bottom-right, bottom-left are the album's.
+        let mut tile = |m: &ChatMessage, w: f32, h: f32, more: usize, [tl, tr, br, bl]: [bool; 4]| {
+            let round = |d: Div| d.rounded_tl(r(tl)).rounded_tr(r(tr)).rounded_br(r(br)).rounded_bl(r(bl));
+            let MessageBody::Image(media) = &m.body else { return div().into_any_element() };
+            if media.path.is_none() && media.state == MediaState::Idle {
+                let (store, chat, id) = (self.store.clone(), m.chat_jid.clone(), m.id.clone());
+                cx.defer(move |cx| store.update(cx, |s, _| s.request_media(&chat, &id)));
+            }
+            let photo = |src: ImageSource| {
+                img(src).size_full().object_fit(ObjectFit::Cover).rounded_tl(r(tl)).rounded_tr(r(tr)).rounded_br(r(br)).rounded_bl(r(bl))
+            };
+            let picture: AnyElement = match (&media.path, self.thumbs.get(&m.id)) {
+                (Some(path), _) => photo(path.clone().into()).into_any_element(),
+                (None, Some(thumb)) => photo(thumb.clone().into()).into_any_element(),
+                (None, None) => round(div().size_full().bg(theme.bubble_in)).into_any_element(),
+            };
+            let (path, store, mini, id) = (media.path.clone(), self.store.clone(), mini.clone(), m.id.clone());
+            div()
+                .id(SharedString::from(format!("img-{}", m.id)))
+                .relative()
+                .flex_none()
+                .w(px(w))
+                .h(px(h))
+                .cursor_pointer()
+                .child(picture)
+                .when(more > 0, |d| {
+                    d.child(
+                        round(div())
+                            .absolute()
+                            .inset_0()
+                            .bg(black().opacity(0.45))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(white())
+                            .text_size(px(24.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("+{more}")),
+                    )
+                })
+                .on_click(move |_, _, cx| {
+                    if let Some(path) = path.clone() {
+                        store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx));
+                    }
+                })
+                .into_any_element()
+        };
+        let row = || div().flex().gap(px(GAP));
+        let grid = match album {
+            [a, b] => vec![row()
+                .child(tile(a, half, half * 1.3, 0, [true, false, false, true]))
+                .child(tile(b, half, half * 1.3, 0, [false, true, true, false]))],
+            [a, b, c] => vec![
+                row().child(tile(a, IMAGE_MAX_W, half, 0, [true, true, false, false])),
+                row()
+                    .child(tile(b, half, half, 0, [false, false, false, true]))
+                    .child(tile(c, half, half, 0, [false, false, true, false])),
+            ],
+            _ => vec![
+                row()
+                    .child(tile(&album[0], half, half, 0, [true, false, false, false]))
+                    .child(tile(&album[1], half, half, 0, [false, true, false, false])),
+                row()
+                    .child(tile(&album[2], half, half, 0, [false, false, false, true]))
+                    .child(tile(&album[3], half, half, more, [false, false, true, false])),
+            ],
+        };
+        div()
+            .w(px(IMAGE_MAX_W))
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .children(grid)
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image_content(
         &self,
@@ -1476,7 +1577,7 @@ impl Conversation {
             }
             (None, None) => div().size_full().bg(theme.bubble_in).into_any_element(),
         };
-        let (path, store, mini) = (media.path.clone(), self.store.clone(), self.binding.fixed().map(String::from));
+        let (path, store, mini, id) = (media.path.clone(), self.store.clone(), self.binding.fixed().map(String::from), m.id.clone());
         let overlay = match (media.path.is_some(), media.state) {
             (true, _) => None,
             (false, MediaState::Failed) => Some("Couldn't download"),
@@ -1509,7 +1610,7 @@ impl Conversation {
             })
             .on_click(move |_, _, cx| {
                 if let Some(path) = path.clone() {
-                    store.update(cx, |s, cx| s.open_lightbox_in(path, mini.clone(), cx));
+                    store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx));
                 }
             });
         match media.caption.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -1733,7 +1834,11 @@ fn voice_content(
         (theme.bubble_in_text, theme.accent, theme.waveform_in)
     };
 
-    let bars = waveform_bars(&media.waveform, 30);
+    // As many bars as fit beside the play button and time: fewer in a narrow (mini) window.
+    // Row padding, hover buttons, group avatar, bubble padding, play button, gaps, time.
+    let gutter = if !from_me && m.chat_jid.ends_with("@g.us") { 38. } else { 0. };
+    let room = f32::from(window.viewport_size().width) - 96. - gutter - 24. - 28. - 18. - 34.;
+    let bars = waveform_bars(&media.waveform, ((room / 4.5) as usize).clamp(12, 30));
     let ready = media.path.is_some();
     let (path, id, chat) = (media.path.clone(), m.id.clone(), m.chat_jid.clone());
     let button = div()
@@ -1758,9 +1863,10 @@ fn voice_content(
         .py(px(2.))
         .child(button)
         .child(
-            div().flex().items_center().gap(px(2.)).h(px(26.)).children(bars.iter().enumerate().map(|(i, v)| {
+            div().flex_none().flex().items_center().gap(px(2.)).h(px(26.)).children(bars.iter().enumerate().map(|(i, v)| {
                 let done = (i as f32 + 0.5) / bars.len() as f32 <= progress;
                 div()
+                    .flex_none()
                     .w(px(2.5))
                     .h(px(4. + 20. * v))
                     .rounded_full()
@@ -1769,6 +1875,7 @@ fn voice_content(
         )
         .child(
             div()
+                .flex_none()
                 .min_w(px(30.))
                 .text_size(px(12.))
                 .text_color(fg.opacity(0.8))
@@ -1942,7 +2049,7 @@ fn scroll_button(unseen: usize, bottom: f32, theme: &Theme, cx: &mut Context<Con
 #[derive(PartialEq)]
 enum RowKey {
     Separator(i64),
-    Message { id: String, first: bool, last: bool, show_name: bool, status: bool },
+    Message { id: String, span: usize, first: bool, last: bool, show_name: bool, status: bool },
     Typing,
 }
 
@@ -1950,8 +2057,9 @@ fn row_keys(rows: &[Row], messages: &[ChatMessage]) -> Vec<RowKey> {
     rows.iter()
         .map(|r| match r {
             Row::Separator(ts) => RowKey::Separator(*ts),
-            Row::Message { ix, first, last, show_name, status } => RowKey::Message {
+            Row::Message { ix, span, first, last, show_name, status } => RowKey::Message {
                 id: messages[*ix].id.clone(),
+                span: *span,
                 first: *first,
                 last: *last,
                 show_name: *show_name,
@@ -1965,9 +2073,13 @@ fn row_keys(rows: &[Row], messages: &[ChatMessage]) -> Vec<RowKey> {
 fn build_rows(messages: &[ChatMessage], typing: bool) -> Vec<Row> {
     let mut rows = Vec::with_capacity(messages.len() + 8);
     let last_mine = messages.iter().rposition(|m| m.from_me && !m.deleted);
-    for (ix, m) in messages.iter().enumerate() {
+    let mut ix = 0;
+    while ix < messages.len() {
+        let span = album_span(messages, ix);
+        // An album's first photo starts the row, its last one ends it.
+        let (m, end) = (&messages[ix], &messages[ix + span - 1]);
         let prev = ix.checked_sub(1).map(|p| &messages[p]);
-        let next = messages.get(ix + 1);
+        let next = messages.get(ix + span);
         let separator = prev.is_none_or(|p| m.timestamp - p.timestamp > SEPARATOR_GAP_SECS);
         if separator {
             rows.push(Row::Separator(m.timestamp));
@@ -1977,15 +2089,44 @@ fn build_rows(messages: &[ChatMessage], typing: bool) -> Vec<Row> {
         };
         let new_sender = separator || prev.is_none_or(|p| !same(p, m));
         let first = new_sender || m.quoted.is_some();
-        let next_separates = next.is_some_and(|n| n.timestamp - m.timestamp > SEPARATOR_GAP_SECS);
-        let last = next.is_none_or(|n| next_separates || !same(m, n) || n.quoted.is_some());
-        let status = (Some(ix) == last_mine || (m.from_me && m.status == DeliveryStatus::Failed)).then(|| status_label(m));
-        rows.push(Row::Message { ix, first, last: last || status.is_some(), show_name: new_sender, status });
+        let next_separates = next.is_some_and(|n| n.timestamp - end.timestamp > SEPARATOR_GAP_SECS);
+        let last = next.is_none_or(|n| next_separates || !same(end, n) || n.quoted.is_some());
+        let mine = last_mine.is_some_and(|l| (ix..ix + span).contains(&l));
+        let status = (mine || (end.from_me && end.status == DeliveryStatus::Failed)).then(|| status_label(end));
+        rows.push(Row::Message { ix, span, first, last: last || status.is_some(), show_name: new_sender, status });
+        ix += span;
     }
     if typing {
         rows.push(Row::Typing);
     }
     rows
+}
+
+/// How many photos from `ix` on were sent together: one after another from the same
+/// sender, each within [`ALBUM_GAP_SECS`] of the last, none captioned, replying or failed.
+fn album_span(messages: &[ChatMessage], ix: usize) -> usize {
+    let photo = |m: &ChatMessage| {
+        !m.deleted
+            && m.status != DeliveryStatus::Failed
+            && matches!(&m.body, MessageBody::Image(i) if i.caption.as_deref().is_none_or(|c| c.trim().is_empty()))
+    };
+    if !photo(&messages[ix]) {
+        return 1;
+    }
+    let mut end = ix;
+    while let Some(n) = messages.get(end + 1) {
+        let p = &messages[end];
+        if !photo(n)
+            || n.quoted.is_some()
+            || n.from_me != p.from_me
+            || n.sender_jid != p.sender_jid
+            || n.timestamp - p.timestamp > ALBUM_GAP_SECS
+        {
+            break;
+        }
+        end += 1;
+    }
+    end - ix + 1
 }
 
 fn status_label(m: &ChatMessage) -> (String, bool) {

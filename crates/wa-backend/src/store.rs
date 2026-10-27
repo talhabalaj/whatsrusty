@@ -19,7 +19,7 @@ use crate::extract::{
 };
 use crate::stickers::StickerSync;
 use crate::types::{
-    ChatMessage, ChatSummary, ContactCard, DeliveryStatus, LocationInfo, MediaState, Mention, MessageBody,
+    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, LocationInfo, MediaState, Mention, MessageBody,
     MessagePreview, PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
@@ -185,6 +185,15 @@ const MIGRATIONS: &[&str] = &[
     // 8: chats marked unread by hand (so reading them tells the phone, too).
     r#"
     ALTER TABLE chats ADD COLUMN marked_unread INTEGER NOT NULL DEFAULT 0;
+    "#,
+    // 9: which community each group belongs to (refreshed from the server on connect).
+    r#"
+    CREATE TABLE group_community (
+        jid TEXT PRIMARY KEY,
+        parent TEXT,
+        is_parent INTEGER NOT NULL DEFAULT 0,
+        name TEXT
+    );
     "#,
 ];
 
@@ -2155,8 +2164,12 @@ impl Store {
     pub fn list_chats(&self, now: Timestamp) -> Result<Vec<ChatSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.jid, c.name, c.is_group, c.unread, c.pinned_at, c.archived, c.muted_until, c.last_activity,
-                    ct.full_name, ct.push_name, av.path
+                    ct.full_name, ct.push_name, av.path,
+                    gc.parent, COALESCE(NULLIF(pg.name, ''), pc.name), COALESCE(gc.is_parent, 0)
              FROM chats c LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN avatars av ON av.jid = c.jid
+                  LEFT JOIN group_community gc ON gc.jid = c.jid
+                  LEFT JOIN group_community pg ON pg.jid = gc.parent
+                  LEFT JOIN chats pc ON pc.jid = gc.parent
              ORDER BY (c.pinned_at > 0) DESC, c.pinned_at DESC, c.last_activity DESC, c.jid",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2172,6 +2185,9 @@ impl Store {
                 r.get::<_, Option<String>>(8)?,
                 r.get::<_, Option<String>>(9)?,
                 r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, bool>(13)?,
             ))
         })?;
         let mut last_stmt = self.conn.prepare_cached(&format!(
@@ -2179,7 +2195,8 @@ impl Store {
         ))?;
         let mut out = Vec::new();
         for row in rows {
-            let (jid, name, is_group, unread, pinned_at, archived, muted_until, last_activity, full, push, avatar) = row?;
+            let (jid, name, is_group, unread, pinned_at, archived, muted_until, last_activity, full, push, avatar, parent, parent_name, is_community) =
+                row?;
             let last = last_stmt.query_row([&jid], MessageRow::from_row).optional()?;
             if last.is_none() && last_activity == 0 {
                 continue;
@@ -2208,9 +2225,24 @@ impl Store {
                 archived,
                 muted: muted_until > now,
                 avatar: existing_path(avatar),
+                community: parent.map(|jid| CommunityRef { jid, name: parent_name.unwrap_or_else(|| "Community".into()) }),
+                is_community,
             });
         }
         Ok(out)
+    }
+
+    /// Replace what's known about communities: for each group I'm in, its community (if
+    /// any), whether it is a community itself, and its subject. Call inside a transaction.
+    pub fn set_group_communities(&self, groups: &[(String, Option<String>, bool, String)]) -> Result<()> {
+        self.conn.execute("DELETE FROM group_community", [])?;
+        let mut insert = self
+            .conn
+            .prepare_cached("INSERT OR REPLACE INTO group_community (jid, parent, is_parent, name) VALUES (?1, ?2, ?3, ?4)")?;
+        for (jid, parent, is_parent, name) in groups.iter().filter(|(_, parent, is_parent, _)| parent.is_some() || *is_parent) {
+            insert.execute(params![jid, parent, is_parent, name])?;
+        }
+        Ok(())
     }
 
     /// A page of messages older than `before` (newest page when `None`), oldest first.
@@ -3113,6 +3145,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE pending_edits DROP COLUMN stored_at; ALTER TABLE messages DROP COLUMN forwarded;
                      DROP TABLE deleted_for_me; ALTER TABLE chats DROP COLUMN marked_unread;
+                     DROP TABLE group_community;
                      PRAGMA user_version = 3",
                 )
                 .unwrap();

@@ -4,7 +4,7 @@
 //!      ( Message text…                   (↑) )
 
 use gpui_kit::component::Sizable as _;
-use gpui_kit::component::input::{Enter, IndentInline, InputEvent, MoveUp, Textarea, TextareaState};
+use gpui_kit::component::input::{Enter, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::{Path, PathBuf};
@@ -452,6 +452,18 @@ impl Composer {
 
     /// ↑: move through suggestions, or edit my last message when the field is empty;
     /// otherwise let the text field move the cursor.
+    fn on_move_down(&mut self, cx: &mut Context<Self>) {
+        if !self.mention_list.is_empty() {
+            self.mention_ix = (self.mention_ix + 1) % self.mention_list.len();
+        } else if !self.suggestions.is_empty() {
+            self.suggestion_ix = (self.suggestion_ix + 1) % self.suggestions.len();
+        } else {
+            return cx.propagate();
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
     fn on_move_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.mention_list.is_empty() {
             let n = self.mention_list.len();
@@ -709,7 +721,7 @@ impl Composer {
         }))
     }
 
-    fn render_sticker_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sticker_panel(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stickers = self.store.read(cx).stickers.clone();
         let section = |title: &str, items: Vec<wa_backend::StickerRef>, cx: &mut Context<Self>| {
             div()
@@ -754,8 +766,9 @@ impl Composer {
             .bottom_full()
             .right(px(14.))
             .mb(px(4.))
-            .w(px(340.))
-            .max_h(px(360.))
+            // Narrower in a mini window, inside its edges.
+            .w(px(340.).min(window.viewport_size().width - px(28.)))
+            .max_h(px(360.).min(window.viewport_size().height - px(120.)))
             .overflow_y_scroll()
             .p(px(12.))
             .rounded(px(12.))
@@ -817,13 +830,13 @@ impl Composer {
     }
 
     /// Instead of the text while recording: cancel, a red dot, the time and a live meter.
-    fn render_recording(&self, rec: &Recorder, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_recording(&self, rec: &Recorder, height: f32, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let secs = rec.elapsed().as_secs();
         let levels = rec.levels(LEVEL_BARS);
         div()
             .flex_1()
             .min_w_0()
-            .h(px(COMPOSER_HEIGHT - 2.))
+            .h(px(height))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -948,8 +961,9 @@ fn popup(theme: &Theme) -> Div {
         .absolute()
         .bottom_full()
         .left(px(56.))
+        .right(px(14.))
         .mb(px(4.))
-        .w(px(280.))
+        .max_w(px(280.))
         .p(px(4.))
         .rounded(px(10.))
         .shadow_md()
@@ -1090,12 +1104,17 @@ impl Render for Composer {
         // The end-cap slot: send while there's something to send (or a recording), else
         // the mic with stickers beside it, like Messages.
         let send_ready = has_text || recording;
+        // With Liquid Glass the band is clear: the + button and the field are glass shapes
+        // floating over the transcript. Without it, a solid band like Messages before 26.
+        let glass_on = crate::glass::enabled(window);
+        // The field's border (none on glass): its insides are that much smaller.
+        let edge = if glass_on { 0. } else { 1. };
         let slot = |id: &'static str, right: f32| {
             div()
                 .id(id)
                 .absolute()
                 .right(px(right))
-                .bottom(px(SEND_INSET - 1.))
+                .bottom(px(SEND_INSET - edge))
                 .size(px(SEND_SIZE))
                 .rounded_full()
                 .flex()
@@ -1108,7 +1127,7 @@ impl Render for Composer {
                 .flex_1()
                 .min_w_0()
                 .track_focus(&self.recording_focus)
-                .child(self.render_recording(rec, &theme, cx))
+                .child(self.render_recording(rec, COMPOSER_HEIGHT - 2. * edge, &theme, cx))
                 .into_any_element(),
             None => div()
                 .flex_1()
@@ -1127,9 +1146,6 @@ impl Render for Composer {
                 .into_any_element(),
         };
 
-        // With Liquid Glass the band is clear: the + button and the field are glass shapes
-        // floating over the transcript. Without it, a solid band like Messages before 26.
-        let glass_on = crate::glass::enabled(window);
         let attach = if glass_on {
             let hover = theme.search_bg;
             div()
@@ -1160,6 +1176,8 @@ impl Render for Composer {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             // ↑ is bound to the input's MoveUp action, which runs before key-down listeners.
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| this.on_move_up(window, cx)))
+            // ↓ likewise (MoveDown), while a suggestion list is open.
+            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| this.on_move_down(cx)))
             // Enter too: picking a suggestion must not insert a newline first.
             .capture_action(cx.listener(|this, ev: &Enter, window, cx| this.on_enter(ev, window, cx)))
             // Tab (bound to indenting) picks one as well.
@@ -1175,7 +1193,7 @@ impl Render for Composer {
             }))
             .when(mentions_open, |d| d.child(self.render_mention_list(&theme, cx)))
             .when(suggestions_open && !mentions_open, |d| d.child(self.render_suggestions(&theme, cx)))
-            .when(sticker_panel, |d| d.child(self.render_sticker_panel(&theme, cx)))
+            .when(sticker_panel, |d| d.child(self.render_sticker_panel(&theme, window, cx)))
             .flex()
             .items_end()
             .gap(px(8.))
@@ -1224,15 +1242,15 @@ impl Render for Composer {
                             .relative()
                             .flex()
                             .items_end()
-                            // Border (2px) + this = COMPOSER_HEIGHT on one line, matching the + button.
-                            .min_h(px(COMPOSER_HEIGHT - 2.))
+                            // Border + this = COMPOSER_HEIGHT on one line, matching the + button.
+                            .min_h(px(COMPOSER_HEIGHT - 2. * edge))
                             .pl(px(if recording { 6. } else { 14. }))
                             // Room for the round button that sits in the field's end cap.
                             .pr(px(SEND_SIZE + 2. * SEND_INSET))
                             // The text area draws its line ~2.5pt below its box's center, so the
                             // padding is asymmetric to optically center one line in the 34pt field
                             // (measured from screenshots). Extra lines grow the field downward.
-                            .when(!recording, |d| d.pt(px(1.5)).pb(px(6.5)))
+                            .when(!recording, |d| d.pt(px(1.5 + 1. - edge)).pb(px(6.5 + 1. - edge)))
                             .text_size(px(14.))
                             .child(text_row)
                             // One slot at the field's right edge: the mic (stickers next to it)
@@ -1240,13 +1258,13 @@ impl Render for Composer {
                             // icon stays at the edge).
                             .when(!send_ready, |d| {
                                 d.child(
-                                    slot("stickers", SEND_INSET - 1. + SEND_SIZE)
+                                    slot("stickers", SEND_INSET - edge + SEND_SIZE)
                                         .hover(|d| d.bg(theme.search_bg))
                                         .child(glyph(Glyph::Sticker, 19., if sticker_panel { theme.accent } else { theme.text_secondary }))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_sticker_panel(cx))),
                                 )
                                 .child(
-                                    slot("record", SEND_INSET - 1.)
+                                    slot("record", SEND_INSET - edge)
                                         .hover(|d| d.bg(theme.search_bg))
                                         .child(glyph(Glyph::Mic, 18., theme.text_secondary))
                                         .on_click(cx.listener(|this, _, _, cx| this.start_recording(cx))),
@@ -1255,8 +1273,8 @@ impl Render for Composer {
                             .when(send_ready, |d| {
                                 d.child(
                                     // Concentric with the pill's rounded end: a 28pt circle inset 3pt
-                                    // on every side of a 34pt field (1pt of that is the border).
-                                    slot("send", SEND_INSET - 1.)
+                                    // on every side of a 34pt field (counting the border).
+                                    slot("send", SEND_INSET - edge)
                                         .bg(theme.accent)
                                         .child(glyph(Glyph::ArrowUp, 18., white()))
                                         .on_click(cx.listener(|this, _, window, cx| {
