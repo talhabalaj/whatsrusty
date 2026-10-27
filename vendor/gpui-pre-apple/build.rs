@@ -63,6 +63,8 @@ mod apple_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            // whatsapp-gpui patch
+            "BackdropBlur".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

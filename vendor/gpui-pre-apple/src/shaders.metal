@@ -1277,3 +1277,99 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// whatsapp-gpui patch: backdrop blur. The region under a `BackdropBlur` is box-downsampled
+// from the frame drawn so far, blurred with a separable gaussian at that resolution, then
+// composited back over the blur's (rounded, clipped) bounds.
+
+struct BackdropBlurPass {
+  int2 region_min;   // destination texels written / source texels readable
+  int2 region_max;   // (exclusive)
+  int2 direction;    // gaussian passes: (1, 0) or (0, 1)
+  float sigma;       // in destination texels
+  uint scale;        // downsample factor from the frame to the blur texture
+};
+
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+};
+
+// One triangle covering the viewport; passes are limited to their region by a scissor.
+vertex BackdropBlurFragmentInput backdrop_blur_pass_vertex(uint vertex_id [[vertex_id]]) {
+  float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
+  return BackdropBlurFragmentInput{float4(uv * float2(2., -2.) + float2(-1., 1.), 0., 1.)};
+}
+
+fragment float4 backdrop_blur_downsample_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlurPass *pass [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, coord::pixel,
+                           address::clamp_to_edge);
+  float scale = float(pass->scale);
+  float2 origin = (floor(input.position.xy)) * scale;
+  if (pass->scale == 1) {
+    return source.sample(linear, origin + 0.5);
+  }
+  // Each bilinear tap at a 2x2 block's shared corner averages those four pixels.
+  uint taps = pass->scale / 2;
+  float4 sum = float4(0.);
+  for (uint y = 0; y < taps; y++) {
+    for (uint x = 0; x < taps; x++) {
+      sum += source.sample(linear, origin + float2(x * 2 + 1, y * 2 + 1));
+    }
+  }
+  return sum / float(taps * taps);
+}
+
+fragment float4 backdrop_blur_gaussian_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlurPass *pass [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]) {
+  int2 texel = int2(input.position.xy);
+  int reach = int(ceil(pass->sigma * 3.0));
+  float inv = -0.5 / (pass->sigma * pass->sigma);
+  float4 sum = float4(0.);
+  float total = 0.;
+  for (int i = -reach; i <= reach; i++) {
+    int2 at = clamp(texel + pass->direction * i, pass->region_min, pass->region_max - 1);
+    float weight = exp(float(i * i) * inv);
+    sum += source.read(uint2(at)) * weight;
+    total += weight;
+  }
+  return sum / total;
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    constant BackdropBlur *blur [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position = to_device_position(unit_vertex, blur->bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, blur->bounds, blur->content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_blur_composite_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blur [[buffer(1)]],
+    constant BackdropBlurPass *pass [[buffer(3)]],
+    texture2d<float> blurred [[texture(0)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, coord::pixel,
+                           address::clamp_to_edge);
+  float2 at = clamp(input.position.xy / float(pass->scale), float2(pass->region_min) + 0.5,
+                    float2(pass->region_max) - 0.5);
+  float4 color = blurred.sample(linear, at);
+  float distance = quad_sdf(input.position.xy, blur->bounds, blur->corner_radii);
+  color.a *= saturate(0.5 - distance);
+  return color;
+}

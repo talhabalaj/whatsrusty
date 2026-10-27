@@ -27,6 +27,8 @@ pub struct Theme {
     pub avatar_bottom: Hsla,
     pub unread_dot: Hsla,
     pub failed: Hsla,
+    /// Over the backdrop blur of the header and composer bars.
+    pub bar_tint: Hsla,
 }
 
 fn c(v: Rgba) -> Hsla {
@@ -65,6 +67,7 @@ impl Theme {
             avatar_bottom: c(rgb(0x858994)),
             unread_dot: c(rgb(0x0a7cff)),
             failed: c(rgb(0xff3b30)),
+            bar_tint: c(rgba(0xf6f6f6b8)),
         }
     }
 
@@ -92,6 +95,7 @@ impl Theme {
             avatar_bottom: c(rgb(0x6c707a)),
             unread_dot: c(rgb(0x0a84ff)),
             failed: c(rgb(0xff453a)),
+            bar_tint: c(rgba(0x262628b3)),
         }
     }
 }

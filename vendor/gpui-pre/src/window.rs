@@ -5260,6 +5260,35 @@ impl Window {
         });
     }
 
+    /// whatsapp-gpui patch: blurs what has been painted under `bounds` so far (a gaussian
+    /// with standard deviation `radius`, like CSS `backdrop-filter: blur()`), clipped to the
+    /// rounded rect and the current content mask. Paint a translucent tint over it after.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        radius: Pixels,
+    ) {
+        use crate::BackdropBlur;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(BackdropBlur {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask,
+            corner_radii: corner_radii.scale(scale_factor),
+            radius: radius.scale(scale_factor),
+            pad2: 0,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::chrome::{round_button, surface};
+use crate::conversation::ChatBinding;
 use crate::icons::{Glyph, glyph};
 use crate::recorder::{MicAccess, Recorder};
 use crate::state::{Draft, FocusComposer, Store, StoreEvent, body_text};
@@ -29,6 +30,7 @@ const LEVEL_BARS: usize = 56;
 
 pub struct Composer {
     store: Entity<Store>,
+    binding: ChatBinding,
     input: Entity<TextareaState>,
     typing_sent: bool,
     /// The chat the input currently belongs to; drafts are kept per chat (in the store)
@@ -62,7 +64,7 @@ pub struct Composer {
 }
 
 impl Composer {
-    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<Store>, binding: ChatBinding, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx).auto_grow(1, 8).placeholder("WhatsApp").submit_on_enter(true)
         });
@@ -75,10 +77,12 @@ impl Composer {
             }),
             // A chat was just picked in New Message.
             cx.subscribe_in(&store, window, |this, _, _: &FocusComposer, window, cx| {
-                this.input.update(cx, |s, cx| s.focus(window, cx));
+                if this.binding == ChatBinding::Selected {
+                    this.input.update(cx, |s, cx| s.focus(window, cx));
+                }
             }),
-            cx.subscribe_in(&store, window, |this, _, ev: &StoreEvent, window, cx| {
-                if matches!(ev, StoreEvent::AccountReset) {
+            cx.subscribe_in(&store, window, |this, _, ev: &StoreEvent, window, cx| match ev {
+                StoreEvent::AccountReset => {
                     this.attachments.clear();
                     this.mentions.clear();
                     this.recording = None;
@@ -86,6 +90,15 @@ impl Composer {
                     this.typing_sent = false;
                     this.input.update(cx, |s, cx| s.set_value("", window, cx));
                 }
+                StoreEvent::DraftChanged { chat_jid } if this.chat.as_deref() == Some(chat_jid.as_str()) => {
+                    this.follow_draft(window, cx)
+                }
+                StoreEvent::ChatMerged { from, to }
+                    if this.binding.follow_merge(from, to) && this.chat.as_deref() == Some(from.as_str()) =>
+                {
+                    this.chat = Some(to.clone());
+                }
+                _ => {}
             }),
             cx.subscribe_in(&input, window, |this, state, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { shift: false, .. } if !this.mention_list.is_empty() => {
@@ -101,21 +114,30 @@ impl Composer {
                     this.update_suggestions(window, cx);
                     this.update_mentions(true, cx);
                     let has_text = !state.read(cx).value().trim().is_empty();
-                    if has_text != this.typing_sent {
+                    if has_text != this.typing_sent
+                        && let Some(chat) = &this.chat
+                    {
                         this.typing_sent = has_text;
-                        this.store.read(cx).set_typing(has_text);
+                        this.store.read(cx).set_typing_in(chat, has_text);
                     }
                     this.save_draft(cx);
                     cx.notify();
                 }
                 _ => {}
             }),
+            // A closed mini window stops "typing…".
+            cx.on_release(|this, cx| {
+                if let Some(chat) = this.chat.as_ref().filter(|_| this.typing_sent) {
+                    this.store.read(cx).set_typing_in(chat, false);
+                }
+            }),
         ];
-        let chat = store.read(cx).selected.clone();
+        let chat = binding.chat(store.read(cx));
         // Reopened window: pick up where the last one left off.
         let draft = chat.as_ref().and_then(|c| store.read(cx).drafts.get(c).cloned()).unwrap_or_default();
-        // Test hooks: pre-filled `:query` suggestions / open sticker panel.
-        let debug_text = std::env::var("WA_DEBUG_COMPOSER_TEXT").ok();
+        // Test hooks (main window only): pre-filled `:query` suggestions / open sticker panel.
+        let debug = binding == ChatBinding::Selected;
+        let debug_text = std::env::var("WA_DEBUG_COMPOSER_TEXT").ok().filter(|_| debug);
         let suggestions = debug_text
             .as_deref()
             .and_then(crate::emoji_complete::trailing_query)
@@ -130,7 +152,7 @@ impl Composer {
             });
         }
         // Test hook: type ":jo" through real keystrokes (the IME/input path).
-        if std::env::var_os("WA_DEBUG_TYPE").is_some() {
+        if debug && std::env::var_os("WA_DEBUG_TYPE").is_some() {
             let input = input.clone();
             cx.spawn_in(window, async move |_, cx| {
                 cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
@@ -155,12 +177,12 @@ impl Composer {
             })
             .detach();
         }
-        let sticker_panel = std::env::var_os("WA_DEBUG_STICKERS").is_some();
+        let sticker_panel = debug && std::env::var_os("WA_DEBUG_STICKERS").is_some();
         if sticker_panel {
             store.read(cx).request_stickers();
         }
         // Test hook: WA_DEBUG_ATTACH="a.png|b.pdf" attaches those (once a chat is open).
-        if let Ok(list) = std::env::var("WA_DEBUG_ATTACH") {
+        if let Some(list) = std::env::var("WA_DEBUG_ATTACH").ok().filter(|_| debug) {
             let paths: Vec<PathBuf> = list.split('|').filter(|p| !p.is_empty()).map(PathBuf::from).collect();
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis(2000)).await;
@@ -169,7 +191,7 @@ impl Composer {
             .detach();
         }
         // Test hook: WA_DEBUG_RECORD=<ms> starts recording, and sends after that long (0: never).
-        if let Ok(ms) = std::env::var("WA_DEBUG_RECORD") {
+        if let Some(ms) = std::env::var("WA_DEBUG_RECORD").ok().filter(|_| debug) {
             let ms: u64 = ms.parse().unwrap_or(0);
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis(2500)).await;
@@ -183,6 +205,7 @@ impl Composer {
         }
         Self {
             store,
+            binding,
             input,
             typing_sent: false,
             chat,
@@ -223,13 +246,32 @@ impl Composer {
         let text = self.input.read(cx).value().to_string();
         let mentions = self.mentions.iter().filter(|(name, _)| text.contains(&format!("@{name}"))).cloned().collect();
         let draft = Draft { text, attachments: self.attachments.clone(), mentions };
-        self.store.update(cx, |s, _| s.save_draft(&chat, draft));
+        self.store.update(cx, |s, cx| s.save_draft(&chat, draft, cx));
+    }
+
+    /// Another window's composer on this chat changed the draft: show it here too, unless
+    /// this window is the one being typed in (or is editing a sent message).
+    fn follow_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() || window.is_window_active() {
+            return;
+        }
+        let Some(chat) = &self.chat else { return };
+        let draft = self.store.read(cx).drafts.get(chat).cloned().unwrap_or_default();
+        if draft.text == self.input.read(cx).value().as_ref() && draft.attachments == self.attachments {
+            return;
+        }
+        self.attachments = draft.attachments;
+        self.mentions = draft.mentions;
+        // Not typing here: skip the Change handling (typing indicator, suggestions).
+        self.replacing = true;
+        self.set_text(draft.text, window, cx);
+        cx.notify();
     }
 
     /// Selection changed: stash the draft (and stop "typing…") for the old chat, restore
     /// the new chat's draft.
     fn sync_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.store.read(cx).selected.clone();
+        let selected = self.binding.chat(self.store.read(cx));
         if selected == self.chat {
             return;
         }
@@ -269,10 +311,10 @@ impl Composer {
             return;
         }
         // Belt and braces: never send text that belongs to a different chat.
-        if self.store.read(cx).selected != self.chat {
+        let Some(chat) = self.chat.clone().filter(|c| self.binding.chat(self.store.read(cx)).as_ref() == Some(c)) else {
             self.sync_chat(window, cx);
             return;
-        }
+        };
         if let Some(message) = self.editing.take() {
             state.update(cx, |s, cx| s.set_value("", window, cx));
             self.store.update(cx, |s, cx| s.edit_message(&message, text, cx));
@@ -289,13 +331,13 @@ impl Composer {
         // can't carry mentions, so then it goes as its own message).
         let captioned = !text.is_empty() && mentioned.is_empty() && attachments.first().is_some_and(|p| is_image(p) || is_video(p));
         self.store.update(cx, |s, cx| {
-            s.set_typing(false);
+            s.set_typing_in(&chat, false);
             for (i, path) in attachments.into_iter().enumerate() {
                 let caption = (i == 0 && captioned).then(|| text.clone());
-                if is_image(&path) { s.send_image(path, caption, cx) } else { s.send_file(path, caption, cx) }
+                if is_image(&path) { s.send_image(chat.clone(), path, caption, cx) } else { s.send_file(chat.clone(), path, caption, cx) }
             }
             if !captioned && !text.is_empty() {
-                s.send_text(text, mentioned, cx);
+                s.send_text(chat.clone(), text, mentioned, cx);
             }
         });
         cx.notify();
@@ -319,13 +361,14 @@ impl Composer {
         let text = Store::editable_text(&message);
         // Whatever was being written stays the chat's draft for after the edit.
         self.save_draft(cx);
+        let chat = message.chat_jid.clone();
         self.editing = Some(message);
         self.attachments.clear();
         self.mentions.clear();
         self.suggestions.clear();
         self.mention_list.clear();
         self.recording = None;
-        self.store.update(cx, |s, cx| s.set_replying_to(None, cx));
+        self.store.update(cx, |s, cx| s.set_replying_to(&chat, None, cx));
         self.set_text(text, window, cx);
         self.input.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
@@ -427,7 +470,7 @@ impl Composer {
         let empty = self.input.read(cx).value().is_empty() && self.attachments.is_empty();
         if empty
             && self.editing.is_none()
-            && let Some(m) = self.store.read(cx).last_editable()
+            && let Some(m) = self.chat.as_ref().and_then(|c| self.store.read(cx).last_editable(c))
         {
             self.begin_edit(m, window, cx);
             cx.stop_propagation();
@@ -552,7 +595,8 @@ impl Composer {
             loop {
                 cx.background_executor().timer(Duration::from_millis(60)).await;
                 let go = this.update(cx, |this, cx| {
-                    let Some(rec) = &this.recording else { return false };
+                    let Some(rec) = &mut this.recording else { return false };
+                    rec.keep_alive();
                     if let Some(e) = rec.error() {
                         this.recording = None;
                         this.mic_notice = Some(format!("Couldn't record: {e}"));
@@ -586,7 +630,8 @@ impl Composer {
         if rate == 0 || samples.len() < rate as usize / 2 {
             return;
         }
-        self.store.update(cx, |s, cx| s.send_voice(samples, rate, cx));
+        let Some(chat) = self.chat.clone() else { return };
+        self.store.update(cx, |s, cx| s.send_voice(chat, samples, rate, cx));
     }
 
     fn render_suggestions(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -694,7 +739,8 @@ impl Composer {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let id = id.clone();
-                            this.store.update(cx, |s, cx| s.send_sticker(id, cx));
+                            let Some(chat) = this.chat.clone() else { return };
+                            this.store.update(cx, |s, cx| s.send_sticker(chat, id, cx));
                             this.sticker_panel = false;
                             cx.notify();
                         }))
@@ -1035,7 +1081,7 @@ impl Render for Composer {
                 self.input.update(cx, |s, cx| s.focus(window, cx));
             }
         }
-        let replying = self.store.read(cx).replying_to.clone();
+        let replying = self.chat.as_ref().and_then(|c| self.store.read(cx).replying_to(c).cloned());
         let weak = cx.entity().downgrade();
 
         let suggestions_open = !self.suggestions.is_empty();
@@ -1069,6 +1115,7 @@ impl Render for Composer {
                 .min_w_0()
                 .child(
                     Textarea::new(&self.input)
+                        .aria_label("Message")
                         .on_paste(move |item, _, cx| weak.update(cx, |this, cx| this.paste(item, cx)).unwrap_or(false))
                         .appearance(false)
                         .xsmall()
@@ -1101,12 +1148,15 @@ impl Render for Composer {
         .child(glyph(Glyph::Plus, 18., theme.text_secondary))
         .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)));
         let field = div().flex_1().min_w_0().flex().flex_col().rounded(px(17.));
-        let field = if glass_on { field } else { surface(field, &theme) };
+        // Without glass the field lets the frosted bar show through a little, like Messages'.
+        let field = if glass_on { field } else { surface(field, &theme).bg(theme.surface_bg.opacity(0.55)) };
 
         div()
             .relative()
             .w_full()
-            .when(!glass_on, |d| d.bg(theme.window_bg).border_t_1().border_color(theme.separator))
+            .when(!glass_on, |d| {
+                d.child(crate::chrome::frosted(theme.bar_tint)).border_t_1().border_color(theme.separator)
+            })
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             // ↑ is bound to the input's MoveUp action, which runs before key-down listeners.
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| this.on_move_up(window, cx)))
@@ -1164,7 +1214,8 @@ impl Render for Composer {
                         let detail = div().child(crate::mentions::display(&body_text(&m.body), &m.mentions).0);
                         let (bar, close) = field_bar("cancel-reply", Glyph::Reply, format!("Replying to {who}"), detail, &theme);
                         d.child(bar.child(close.on_click(cx.listener(|this, _, _, cx| {
-                            this.store.update(cx, |s, cx| s.set_replying_to(None, cx));
+                            let Some(chat) = this.chat.clone() else { return };
+                            this.store.update(cx, |s, cx| s.set_replying_to(&chat, None, cx));
                         }))))
                     })
                     .when(!self.attachments.is_empty() && !recording, |d| d.child(self.render_attachments(&theme, cx)))

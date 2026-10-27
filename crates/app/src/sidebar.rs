@@ -370,6 +370,8 @@ fn chat_menu(
 ) -> PopupMenu {
     let jid = chat.jid.clone();
     let mut menu = menu.min_w(px(180.));
+    let j = jid.clone();
+    menu = menu.item(menu_item(store, "Pop Out", move |s, cx| crate::mini::pop_out(s, j.clone(), cx))).separator();
     if !chat.archived {
         let pinned = chat.pinned;
         let j = jid.clone();
@@ -502,6 +504,7 @@ fn chat_row(
                 (Some(s), true, false) => format!("{s}: {}", m.text),
                 _ => m.text.clone(),
             })
+            .map(|p| crate::links::strip_bidi(&p))
             .unwrap_or_default()
     };
     let time = chat.last_message.as_ref().map(|m| sidebar_time(m.timestamp)).unwrap_or_default();
@@ -608,6 +611,12 @@ fn debug_scroll(window: &mut Window, cx: &mut App, position: Point<Pixels>, dy: 
 fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
     static WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let var = if WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 { "WA_DEBUG_UI" } else { "WA_DEBUG_UI_REOPENED" };
+    run_debug_ui_script(var, window, cx);
+}
+
+/// Runs the `WA_DEBUG_UI`-style script in env var `var` against `window` (mini windows
+/// use `WA_DEBUG_UI_MINI`).
+pub fn run_debug_ui_script<T: 'static>(var: &str, window: &mut Window, cx: &mut Context<T>) {
     let Ok(script) = std::env::var(var) else { return };
     cx.spawn_in(window, async move |_, cx| {
         cx.background_executor().timer(Duration::from_millis(2000)).await;
@@ -637,7 +646,8 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
             // Keystroke parsing wants 'static strings; a test hook can afford the leak.
             let arg: &'static str = Box::leak(arg.to_string().into_boxed_str());
             let _ = cx.update(|window, cx| match verb {
-                "click" | "rclick" => {
+                // "press" / "rpress": a frame between down and up, which InteractiveText needs.
+                "click" | "rclick" | "press" | "rpress" => {
                     // Hit testing uses the last drawn frame, which is stale with no screen.
                     #[cfg(feature = "snapshots")]
                     {
@@ -646,7 +656,7 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                     }
                     let Some((x, y)) = arg.split_once(',') else { return };
                     let position = point(px(x.trim().parse().unwrap_or(0.)), px(y.trim().parse().unwrap_or(0.)));
-                    let button = if verb == "rclick" { MouseButton::Right } else { MouseButton::Left };
+                    let button = if verb.starts_with('r') { MouseButton::Right } else { MouseButton::Left };
                     let modifiers = Modifiers::default();
                     window.dispatch_event(
                         PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }),
@@ -662,6 +672,11 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                         }),
                         cx,
                     );
+                    #[cfg(feature = "snapshots")]
+                    if verb.ends_with("press") {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    }
                     window.dispatch_event(
                         PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers, click_count: 1 }),
                         cx,
@@ -684,6 +699,11 @@ fn debug_ui_script(window: &mut Window, cx: &mut Context<Sidebar>) {
                     window.dispatch_event(PlatformInput::FileDrop(event), cx);
                 }
                 "scroll" => {
+                    #[cfg(feature = "snapshots")]
+                    {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    }
                     let (at, dy) = arg.split_once(' ').unwrap_or((arg, "0"));
                     debug_scroll(window, cx, parse_point(at), dy.trim().parse().unwrap_or(0.));
                 }

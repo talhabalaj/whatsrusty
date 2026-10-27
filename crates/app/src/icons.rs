@@ -25,6 +25,8 @@ const ARROW_DOWN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 const MAGNIFIER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="black" stroke-width="2.2"/><path d="M15 15 L20 20" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round"/></svg>"#;
 const MIC: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="8.6" y="3" width="6.8" height="11.6" rx="3.4" fill="black"/><path d="M5.6 11 A6.4 6.4 0 0 0 18.4 11 M12 17.6 V20.6" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>"#;
 const FILM: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="3.5" y="6" width="12" height="12" rx="2.6" fill="none" stroke="black" stroke-width="1.9"/><path d="M15.5 10.6 L20.5 7.8 V16.2 L15.5 13.4" fill="none" stroke="black" stroke-width="1.9" stroke-linejoin="round"/></svg>"#;
+const POP_OUT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10.5 4.5 H7 A3 3 0 0 0 4 7.5 V17 A3 3 0 0 0 7 20 H16.5 A3 3 0 0 0 19.5 17 V13.5" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round"/><path d="M14 4 H20 V10 M19.6 4.4 L11.5 12.5" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const EXPAND: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14 4.5 H19.5 V10 M19.2 4.8 L13.5 10.5 M10 19.5 H4.5 V14 M4.8 19.2 L10.5 13.5" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 #[derive(Clone, Copy)]
 pub enum Glyph {
@@ -48,6 +50,8 @@ pub enum Glyph {
     Magnifier,
     Mic,
     Film,
+    PopOut,
+    Expand,
 }
 
 pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
@@ -72,6 +76,8 @@ pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
         Glyph::Magnifier => MAGNIFIER,
         Glyph::Mic => MIC,
         Glyph::Film => FILM,
+        Glyph::PopOut => POP_OUT,
+        Glyph::Expand => EXPAND,
     };
     Icon::default().data(svg.as_bytes()).size(px(size)).text_color(color)
 }

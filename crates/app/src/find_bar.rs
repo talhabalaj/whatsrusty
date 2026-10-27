@@ -89,7 +89,8 @@ impl Render for FindBar {
             .flex()
             .items_center()
             .gap(px(8.))
-            .bg(theme.header_bg)
+            .relative()
+            .child(crate::chrome::frosted(theme.bar_tint))
             .border_b_1()
             .border_color(theme.separator)
             .capture_action(cx.listener(|_, _: &Escape, _, cx| {

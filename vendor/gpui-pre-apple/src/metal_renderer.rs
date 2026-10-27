@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -157,6 +157,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur: BackdropBlurPipelines,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -438,6 +439,8 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let backdrop_blur = BackdropBlurPipelines::new(&device, &library);
+
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
@@ -478,6 +481,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrop_blur,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -592,6 +596,11 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        // whatsapp-gpui patch: a backdrop blur samples the frame drawn so far. Only windows
+        // that ever blur give up framebuffer-only drawables.
+        if !scene.backdrop_blurs.is_empty() && layer.framebuffer_only() {
+            layer.set_framebuffer_only(false);
+        }
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -963,12 +972,137 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    command_encoder.end_encoding();
+                    for blur in &scene.backdrop_blurs[range] {
+                        self.draw_backdrop_blur(blur, texture, viewport_size, command_buffer);
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                }
             }
         }
 
         command_encoder.end_encoding();
 
         Ok(())
+    }
+
+    /// whatsapp-gpui patch: blurs the frame under `blur` and draws it back over its bounds.
+    /// Works on the sampled region only, at 1/scale resolution: downsample, a horizontal and
+    /// a vertical gaussian pass between two scratch textures, then the composite.
+    fn draw_backdrop_blur(
+        &mut self,
+        blur: &BackdropBlur,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        let sigma = blur.radius.0.max(0.);
+        let (width, height) = (viewport_size.width.0, viewport_size.height.0);
+        if width <= 0 || height <= 0 || texture.framebuffer_only() {
+            return;
+        }
+        // Gaussian passes stay within ~4 sigma of reach at most.
+        let scale: u32 = match sigma {
+            s if s < 3. => 1,
+            s if s < 6. => 2,
+            s if s < 12. => 4,
+            _ => 8,
+        };
+        let sample = blur.sample_bounds();
+        let to_texels = |v: f32, max: i32, round: fn(f32) -> f32| {
+            (round(v / scale as f32) as i32).clamp(0, max)
+        };
+        let (tex_w, tex_h) = (
+            (width as u32).div_ceil(scale) as i32,
+            (height as u32).div_ceil(scale) as i32,
+        );
+        let region_min = [
+            to_texels(sample.origin.x.0, tex_w, f32::floor),
+            to_texels(sample.origin.y.0, tex_h, f32::floor),
+        ];
+        let region_max = [
+            to_texels(sample.right().0, tex_w, f32::ceil),
+            to_texels(sample.bottom().0, tex_h, f32::ceil),
+        ];
+        if region_max[0] <= region_min[0] || region_max[1] <= region_min[1] {
+            return;
+        }
+        let (first, second) = self
+            .backdrop_blur
+            .scratch_textures(&self.device, scale, tex_w as u64, tex_h as u64);
+        let scissor = metal::MTLScissorRect {
+            x: region_min[0] as u64,
+            y: region_min[1] as u64,
+            width: (region_max[0] - region_min[0]) as u64,
+            height: (region_max[1] - region_min[1]) as u64,
+        };
+        let mut pass = BackdropBlurPass {
+            region_min,
+            region_max,
+            direction: [0, 0],
+            sigma: (sigma / scale as f32).max(0.5),
+            scale,
+        };
+        let run_pass = |pipeline: &metal::RenderPipelineStateRef,
+                        source: &metal::TextureRef,
+                        target: &metal::TextureRef,
+                        pass: &BackdropBlurPass| {
+            let descriptor = metal::RenderPassDescriptor::new();
+            let attachment = descriptor.color_attachments().object_at(0).unwrap();
+            attachment.set_texture(Some(target));
+            attachment.set_load_action(metal::MTLLoadAction::DontCare);
+            attachment.set_store_action(metal::MTLStoreAction::Store);
+            let encoder = command_buffer.new_render_command_encoder(descriptor);
+            encoder.set_render_pipeline_state(pipeline);
+            encoder.set_scissor_rect(scissor);
+            encoder.set_fragment_bytes(
+                0,
+                mem::size_of::<BackdropBlurPass>() as u64,
+                pass as *const BackdropBlurPass as *const c_void,
+            );
+            encoder.set_fragment_texture(0, Some(source));
+            encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+            encoder.end_encoding();
+        };
+        let pipelines = &self.backdrop_blur;
+        run_pass(&pipelines.downsample, texture, &first, &pass);
+        pass.direction = [1, 0];
+        run_pass(&pipelines.gaussian, &first, &second, &pass);
+        pass.direction = [0, 1];
+        run_pass(&pipelines.gaussian, &second, &first, &pass);
+
+        let encoder = new_command_encoder_for_texture(command_buffer, texture, viewport_size, None);
+        encoder.set_render_pipeline_state(&pipelines.composite);
+        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        encoder.set_vertex_bytes(
+            1,
+            mem::size_of::<BackdropBlur>() as u64,
+            blur as *const BackdropBlur as *const c_void,
+        );
+        encoder.set_vertex_bytes(
+            2,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        encoder.set_fragment_bytes(
+            1,
+            mem::size_of::<BackdropBlur>() as u64,
+            blur as *const BackdropBlur as *const c_void,
+        );
+        encoder.set_fragment_bytes(
+            3,
+            mem::size_of::<BackdropBlurPass>() as u64,
+            &pass as *const BackdropBlurPass as *const c_void,
+        );
+        encoder.set_fragment_texture(0, Some(&first));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
     }
 
     fn draw_paths_to_intermediate(
@@ -2019,3 +2153,84 @@ mod tests {
 // whatsapp-gpui patch: kept out of this file, which cbindgen scans for the shader header.
 #[path = "frame_stats.rs"]
 mod frame_stats;
+/// whatsapp-gpui patch: mirrors `BackdropBlurPass` in shaders.metal.
+#[repr(C)]
+struct BackdropBlurPass {
+    region_min: [i32; 2],
+    region_max: [i32; 2],
+    direction: [i32; 2],
+    sigma: f32,
+    scale: u32,
+}
+
+struct BackdropBlurPipelines {
+    downsample: metal::RenderPipelineState,
+    gaussian: metal::RenderPipelineState,
+    composite: metal::RenderPipelineState,
+    /// Two viewport/scale sized textures per downsample factor in use.
+    scratch: Vec<(u32, metal::Texture, metal::Texture)>,
+}
+
+impl BackdropBlurPipelines {
+    fn new(device: &metal::DeviceRef, library: &metal::LibraryRef) -> Self {
+        let pass = |label: &str, fragment: &str| {
+            let descriptor = metal::RenderPipelineDescriptor::new();
+            descriptor.set_label(label);
+            let vertex_fn = library
+                .get_function("backdrop_blur_pass_vertex", None)
+                .expect("error locating vertex function");
+            let fragment_fn = library
+                .get_function(fragment, None)
+                .expect("error locating fragment function");
+            descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+            descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+            let attachment = descriptor.color_attachments().object_at(0).unwrap();
+            attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            attachment.set_blending_enabled(false);
+            device
+                .new_render_pipeline_state(&descriptor)
+                .expect("could not create render pipeline state")
+        };
+        Self {
+            downsample: pass(
+                "backdrop_blur_downsample",
+                "backdrop_blur_downsample_fragment",
+            ),
+            gaussian: pass("backdrop_blur_gaussian", "backdrop_blur_gaussian_fragment"),
+            composite: build_pipeline_state(
+                device,
+                library,
+                "backdrop_blur_composite",
+                "backdrop_blur_composite_vertex",
+                "backdrop_blur_composite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+            ),
+            scratch: Vec::new(),
+        }
+    }
+
+    fn scratch_textures(
+        &mut self,
+        device: &metal::DeviceRef,
+        scale: u32,
+        width: u64,
+        height: u64,
+    ) -> (metal::Texture, metal::Texture) {
+        self.scratch.retain(|(s, texture, _)| {
+            *s != scale || (texture.width() == width && texture.height() == height)
+        });
+        if let Some((_, first, second)) = self.scratch.iter().find(|(s, ..)| *s == scale) {
+            return (first.clone(), second.clone());
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let first = device.new_texture(&descriptor);
+        let second = device.new_texture(&descriptor);
+        self.scratch.push((scale, first.clone(), second.clone()));
+        (first, second)
+    }
+}

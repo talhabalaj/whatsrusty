@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
+use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
 use wa_backend::{
     BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, MessageBody, SearchHit,
 };
@@ -16,6 +16,10 @@ pub enum StoreEvent {
     TranscriptChanged { chat_jid: String, change: Change },
     /// The account ended (logout / unlinked): drop drafts and anything account-specific.
     AccountReset,
+    /// A chat's draft was saved, so other composers on the same chat can follow it.
+    DraftChanged { chat_jid: String },
+    /// A LID chat became a phone-number chat: views bound to `from` move to `to`.
+    ChatMerged { from: String, to: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +47,13 @@ impl Draft {
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.attachments.is_empty()
     }
+}
+
+/// A chat shown in its own small window (see `mini.rs`).
+pub struct Popped {
+    pub window: AnyWindowHandle,
+    /// Its transcript shows the newest messages (not scrolled up).
+    pub at_latest: bool,
 }
 
 /// Paging state of one chat's transcript.
@@ -91,10 +102,12 @@ pub struct Store {
     /// Downloads requested and not yet answered (cleared when the backend reports back,
     /// so "retry" works after a failure).
     media_requested: HashSet<(String, String)>,
-    /// Message being replied to in the selected chat's composer.
-    pub replying_to: Option<ChatMessage>,
-    /// Photo shown full-window over the app.
+    /// Message being replied to, per chat (shared by the main and mini windows).
+    replying: HashMap<String, ChatMessage>,
+    /// Photo shown full-window over the app, and the mini window's chat it opened in
+    /// (`None`: the main window).
     pub lightbox: Option<PathBuf>,
+    pub lightbox_in: Option<String>,
     /// JID whose info panel is open, and the profiles loaded so far.
     pub profile_open: Option<String>,
     pub profiles: HashMap<String, wa_backend::Profile>,
@@ -113,6 +126,9 @@ pub struct Store {
     stay_deselected: bool,
     /// Unsent text and attachments per chat.
     pub drafts: HashMap<String, Draft>,
+    pub main_window: Option<AnyWindowHandle>,
+    /// Chats popped out into mini windows.
+    pub popped: HashMap<String, Popped>,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
@@ -149,8 +165,9 @@ impl Store {
             avatar_requested: HashSet::new(),
             avatar_loading: HashSet::new(),
             media_requested: HashSet::new(),
-            replying_to: None,
+            replying: HashMap::new(),
             lightbox: None,
+            lightbox_in: None,
             profile_open: None,
             profiles: HashMap::new(),
             stickers: Vec::new(),
@@ -161,6 +178,8 @@ impl Store {
             phone_lookups: HashMap::new(),
             stay_deselected: false,
             drafts: HashMap::new(),
+            main_window: None,
+            popped: HashMap::new(),
         }
     }
 
@@ -254,7 +273,7 @@ impl Store {
                     cx.emit(StoreEvent::TranscriptChanged { chat_jid: chat_jid.clone(), change: Change::Appended });
                 }
                 // Only acknowledge what the user can actually see.
-                if !from_me && self.selected.as_deref() == Some(chat_jid.as_str()) && cx.active_window().is_some() {
+                if !from_me && self.chat_on_screen(&chat_jid, cx) {
                     self.send(Command::MarkRead { chat_jid });
                 }
             }
@@ -262,8 +281,8 @@ impl Store {
                 for id in &message_ids {
                     self.media_requested.remove(&(chat_jid.clone(), id.clone()));
                 }
-                if self.replying_to.as_ref().is_some_and(|m| message_ids.contains(&m.id)) {
-                    self.replying_to = None;
+                if self.replying.get(&chat_jid).is_some_and(|m| message_ids.contains(&m.id)) {
+                    self.replying.remove(&chat_jid);
                 }
                 if let Some(list) = self.messages.get_mut(&chat_jid) {
                     list.retain(|m| !message_ids.contains(&m.id));
@@ -307,13 +326,17 @@ impl Store {
                 }
             },
             Event::Notify { chat_jid, message_id, title, body } => {
-                // Like Messages: no banner for the conversation you're looking at.
-                let focused = cx.active_window().is_some() && self.selected.as_deref() == Some(chat_jid.as_str());
-                if !focused {
+                // Like Messages: no banner for the conversation you're looking at, or one
+                // popped out into a visible mini window.
+                let focused = self.main_active(cx) && self.selected.as_deref() == Some(chat_jid.as_str());
+                let popped = self.popped.get(&chat_jid).map(|p| p.window);
+                let mini_visible = popped.is_some_and(|w| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false));
+                log::debug!("notify {chat_jid}: focused={focused} mini_visible={mini_visible}");
+                if !focused && !mini_visible {
                     cx.show_system_notification(SystemNotification {
                         tag: chat_jid.into(),
-                        title: title.into(),
-                        body: body.into(),
+                        title: crate::links::strip_bidi(&title).into(),
+                        body: crate::links::strip_bidi(&body).into(),
                         actions: Vec::new(),
                     });
                 }
@@ -338,16 +361,12 @@ impl Store {
         if self.selected.as_deref() == Some(jid.as_str()) {
             return;
         }
-        if self.requested.insert(jid.clone()) {
-            self.messages.entry(jid.clone()).or_default();
-            self.history.entry(jid.clone()).or_default().page_pending = true;
-            self.send(Command::LoadMessages { chat_jid: jid.clone(), before: None, limit: 100 });
-        }
-        if cx.active_window().is_some() && self.chats.iter().any(|c| c.jid == jid && c.unread_count > 0) {
+        self.ensure_loaded(&jid);
+        if self.main_active(cx) && self.chats.iter().any(|c| c.jid == jid && c.unread_count > 0) {
             self.send(Command::MarkRead { chat_jid: jid.clone() });
         }
         if self.selected.as_deref() != Some(jid.as_str()) {
-            self.replying_to = None;
+            self.drop_reply_of_selected();
             // An open info panel follows the conversation, like Messages' details pane.
             if self.profile_open.is_some() && self.profile_open == self.selected {
                 self.request_profile(&jid, cx);
@@ -363,17 +382,78 @@ impl Store {
         cx.notify();
     }
 
-    /// Request the page before the oldest loaded message of the selected chat.
+    /// Ask for a chat's newest messages the first time it's shown (selected or popped out).
+    pub fn ensure_loaded(&mut self, jid: &str) {
+        if self.requested.insert(jid.to_string()) {
+            self.messages.entry(jid.to_string()).or_default();
+            self.history.entry(jid.to_string()).or_default().page_pending = true;
+            self.send(Command::LoadMessages { chat_jid: jid.to_string(), before: None, limit: 100 });
+        }
+    }
+
+    /// Leaving the selected chat drops its reply, unless a mini window still shows it.
+    fn drop_reply_of_selected(&mut self) {
+        if let Some(old) = &self.selected
+            && !self.popped.contains_key(old)
+        {
+            self.replying.remove(old);
+        }
+    }
+
+    /// The main window is the key window.
+    pub fn main_active(&self, cx: &App) -> bool {
+        cx.active_window().is_some_and(|w| Some(w) == self.main_window)
+    }
+
+    /// `chat` is in front of the user: selected in the active main window, or in the key
+    /// mini window showing its newest messages.
+    pub fn chat_on_screen(&self, chat: &str, cx: &App) -> bool {
+        (self.selected.as_deref() == Some(chat) && self.main_active(cx))
+            || self.popped.get(chat).is_some_and(|p| p.at_latest && cx.active_window() == Some(p.window))
+    }
+
+    /// Acknowledge a chat that's on screen in a mini window (it became key, or was
+    /// scrolled back to the newest messages).
+    pub fn mark_read_if_unread(&self, chat: &str) {
+        if self.chats.iter().any(|c| c.jid == chat && c.unread_count > 0) {
+            self.send(Command::MarkRead { chat_jid: chat.to_string() });
+        }
+    }
+
+    pub fn set_popped(&mut self, chat: &str, window: Option<AnyWindowHandle>) {
+        match window {
+            Some(window) => {
+                self.ensure_loaded(chat);
+                self.popped.insert(chat.to_string(), Popped { window, at_latest: true });
+            }
+            None => {
+                self.popped.remove(chat);
+                if self.selected.as_deref() != Some(chat) {
+                    self.replying.remove(chat);
+                }
+            }
+        }
+    }
+
+    pub fn set_mini_at_latest(&mut self, chat: &str, at_latest: bool, cx: &mut Context<Self>) {
+        let Some(p) = self.popped.get_mut(chat) else { return };
+        p.at_latest = at_latest;
+        if self.chat_on_screen(chat, cx) {
+            self.mark_read_if_unread(chat);
+        }
+    }
+
+    /// Request the page before the oldest loaded message of `chat`.
     /// Called when the transcript is scrolled near its top.
-    pub fn load_older(&mut self, cx: &mut Context<Self>) {
-        self.load_older_by(100, false, cx);
+    pub fn load_older(&mut self, chat: &str, cx: &mut Context<Self>) {
+        self.load_older_by(chat, 100, false, cx);
     }
 
     /// Like `load_older`, with a page of `limit` messages (bigger when jumping back to a
     /// quoted message or search hit). `force` skips the pause after an empty answer (an
     /// explicit jump, not scrolling). Returns whether a page was requested.
-    pub fn load_older_by(&mut self, limit: u32, force: bool, cx: &mut Context<Self>) -> bool {
-        let Some(jid) = self.selected.clone() else { return false };
+    pub fn load_older_by(&mut self, chat: &str, limit: u32, force: bool, cx: &mut Context<Self>) -> bool {
+        let jid = chat.to_string();
         let Some(oldest) = self.messages.get(&jid).and_then(|m| m.first()).map(|m| m.timestamp) else { return false };
         let h = self.history.entry(jid.clone()).or_default();
         if !h.has_more || h.page_pending || h.fetching_remote || (!force && h.retry_after.is_some_and(|t| Instant::now() < t)) {
@@ -419,6 +499,16 @@ impl Store {
         if let Some(d) = self.drafts.remove(&from) {
             self.drafts.entry(to.clone()).or_insert(d);
         }
+        if let Some(r) = self.replying.remove(&from) {
+            self.replying.entry(to.clone()).or_insert(r);
+        }
+        if let Some(p) = self.popped.remove(&from) {
+            self.popped.entry(to.clone()).or_insert(p);
+        }
+        if self.lightbox_in.as_deref() == Some(from.as_str()) {
+            self.lightbox_in = Some(to.clone());
+        }
+        cx.emit(StoreEvent::ChatMerged { from: from.clone(), to: to.clone() });
         if was_loaded {
             self.requested.insert(to.clone());
             self.messages.entry(to.clone()).or_default();
@@ -447,8 +537,9 @@ impl Store {
         self.avatar_requested.clear();
         self.avatar_loading.clear();
         self.media_requested.clear();
-        self.replying_to = None;
+        self.replying.clear();
         self.lightbox = None;
+        self.lightbox_in = None;
         self.profile_open = None;
         self.profiles.clear();
         self.stickers.clear();
@@ -475,42 +566,34 @@ impl Store {
         .detach();
     }
 
-    pub fn selected_history(&self) -> History {
-        self.selected.as_ref().and_then(|j| self.history.get(j)).copied().unwrap_or_default()
-    }
-
-    pub fn selected_chat(&self) -> Option<&ChatSummary> {
-        let jid = self.selected.as_deref()?;
-        self.chats.iter().find(|c| c.jid == jid)
+    pub fn history_of(&self, chat: &str) -> History {
+        self.history.get(chat).copied().unwrap_or_default()
     }
 
     /// `mentions`: JIDs whose `@<digits>` are in `text`.
-    pub fn send_text(&mut self, text: String, mentions: Vec<String>, cx: &mut Context<Self>) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    pub fn send_text(&mut self, chat_jid: String, text: String, mentions: Vec<String>, cx: &mut Context<Self>) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
         let client_id = self.new_sent_id();
-        let reply_to = self.replying_to.take().map(|m| m.id);
+        let reply_to = self.replying.remove(&chat_jid).map(|m| m.id);
         self.send(Command::SendText { chat_jid, text, client_id, reply_to, mentions });
         cx.notify();
     }
 
     /// Any file but photos (videos, documents); see [`Command::SendFile`].
-    pub fn send_file(&mut self, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    pub fn send_file(&mut self, chat_jid: String, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
         let client_id = self.new_sent_id();
-        let reply_to = self.replying_to.take().map(|m| m.id);
+        let reply_to = self.replying.remove(&chat_jid).map(|m| m.id);
         self.send(Command::SendFile { chat_jid, path, caption, client_id, reply_to });
         cx.notify();
     }
 
     /// A recorded voice note (mono PCM).
-    pub fn send_voice(&mut self, samples: Vec<i16>, sample_rate: u32, cx: &mut Context<Self>) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    pub fn send_voice(&mut self, chat_jid: String, samples: Vec<i16>, sample_rate: u32, cx: &mut Context<Self>) {
         let client_id = self.new_sent_id();
-        let reply_to = self.replying_to.take().map(|m| m.id);
+        let reply_to = self.replying.remove(&chat_jid).map(|m| m.id);
         self.send(Command::SendVoice { chat_jid, samples, sample_rate, client_id, reply_to });
         cx.notify();
     }
@@ -523,13 +606,17 @@ impl Store {
         client_id
     }
 
-    /// Store (or drop, when empty) the composer's draft for `chat`. No notify: only the
-    /// composer reads it.
-    pub fn save_draft(&mut self, chat: &str, draft: Draft) {
+    /// Store (or drop, when empty) the composer's draft for `chat`. No notify (only
+    /// composers read it); an event lets another window's composer on the chat follow.
+    pub fn save_draft(&mut self, chat: &str, draft: Draft, cx: &mut Context<Self>) {
+        let old = self.drafts.get(chat).cloned().unwrap_or_default();
         if draft.is_empty() {
             self.drafts.remove(chat);
         } else {
             self.drafts.insert(chat.to_string(), draft);
+        }
+        if self.drafts.get(chat).cloned().unwrap_or_default() != old {
+            cx.emit(StoreEvent::DraftChanged { chat_jid: chat.to_string() });
         }
     }
 
@@ -550,19 +637,17 @@ impl Store {
         self.send(Command::ListStickers);
     }
 
-    pub fn send_sticker(&mut self, sticker_id: String, cx: &mut Context<Self>) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    pub fn send_sticker(&mut self, chat_jid: String, sticker_id: String, cx: &mut Context<Self>) {
         let client_id = wa_backend::new_message_id();
         self.just_sent.insert(client_id.clone(), Instant::now());
-        let reply_to = self.replying_to.take().map(|m| m.id);
+        let reply_to = self.replying.remove(&chat_jid).map(|m| m.id);
         self.send(Command::SendSticker { chat_jid, sticker_id, client_id, reply_to });
         cx.notify();
     }
 
-    pub fn send_image(&mut self, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    pub fn send_image(&mut self, chat_jid: String, path: PathBuf, caption: Option<String>, cx: &mut Context<Self>) {
         let client_id = self.new_sent_id();
-        let reply_to = self.replying_to.take().map(|m| m.id);
+        let reply_to = self.replying.remove(&chat_jid).map(|m| m.id);
         self.send(Command::SendImage { chat_jid, path, caption, client_id, reply_to });
         cx.notify();
     }
@@ -602,7 +687,13 @@ impl Store {
     }
 
     pub fn open_lightbox(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_lightbox_in(path, None, cx);
+    }
+
+    /// `mini`: the popped-out chat whose window shows it (`None`: the main window).
+    pub fn open_lightbox_in(&mut self, path: PathBuf, mini: Option<String>, cx: &mut Context<Self>) {
         self.lightbox = Some(path);
+        self.lightbox_in = mini;
         cx.notify();
     }
 
@@ -643,11 +734,10 @@ impl Store {
         }
     }
 
-    /// My most recent message in the selected chat that can still be edited (↑ in an
+    /// My most recent message in `chat` that can still be edited (↑ in an
     /// empty composer).
-    pub fn last_editable(&self) -> Option<ChatMessage> {
-        let jid = self.selected.as_ref()?;
-        let list = self.messages.get(jid)?;
+    pub fn last_editable(&self, chat: &str) -> Option<ChatMessage> {
+        let list = self.messages.get(chat)?;
         list.iter().rev().find(|m| m.from_me).filter(|m| Self::can_edit(m)).cloned()
     }
 
@@ -680,8 +770,15 @@ impl Store {
         cx.notify();
     }
 
-    pub fn set_replying_to(&mut self, message: Option<ChatMessage>, cx: &mut Context<Self>) {
-        self.replying_to = message;
+    pub fn replying_to(&self, chat: &str) -> Option<&ChatMessage> {
+        self.replying.get(chat)
+    }
+
+    pub fn set_replying_to(&mut self, chat: &str, message: Option<ChatMessage>, cx: &mut Context<Self>) {
+        match message {
+            Some(m) => self.replying.insert(chat.to_string(), m),
+            None => self.replying.remove(chat),
+        };
         cx.notify();
     }
 
@@ -716,12 +813,6 @@ impl Store {
     /// Animation start for a message this window just sent (cleared after a second).
     pub fn sent_at(&self, id: &str) -> Option<Instant> {
         self.just_sent.get(id).copied().filter(|t| t.elapsed().as_millis() < 1200)
-    }
-
-    pub fn set_typing(&self, typing: bool) {
-        if let Some(chat_jid) = self.selected.clone() {
-            self.send(Command::SetTyping { chat_jid, typing });
-        }
     }
 
     pub fn set_typing_in(&self, chat_jid: &str, typing: bool) {
@@ -759,9 +850,10 @@ impl Store {
     }
 
     pub fn deselect(&mut self, cx: &mut Context<Self>) {
-        if self.selected.take().is_some() {
+        if self.selected.is_some() {
+            self.drop_reply_of_selected();
+            self.selected = None;
             self.stay_deselected = true;
-            self.replying_to = None;
             cx.notify();
         }
     }
@@ -851,9 +943,9 @@ impl Store {
         cx.notify();
     }
 
-    /// Search the selected chat's stored messages; the answer lands in `search_results`.
-    pub fn search(&mut self, query: &str) {
-        let Some(chat_jid) = self.selected.clone() else { return };
+    /// Search a chat's stored messages; the answer lands in `search_results`.
+    pub fn search(&mut self, chat: &str, query: &str) {
+        let chat_jid = chat.to_string();
         self.search_results = None;
         if !query.trim().is_empty() {
             self.send(Command::SearchMessages { chat_jid, query: query.to_string() });

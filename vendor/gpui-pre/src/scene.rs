@@ -50,6 +50,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    // whatsapp-gpui patch: in-window backdrop blur.
+    pub backdrop_blurs: Vec<BackdropBlur>,
     // whatsapp-gpui patch: panes. Primitives painted inside a pane go to the pane's own
     // scene, in pane-local coordinates, so the platform can draw them into a separate
     // surface (e.g. one hosted inside an NSGlassEffectView, above the main surface).
@@ -116,6 +118,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
         // Keep the pane scenes' allocations for the next frame.
         for pane in &mut self.panes[..self.active_panes] {
             pane.scene.clear();
@@ -219,11 +222,17 @@ impl Scene {
             return None;
         }
 
+        // A blur reads everything under the region it samples, so it must be ordered
+        // after whatever overlaps that region, not only its own bounds.
+        let order_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) => blur.sample_bounds(),
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(order_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -258,6 +267,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
+            }
         }
         Some(primitive)
     }
@@ -286,6 +299,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
         for pane in &mut self.panes[..self.active_panes] {
             pane.scene.finish();
         }
@@ -316,6 +330,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -338,6 +354,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    BackdropBlur,
 }
 
 pub(crate) enum PaintOperation {
@@ -359,6 +376,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    BackdropBlur(BackdropBlur),
 }
 
 #[expect(missing_docs)]
@@ -373,6 +391,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
         }
     }
 
@@ -428,6 +447,11 @@ impl Primitive {
                 s.bounds.origin = s.bounds.origin - origin;
                 mask(&mut s.content_mask, origin);
             }
+            // Inside a pane a blur only sees the pane's own content.
+            Primitive::BackdropBlur(b) => {
+                b.bounds.origin = b.bounds.origin - origin;
+                mask(&mut b.content_mask, origin);
+            }
         }
         p
     }
@@ -442,6 +466,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
         }
     }
 }
@@ -470,6 +495,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -502,6 +529,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -648,6 +679,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::BackdropBlur => {
+                let blurs_start = self.backdrop_blurs_start;
+                let mut blurs_end = blurs_start + 1;
+                self.backdrop_blurs_iter.next();
+                while self
+                    .backdrop_blurs_iter
+                    .next_if(|blur| (blur.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    blurs_end += 1;
+                }
+                self.backdrop_blurs_start = blurs_end;
+                Some(PrimitiveBatch::BackdropBlurs(blurs_start..blurs_end))
+            }
         }
     }
 }
@@ -680,6 +725,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// whatsapp-gpui patch: renderers that don't support it may skip these.
+    BackdropBlurs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -712,7 +759,38 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
         }
+    }
+}
+
+/// whatsapp-gpui patch: blurs what was drawn under `bounds` (a gaussian with standard
+/// deviation `radius`, like CSS `backdrop-filter: blur()`), clipped to the rounded rect.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BackdropBlur {
+    pub order: DrawOrder,
+    pub pad: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub radius: ScaledPixels,
+    pub pad2: u32,
+}
+
+impl BackdropBlur {
+    /// The region whose pixels contribute to the blur (three standard deviations out).
+    pub fn sample_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+            .intersect(&self.content_mask.bounds)
+            .dilate(self.radius * 3.)
+    }
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 

@@ -17,7 +17,7 @@ use crate::glass;
 use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
 use crate::forward_picker::{ForwardEvent, ForwardPicker};
 use crate::format::{short_time, transcript_time};
-use crate::chrome::surface;
+use crate::chrome::{frosted, surface};
 use crate::icons::{Glyph, glyph};
 use crate::state::{Change, Store, StoreEvent};
 use crate::theme::Theme;
@@ -28,6 +28,8 @@ const GROUP_GAP_SECS: i64 = 5 * 60;
 const SEPARATOR_GAP_SECS: i64 = 60 * 60;
 use crate::kinds::BUBBLE_RADIUS;
 const HEADER_HEIGHT: f32 = 52.;
+/// The mini window's header, its traffic lights inside it.
+pub const MINI_HEADER_HEIGHT: f32 = 40.;
 /// Space reserved under the transcript for the floating composer.
 const COMPOSER_CLEARANCE: f32 = 78.;
 const IMAGE_MAX_W: f32 = 260.;
@@ -46,6 +48,42 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-f", FindInChat, None), KeyBinding::new("cmd-f", FindInChat, Some("Input"))]);
 }
 
+/// Which chat a conversation view shows: the main window follows the selection, a mini
+/// window sticks to one chat.
+#[derive(Clone, PartialEq)]
+pub enum ChatBinding {
+    Selected,
+    Fixed(String),
+}
+
+impl ChatBinding {
+    pub fn chat(&self, store: &Store) -> Option<String> {
+        match self {
+            ChatBinding::Selected => store.selected.clone(),
+            ChatBinding::Fixed(jid) => Some(jid.clone()),
+        }
+    }
+
+    /// The popped-out chat, for a mini window's view.
+    pub fn fixed(&self) -> Option<&str> {
+        match self {
+            ChatBinding::Selected => None,
+            ChatBinding::Fixed(jid) => Some(jid),
+        }
+    }
+
+    /// A merged chat (LID → phone number) keeps its mini window.
+    pub fn follow_merge(&mut self, from: &str, to: &str) -> bool {
+        match self {
+            ChatBinding::Fixed(jid) if jid == from => {
+                *jid = to.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Row {
     Separator(i64),
@@ -55,6 +93,7 @@ enum Row {
 
 pub struct Conversation {
     store: Entity<Store>,
+    binding: ChatBinding,
     composer: Entity<Composer>,
     list: ListState,
     rows: Vec<Row>,
@@ -69,6 +108,8 @@ pub struct Conversation {
     menu_at: Option<Point<Pixels>>,
     /// Message whose "Delete…" confirmation is showing.
     confirm_delete: Option<ChatMessage>,
+    /// Suspicious link clicked: "This link may not be what it looks like" is showing.
+    confirm_link: Option<crate::links::Link>,
     forward: Option<(Entity<ForwardPicker>, Subscription)>,
     find: Option<Find>,
     /// A quoted message / search hit to scroll to once it's loaded.
@@ -80,6 +121,9 @@ pub struct Conversation {
     away: Rc<Cell<bool>>,
     /// Messages that arrived while scrolled up (the scroll-to-bottom badge).
     unseen: usize,
+    /// `away` as last told to the store (mini windows: read receipts need the newest
+    /// messages on screen).
+    reported_away: bool,
     /// A short-lived status pill ("Forwarded to …").
     notice: Option<String>,
     _timers: Vec<Task<()>>,
@@ -109,20 +153,32 @@ struct Find {
 }
 
 impl Conversation {
-    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx));
+    pub fn new(store: Entity<Store>, binding: ChatBinding, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let composer = cx.new(|cx| Composer::new(store.clone(), binding.clone(), window, cx));
         let subs = vec![
             cx.observe(&store, |this, _, cx| this.sync_header(cx)),
             cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| match ev {
                 StoreEvent::TranscriptChanged { chat_jid, change } => {
-                    if this.store.read(cx).selected.as_deref() == Some(chat_jid.as_str()) {
+                    if this.binding.chat(this.store.read(cx)).as_deref() == Some(chat_jid.as_str()) {
                         this.rebuild(*change, cx);
+                    }
+                }
+                // The composer's attachment tray changes the transcript's bottom inset.
+                StoreEvent::DraftChanged { chat_jid } => {
+                    if this.chat_jid.as_deref() == Some(chat_jid.as_str()) {
+                        cx.notify();
+                    }
+                }
+                StoreEvent::ChatMerged { from, to } => {
+                    if this.binding.follow_merge(from, to) {
+                        this.rebuild(Change::Appended, cx);
                     }
                 }
                 StoreEvent::AccountReset => {
                     this.find = None;
                     this.forward = None;
                     this.confirm_delete = None;
+                    this.confirm_link = None;
                     this.pending_jump = None;
                     this.rows.clear();
                     this.messages.clear();
@@ -145,6 +201,7 @@ impl Conversation {
         });
         let mut this = Self {
             store,
+            binding,
             composer,
             list,
             rows: Vec::new(),
@@ -156,6 +213,7 @@ impl Conversation {
             picker_for: None,
             menu_at: None,
             confirm_delete: None,
+            confirm_link: None,
             forward: None,
             find: None,
             pending_jump: None,
@@ -163,19 +221,22 @@ impl Conversation {
             highlight_gen: 0,
             away,
             unseen: 0,
+            reported_away: false,
             notice: None,
             _timers: Vec::new(),
             _subs: subs,
         };
-        this.debug_hooks(window, cx);
+        if this.binding == ChatBinding::Selected {
+            this.debug_hooks(window, cx);
+        }
         // A reopened window starts on whatever chat the store already has selected.
         this.rebuild(Change::Appended, cx);
         this
     }
 
     fn sync_header(&mut self, cx: &mut Context<Self>) {
-        let selected = self.store.read(cx).selected.clone();
-        if selected != self.chat_jid {
+        let bound = self.binding.chat(self.store.read(cx));
+        if bound != self.chat_jid {
             // `rebuild` notices the switch (and resets per-chat state) itself.
             self.rebuild(Change::Appended, cx);
         } else {
@@ -184,7 +245,7 @@ impl Conversation {
                 self.refresh_matches(cx);
             }
             // A history fetch finishing (no transcript change) lets a jump page on.
-            let h = self.store.read(cx).selected_history();
+            let h = self.chat_jid.as_ref().map(|c| self.store.read(cx).history_of(c)).unwrap_or_default();
             if self.pending_jump.is_some() && !h.page_pending && !h.fetching_remote {
                 self.try_jump(cx);
             }
@@ -194,9 +255,10 @@ impl Conversation {
 
     fn rebuild(&mut self, change: Change, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let switched = store.selected != self.chat_jid;
-        self.chat_jid = store.selected.clone();
-        self.is_group = store.selected_chat().is_some_and(|c| c.is_group);
+        let bound = self.binding.chat(store);
+        let switched = bound != self.chat_jid;
+        self.chat_jid = bound;
+        self.is_group = self.chat_jid.as_ref().is_some_and(|j| store.chats.iter().any(|c| &c.jid == j && c.is_group));
         // Where the previously-first message sat, to splice older rows in above it.
         let old_first = self.messages.first().map(|m| m.id.clone());
         let old_first_row = self.rows.iter().position(|r| matches!(r, Row::Message { .. }));
@@ -214,6 +276,7 @@ impl Conversation {
             self.pending_jump = None;
             self.highlight = None;
             self.confirm_delete = None;
+            self.confirm_link = None;
             self.picker_for = None;
             self.find = None;
         }
@@ -351,15 +414,16 @@ impl Conversation {
             self.pending_jump = None;
             return;
         }
+        let Some(chat) = self.chat_jid.clone() else { return };
         let (store, view) = (self.store.clone(), cx.entity().downgrade());
         let exhausted = jump.pages >= JUMP_MAX_PAGES;
         cx.defer(move |cx| {
-            if !exhausted && store.update(cx, |s, cx| s.load_older_by(JUMP_PAGE, true, cx)) {
+            if !exhausted && store.update(cx, |s, cx| s.load_older_by(&chat, JUMP_PAGE, true, cx)) {
                 let _ = view.update(cx, |this, _| this.pending_jump.as_mut().map(|j| j.pages += 1));
                 return;
             }
             // Still loading: the next store update tries again.
-            let h = store.read(cx).selected_history();
+            let h = store.read(cx).history_of(&chat);
             if exhausted || (!h.page_pending && !h.fetching_remote) {
                 let _ = view.update(cx, |this, cx| {
                     if this.pending_jump.take().is_some() {
@@ -443,10 +507,10 @@ impl Conversation {
                 }
                 (find.query, find.searched, find.jumped, find.current) = (query.clone(), false, false, None);
                 // The store scan decodes every message of the chat: not on every keystroke.
-                let store = self.store.clone();
+                let (store, chat) = (self.store.clone(), self.chat_jid.clone().unwrap_or_default());
                 find._debounce = Some(cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(Duration::from_millis(200)).await;
-                    store.update(cx, |s, _| s.search(&query));
+                    store.update(cx, |s, _| s.search(&chat, &query));
                 }));
                 self.refresh_matches(cx);
             }
@@ -637,6 +701,126 @@ impl Conversation {
         .detach();
     }
 
+    /// Main window: compact centered avatar + name, like Messages (click for info), with
+    /// Pop Out at the end. Mini window: avatar + name after the traffic lights, and a
+    /// button that opens the chat in the main window. With Liquid Glass the main window's
+    /// avatar + name sit in a glass capsule floating over the transcript instead of a bar.
+    #[allow(clippy::too_many_arguments)]
+    fn header(
+        &self,
+        chat: &wa_backend::ChatSummary,
+        typing_label: Option<String>,
+        photo: Option<Arc<Image>>,
+        glass_on: bool,
+        theme: &Theme,
+    ) -> AnyElement {
+        let (store, jid) = (self.store.clone(), chat.jid.clone());
+        let icon_button = |id: &'static str, icon: Glyph, tip: &'static str| {
+            div()
+                .id(id)
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .my_auto()
+                .size(px(28.))
+                .rounded(px(7.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.search_bg))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+                .child(glyph(icon, 15., theme.text_secondary))
+        };
+        let names = div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .truncate()
+                    .child(chat.name.clone()),
+            )
+            .when_some(typing_label, |d, label| {
+                d.child(div().text_size(px(11.)).text_color(theme.text_secondary).truncate().child(label))
+            });
+        let bar = div()
+            .id("chat-header")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .child(frosted(theme.bar_tint))
+            .border_b_1()
+            .border_color(theme.separator)
+            .flex()
+            .items_center()
+            .gap(px(8.));
+        if self.binding.fixed().is_some() {
+            return bar
+                .h(px(MINI_HEADER_HEIGHT))
+                // Clear of the traffic lights.
+                .pl(px(84.))
+                .pr(px(40.))
+                .child(avatar(&chat.name, photo, 22., theme))
+                .child(names)
+                .child(icon_button("open-in-main", Glyph::Expand, "Open in Main Window").right(px(8.)).on_click(
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        crate::mini::open_in_main(&store, jid.clone(), cx);
+                    },
+                ))
+                .into_any_element();
+        }
+        let pop_jid = jid.clone();
+        let pop_store = store.clone();
+        let pop_out = icon_button("pop-out", Glyph::PopOut, "Pop Out").right(px(12.)).on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            crate::mini::pop_out(&pop_store, pop_jid.clone(), cx);
+        });
+        if glass_on {
+            let identity = div()
+                .id("chat-header")
+                .cursor_pointer()
+                .on_click(move |_, _, cx| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx)))
+                .h(px(38.))
+                .pl(px(5.))
+                .pr(px(16.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(avatar(&chat.name, photo, 28., theme))
+                .child(names);
+            return div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(HEADER_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(glass::glass("chat-header", 19., identity))
+                .child(pop_out)
+                .into_any_element();
+        }
+        bar.h(px(HEADER_HEIGHT))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx)))
+            .justify_center()
+            .child(avatar(&chat.name, photo, 28., theme))
+            .child(names)
+            .child(pop_out)
+            .into_any_element()
+    }
+
+    pub fn composer(&self) -> &Entity<Composer> {
+        &self.composer
+    }
+
     fn render_row(&self, ix: usize, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.rows.get(ix) {
             Some(Row::Separator(ts)) => div()
@@ -713,7 +897,7 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Voice(media) => voice_content(&self.store, m, media, from_me, last, theme, window, cx),
-            MessageBody::Text(t) => bubble(found_text(t, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme)
+            MessageBody::Text(t) => bubble(found_text(format!("text-{}", m.id).into(), t, found, &m.mentions, from_me, theme, cx), from_me, last, theme)
                 .into_any_element(),
             MessageBody::Unsupported { label } => {
                 bubble(text_content(label, true), from_me, last, theme).into_any_element()
@@ -739,7 +923,7 @@ impl Conversation {
         let reply_button = hover_button(format!("reply-{}", m.id), Glyph::Reply).on_click(cx.listener(
             move |this, _, window, cx| {
                 let target = reply_target.clone();
-                this.store.update(cx, |s, cx| s.set_replying_to(Some(target), cx));
+                this.store.update(cx, |s, cx| s.set_replying_to(&target.chat_jid.clone(), Some(target), cx));
                 Composer::focus(&this.composer, window, cx);
             },
         ));
@@ -1022,7 +1206,7 @@ impl Conversation {
                     .child(glyph(Glyph::Reply, 15., theme.text_secondary))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let target = target.clone();
-                        this.store.update(cx, |s, cx| s.set_replying_to(Some(target), cx));
+                        this.store.update(cx, |s, cx| s.set_replying_to(&target.chat_jid.clone(), Some(target), cx));
                         this.close_menu(cx);
                         Composer::focus(&this.composer, window, cx);
                     }))
@@ -1081,7 +1265,7 @@ impl Conversation {
             items.push(
                 item("reply", "Reply", false)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.store.update(cx, |s, cx| s.set_replying_to(Some(target.clone()), cx));
+                        this.store.update(cx, |s, cx| s.set_replying_to(&target.chat_jid, Some(target.clone()), cx));
                         this.close_menu(cx);
                         Composer::focus(&this.composer, window, cx);
                     }))
@@ -1292,7 +1476,7 @@ impl Conversation {
             }
             (None, None) => div().size_full().bg(theme.bubble_in).into_any_element(),
         };
-        let (path, store) = (media.path.clone(), self.store.clone());
+        let (path, store, mini) = (media.path.clone(), self.store.clone(), self.binding.fixed().map(String::from));
         let overlay = match (media.path.is_some(), media.state) {
             (true, _) => None,
             (false, MediaState::Failed) => Some("Couldn't download"),
@@ -1325,7 +1509,7 @@ impl Conversation {
             })
             .on_click(move |_, _, cx| {
                 if let Some(path) = path.clone() {
-                    store.update(cx, |s, cx| s.open_lightbox(path, cx));
+                    store.update(cx, |s, cx| s.open_lightbox_in(path, mini.clone(), cx));
                 }
             });
         match media.caption.as_deref().filter(|c| !c.trim().is_empty()) {
@@ -1336,7 +1520,12 @@ impl Conversation {
                 .gap(px(2.))
                 .when(from_me, |d| d.items_end())
                 .child(frame)
-                .child(bubble(found_text(caption, found, &m.mentions, mention_color(from_me, theme)), from_me, last, theme))
+                .child(bubble(
+                    found_text(format!("caption-{}", m.id).into(), caption, found, &m.mentions, from_me, theme, cx),
+                    from_me,
+                    last,
+                    theme,
+                ))
                 .into_any_element(),
         }
     }
@@ -1415,12 +1604,24 @@ fn mention_color(from_me: bool, theme: &Theme) -> Hsla {
     if from_me { theme.bubble_out_text } else { theme.accent }
 }
 
-/// Bubble text with @mentions shown by name and find-in-chat matches highlighted (the
-/// current match stronger). Matches are found in the text as shown.
-fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::Mention], mention_color: Hsla) -> Div {
+/// Bubble text with @mentions shown by name, links clickable (see `links`) and
+/// find-in-chat matches highlighted (the current match stronger). Matches are found in
+/// the text as shown.
+fn found_text(
+    id: SharedString,
+    text: &str,
+    found: Option<(&str, bool)>,
+    mentions: &[wa_backend::Mention],
+    from_me: bool,
+    theme: &Theme,
+    cx: &Context<Conversation>,
+) -> Div {
     let (text, mentioned) = crate::mentions::display(text, mentions);
+    let linked = crate::links::linkify(&text, &mentioned);
+    let mentioned: Vec<_> = mentioned.iter().map(|r| linked.map_range(r)).collect();
+    let (text, links) = (linked.text, linked.links);
     let matches = found.map(|(query, _)| match_ranges(&text, query)).unwrap_or_default();
-    if matches.is_empty() && mentioned.is_empty() {
+    if matches.is_empty() && mentioned.is_empty() && links.is_empty() {
         return text_content(&text, false);
     }
     let current = found.is_some_and(|(_, current)| current);
@@ -1429,8 +1630,15 @@ fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::M
         color: Some(black()),
         ..Default::default()
     };
-    // Cut at every boundary so a match inside a mention gets both looks.
-    let mut cuts: Vec<usize> = matches.iter().chain(&mentioned).flat_map(|r| [r.start, r.end]).collect();
+    // Links: white on my blue bubbles, tinted on gray ones, like Messages; the warning
+    // mark of a suspicious one in amber.
+    let link_color = if from_me { theme.bubble_out_text } else { theme.accent };
+    let warn_color = if from_me { hsla(45. / 360., 1., 0.72, 1.) } else { hsla(32. / 360., 0.95, 0.48, 1.) };
+    let link_ranges: Vec<_> = links.iter().map(|l| l.range.clone()).collect();
+    let mark_ranges: Vec<_> = links.iter().filter_map(|l| l.mark.clone()).collect();
+    // Cut at every boundary so a match inside a mention or link gets both looks.
+    let mut cuts: Vec<usize> =
+        matches.iter().chain(&mentioned).chain(&link_ranges).chain(&mark_ranges).flat_map(|r| [r.start, r.end]).collect();
     cuts.sort_unstable();
     cuts.dedup();
     let inside = |ranges: &[std::ops::Range<usize>], seg: &std::ops::Range<usize>| {
@@ -1440,19 +1648,43 @@ fn found_text(text: &str, found: Option<(&str, bool)>, mentions: &[wa_backend::M
         .windows(2)
         .map(|w| w[0]..w[1])
         .filter_map(|seg| {
-            let style = match (inside(&matches, &seg), inside(&mentioned, &seg)) {
-                (false, false) => return None,
+            let link = links.iter().find(|l| l.range.start <= seg.start && seg.end <= l.range.end);
+            let mut style = match (inside(&matches, &seg), inside(&mentioned, &seg)) {
                 (true, m) => HighlightStyle { font_weight: m.then_some(FontWeight::SEMIBOLD), ..find_style },
                 (false, true) => HighlightStyle {
-                    color: Some(mention_color),
+                    color: Some(mention_color(from_me, theme)),
                     font_weight: Some(FontWeight::SEMIBOLD),
                     ..Default::default()
                 },
+                (false, false) if link.is_some() => HighlightStyle { color: Some(link_color), ..Default::default() },
+                (false, false) if inside(&mark_ranges, &seg) => {
+                    HighlightStyle { color: Some(warn_color), ..Default::default() }
+                }
+                (false, false) => return None,
             };
+            if let Some(link) = link {
+                let color = style.color.unwrap_or(link_color);
+                style.underline = Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(if link.suspicious() { warn_color } else { color }),
+                    wavy: link.suspicious(),
+                });
+            }
             Some((seg, style))
         })
         .collect();
-    div().text_size(px(14.)).line_height(px(19.)).child(StyledText::new(text).with_highlights(highlights))
+    let styled = StyledText::new(text).with_highlights(highlights);
+    let body = div().text_size(px(14.)).line_height(px(19.));
+    if links.is_empty() {
+        return body.child(styled);
+    }
+    let this = cx.entity().downgrade();
+    body.child(crate::links::interactive(id, styled, links, move |link, _, cx| {
+        let _ = this.update(cx, |this, cx| {
+            this.confirm_link = Some(link);
+            cx.notify();
+        });
+    }))
 }
 
 fn text_content(text: &str, italic: bool) -> Div {
@@ -1770,7 +2002,8 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_window(window);
         let store = self.store.read(cx);
-        let Some(chat) = store.selected_chat().cloned() else {
+        let bound = self.binding.chat(store);
+        let Some(chat) = bound.as_ref().and_then(|j| store.chats.iter().find(|c| &c.jid == j)).cloned() else {
             return div()
                 .size_full()
                 .flex()
@@ -1790,30 +2023,41 @@ impl Render for Conversation {
             t => Some(format!("{} are typing…", names_label(t))),
         };
         let store = self.store.read(cx);
-        let profile_open = store.profile_open.clone();
-        let history = store.selected_history();
+        let mini = self.binding.fixed().is_some();
+        // A mini window has no room for the info panel.
+        let profile_open = if mini { None } else { store.profile_open.clone() };
+        let history = store.history_of(&chat.jid);
         let loading_older = history.page_pending || history.fetching_remote;
-        let replying = store.replying_to.is_some();
+        let replying = store.replying_to(&chat.jid).is_some();
         // The composer's attachment tray (one row of 64pt tiles plus padding).
-        let attaching = store.selected.as_ref().and_then(|c| store.drafts.get(c)).is_some_and(|d| !d.attachments.is_empty());
+        let attaching = store.drafts.get(&chat.jid).is_some_and(|d| !d.attachments.is_empty());
         let header_photo = store.avatar_cached(&chat.jid);
         if header_photo.is_none() {
             let (s, jid) = (self.store.clone(), chat.jid.clone());
             cx.defer(move |cx| s.update(cx, |s, _| s.request_avatar(&jid)));
         }
         let view = cx.entity();
-        let store_handle = self.store.clone();
+        let (store_handle, chat_jid) = (self.store.clone(), chat.jid.clone());
         let find_bar = self.find.as_ref().map(|f| f.bar.clone());
-        let top = HEADER_HEIGHT + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
+        let header_height = if mini { MINI_HEADER_HEIGHT } else { HEADER_HEIGHT };
+        let top = header_height + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
         let bottom = COMPOSER_CLEARANCE + if replying { 44. } else { 0. } + if attaching { 76. } else { 0. };
         let away = self.away.get();
         if !away {
             self.unseen = 0;
         }
         let unseen = self.unseen;
+        if let Some(jid) = self.binding.fixed()
+            && self.reported_away != away
+        {
+            self.reported_away = away;
+            let (store, jid) = (self.store.clone(), jid.to_string());
+            cx.defer(move |cx| store.update(cx, |s, cx| s.set_mini_at_latest(&jid, !away, cx)));
+        }
+        let glass_on = glass::enabled(window);
+        let header = self.header(&chat, typing_label, header_photo, glass_on, &theme);
         let confirm = self.confirm_delete.clone();
         let forward = self.forward.as_ref().map(|(p, _)| p.clone());
-        let glass_on = glass::enabled(window);
 
         let pane = div()
             .flex_1()
@@ -1827,8 +2071,8 @@ impl Render for Conversation {
                     // The first rows are laid out once they come within the list's
                     // overdraw of the viewport: prefetch the previous page.
                     if ix < 3 {
-                        let store = store_handle.clone();
-                        cx.defer(move |cx| store.update(cx, |s, cx| s.load_older(cx)));
+                        let (store, chat) = (store_handle.clone(), chat_jid.clone());
+                        cx.defer(move |cx| store.update(cx, |s, cx| s.load_older(&chat, cx)));
                     }
                     let theme = Theme::for_window(window);
                     view.update(cx, |this, cx| this.render_row(ix, &theme, window, cx))
@@ -1851,64 +2095,9 @@ impl Render for Conversation {
                     ),
                 )
             })
-            // Header: compact centered avatar + name, like Messages. Click for info.
-            .map(|d| {
-                let identity = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(avatar(&chat.name, header_photo, 28., &theme))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(chat.name.clone()),
-                            )
-                            .when_some(typing_label, |d, label| {
-                                d.child(div().text_size(px(11.)).text_color(theme.text_secondary).child(label))
-                            }),
-                    );
-                let toggle_profile = {
-                    let (store, jid) = (self.store.clone(), chat.jid.clone());
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx))
-                };
-                let band = div().absolute().top_0().left_0().right_0().h(px(HEADER_HEIGHT));
-                if glass_on {
-                    // A glass capsule floating over the transcript, which fades out beneath it.
-                    d.child(edge_fade(true, HEADER_HEIGHT + 12., &theme)).child(
-                        band.flex().items_center().justify_center().child(glass::glass(
-                            "chat-header",
-                            19.,
-                            identity
-                                .id("chat-header")
-                                .cursor_pointer()
-                                .on_click(toggle_profile)
-                                .h(px(38.))
-                                .pl(px(5.))
-                                .pr(px(16.)),
-                        )),
-                    )
-                } else {
-                    d.child(
-                        band.id("chat-header")
-                            .cursor_pointer()
-                            .on_click(toggle_profile)
-                            .bg(theme.header_bg)
-                            .border_b_1()
-                            .border_color(theme.separator)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(identity),
-                    )
-                }
-            })
-            .when_some(find_bar, |d, bar| d.child(div().absolute().top(px(HEADER_HEIGHT)).left_0().right_0().child(bar)))
+            .when(glass_on && !mini, |d| d.child(edge_fade(true, HEADER_HEIGHT + 12., &theme)))
+            .child(header)
+            .when_some(find_bar, |d, bar| d.child(div().absolute().top(px(header_height)).left_0().right_0().child(bar)))
             .when_some(self.notice.clone(), |d, text| {
                 d.child(
                     div().absolute().top(px(top + 10.)).left_0().right_0().flex().justify_center().child(
@@ -1961,6 +2150,23 @@ impl Render for Conversation {
                     this.confirm_delete = None;
                     cx.notify();
                 })).child(dialog)))
+            })
+            .when_some(self.confirm_link.clone(), |d, link| {
+                let close = |this: &mut Self, cx: &mut Context<Self>| {
+                    this.confirm_link = None;
+                    cx.notify();
+                };
+                let target = link.clone();
+                let sheet = crate::links::confirm_sheet(
+                    &link,
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        crate::links::open(&target, cx);
+                        close(this, cx);
+                    }),
+                    cx.listener(move |this, _, _, cx| close(this, cx)),
+                );
+                d.child(modal_backdrop("link-backdrop", cx.listener(move |this, _, _, cx| close(this, cx))).child(sheet))
             })
             .when_some(forward, |d, picker| {
                 d.child(above_glass(glass_on, "forward-backdrop", modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {
