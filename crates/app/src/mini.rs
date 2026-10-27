@@ -170,6 +170,9 @@ impl MiniChat {
                         if s.lightbox_in.as_deref() == Some(jid.as_str()) {
                             s.close_lightbox(cx);
                         }
+                        if s.video_in.as_deref() == Some(jid.as_str()) {
+                            s.close_video(cx);
+                        }
                     })
                 });
             }),
@@ -197,7 +200,8 @@ impl Render for MiniChat {
             window.set_window_title(&self.title);
         }
         let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.as_deref() == Some(self.jid.as_str()));
-        crate::follow_lightbox(&mut self.lightbox_focus, lightbox.is_some(), &self.conversation, window, cx);
+        let video = store.video.clone().filter(|_| store.video_in.as_deref() == Some(self.jid.as_str()));
+        crate::follow_lightbox(&mut self.lightbox_focus, lightbox.is_some() || video.is_some(), &self.conversation, window, cx);
         div()
             .size_full()
             .relative()
@@ -209,5 +213,8 @@ impl Render for MiniChat {
             }))
             .child(self.conversation.clone())
             .when_some(lightbox, |d, path| d.child(crate::lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
+            .when_some(video, |d, video| {
+                d.child(crate::video_overlay(video, Some(self.jid.clone()), self.store.clone(), &self.lightbox_focus.0))
+            })
     }
 }

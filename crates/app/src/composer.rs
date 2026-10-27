@@ -541,11 +541,23 @@ impl Composer {
             return;
         }
         if self.suggestions.is_empty() {
-            if key == "escape" && self.sticker_panel {
+            if key != "escape" {
+                return;
+            }
+            let replying = self.chat.clone().filter(|c| self.store.read(cx).replying_to(c).is_some());
+            if self.sticker_panel {
                 self.sticker_panel = false;
                 cx.notify();
-                cx.stop_propagation();
+            } else if self.mic_notice.take().is_some() {
+                cx.notify();
+            } else if let Some(chat) = replying {
+                // Like Messages: Esc drops the reply (the text stays).
+                self.store.update(cx, |s, cx| s.set_replying_to(&chat, None, cx));
+            } else {
+                // Nothing here to close: the conversation may have something.
+                return;
             }
+            cx.stop_propagation();
             return;
         }
         let n = self.suggestions.len();

@@ -623,6 +623,20 @@ impl Conversation {
         cx.notify();
     }
 
+    /// Esc closes the topmost thing open over the conversation; false if nothing was.
+    fn on_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.confirm_link.take().is_some() || self.confirm_delete.take().is_some() {
+            cx.notify();
+        } else if self.picker_for.is_some() {
+            self.close_menu(cx);
+        } else if self.binding.fixed().is_none() && self.store.read(cx).profile_open.is_some() {
+            self.store.update(cx, |s, cx| s.close_profile(cx));
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         self.picker_for = None;
         self.menu_at = None;
@@ -885,7 +899,7 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Image(media) => self.image_content(m, media, from_me, last, found, theme, cx),
-            MessageBody::Video(v) => crate::kinds::video(&self.store, m, v, thumb, theme, cx).into_any_element(),
+            MessageBody::Video(v) => crate::kinds::video(&self.store, m, v, thumb, self.binding.fixed().map(String::from), theme, cx).into_any_element(),
             MessageBody::Document(d) => {
                 bubble(div().child(crate::kinds::document(&self.store, m, d, from_me, theme)), from_me, last, theme)
                     .into_any_element()
@@ -2205,6 +2219,12 @@ impl Render for Conversation {
             .min_w_0()
             .h_full()
             .relative()
+            // After the composer (whose own popups come first) lets it through.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && this.on_escape(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(theme.window_bg)
             // Transcript fills the pane and scrolls under the floating header and composer.
             .child(
