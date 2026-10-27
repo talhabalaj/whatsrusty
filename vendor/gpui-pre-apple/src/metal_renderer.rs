@@ -109,8 +109,9 @@ impl InstanceBufferPool {
     }
 }
 
-/// whatsapp-gpui patch: the CAMetalLayer a pane is drawn into.
-pub struct PaneLayer(metal::MetalLayer);
+/// whatsapp-gpui patch: the CAMetalLayer a pane is drawn into, and a fingerprint of what
+/// it shows, so unchanged panes aren't drawn and presented again.
+pub struct PaneLayer(metal::MetalLayer, Cell<Option<(u64, Size<DevicePixels>)>>);
 
 impl PaneLayer {
     /// The `CAMetalLayer`, for hosting in a view.
@@ -207,7 +208,7 @@ impl MetalRenderer {
             objc2_layer.setNeedsDisplayOnBoundsChange(false);
         }
         layer.set_presents_with_transaction(self.presents_with_transaction);
-        PaneLayer(layer)
+        PaneLayer(layer, Cell::new(None))
     }
 
     /// Creates a renderer for a CAMetalLayer owned by a platform view, such as
@@ -576,6 +577,7 @@ impl MetalRenderer {
     /// inside the current Core Animation transaction even when the renderer doesn't
     /// always do so (the caller moved pane views this frame and wants them in sync).
     pub fn draw_with_panes(&mut self, scene: &Scene, panes: &[PaneTarget<'_>], transaction: bool) {
+        let frame_start = frame_stats::enabled().then(std::time::Instant::now);
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -620,6 +622,12 @@ impl MetalRenderer {
         }
         let mut drawables = vec![drawable.to_owned()];
         for pane in panes {
+            // Most frames only change the main scene (scrolling under the bars): the pane's
+            // layer keeps showing its last drawable, so don't render or present it again.
+            let fingerprint = scene_fingerprint(pane.scene).map(|hash| (hash, pane.size));
+            if fingerprint.is_some() && pane.layer.1.get() == fingerprint {
+                continue;
+            }
             let Some(pane_drawable) = pane.layer.0.next_drawable() else {
                 log::error!("failed to retrieve a pane drawable, size: {:?}", pane.size);
                 continue;
@@ -636,8 +644,12 @@ impl MetalRenderer {
                 continue;
             }
             drawables.push(pane_drawable.to_owned());
+            pane.layer.1.set(fingerprint);
         }
         self.release_on_completion(&command_buffer, writer);
+        if let Some(start) = frame_start {
+            frame_stats::record(&command_buffer, &drawables[0], start, drawables.len() - 1);
+        }
 
         let with_transaction = self.presents_with_transaction || transaction;
         for pane in panes {
@@ -1466,6 +1478,33 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
+/// whatsapp-gpui patch: a hash of everything a scene draws, or `None` if it can't tell
+/// (paths and video surfaces are always redrawn).
+fn scene_fingerprint(scene: &Scene) -> Option<u64> {
+    use std::hash::Hasher;
+    if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
+        return None;
+    }
+    fn bytes<T>(items: &[T]) -> &[u8] {
+        // SAFETY: GPU primitives are plain `repr(C)` data without padding (see
+        // `PaddedBool32`); they're copied byte for byte into instance buffers too.
+        unsafe { slice::from_raw_parts(items.as_ptr().cast::<u8>(), mem::size_of_val(items)) }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in [
+        bytes(&scene.shadows),
+        bytes(&scene.quads),
+        bytes(&scene.underlines),
+        bytes(&scene.monochrome_sprites),
+        bytes(&scene.subpixel_sprites),
+        bytes(&scene.polychrome_sprites),
+    ] {
+        hasher.write_usize(part.len());
+        hasher.write(part);
+    }
+    Some(hasher.finish())
+}
+
 /// whatsapp-gpui patch: a pane's scene moved back from pane-local to window coordinates,
 /// keeping its draw order, so snapshots can draw it over the main scene.
 #[cfg(any(test, feature = "test-support"))]
@@ -1975,3 +2014,8 @@ mod tests {
         }
     }
 }
+
+
+// whatsapp-gpui patch: kept out of this file, which cbindgen scans for the shader header.
+#[path = "frame_stats.rs"]
+mod frame_stats;

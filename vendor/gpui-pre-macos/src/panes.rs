@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 struct Classes {
     pane_view: &'static AnyClass,
     glass_view: Option<&'static AnyClass>,
+    glass_container: Option<&'static AnyClass>,
 }
 
 // SAFETY: Objective-C classes are immutable once registered.
@@ -54,9 +55,21 @@ fn classes() -> &'static Classes {
             }
             decl.register()
         });
+        let glass_container = AnyClass::get(c"NSGlassEffectContainerView").map(|container| {
+            let mut decl = ClassBuilder::new(c"GPUIGlassContainerView", container).unwrap();
+            // SAFETY: the signatures match the selectors.
+            unsafe {
+                decl.add_method(
+                    sel!(hitTest:),
+                    hit_test_none as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
+                );
+            }
+            decl.register()
+        });
         Classes {
             pane_view,
             glass_view,
+            glass_container,
         }
     })
 }
@@ -169,9 +182,21 @@ impl NativePane {
     }
 }
 
+/// Glass panes share one `NSGlassEffectContainerView` covering the GPUI view, which lets
+/// the system render them together (`GPUI_GLASS_CONTAINER=0` puts each glass view
+/// directly in the GPUI view instead, for comparisons). Plain panes stay above it.
+fn use_container() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        classes().glass_container.is_some()
+            && std::env::var("GPUI_GLASS_CONTAINER").map_or(true, |v| v != "0")
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct Panes {
     panes: Vec<NativePane>,
+    container: Option<Retained<AnyObject>>,
 }
 
 impl Panes {
@@ -237,14 +262,43 @@ impl Panes {
             }
         }
         if restack {
+            let container = self.container(parent);
             // Re-adding a subview moves it to the top, which leaves them in paint order.
             for pane in &self.panes {
+                let superview = match &container {
+                    Some(container) if pane.is_glass() => &**container as *const AnyObject as *mut AnyObject,
+                    _ => parent,
+                };
                 unsafe {
-                    let _: () = msg_send![parent, addSubview: &*pane.outer];
+                    let _: () = msg_send![superview, addSubview: &*pane.outer];
                 }
             }
         }
         Some(transaction)
+    }
+
+    /// The shared glass container, created on first use, below every plain pane.
+    fn container(&mut self, parent: *mut AnyObject) -> Option<Retained<AnyObject>> {
+        if !use_container() {
+            return None;
+        }
+        let container = self.container.get_or_insert_with(|| unsafe {
+            let class = classes().glass_container.expect("checked by use_container");
+            let container: Retained<AnyObject> = msg_send![class, new];
+            let bounds: NSRect = msg_send![parent, bounds];
+            let _: () = msg_send![&*container, setFrame: bounds];
+            let _: () = msg_send![
+                &*container,
+                setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable
+            ];
+            container
+        });
+        // (Re-)adding moves it to the top; plain panes are re-added after it, above.
+        unsafe {
+            let _: () = msg_send![parent, addSubview: &**container];
+        }
+        Some(container.clone())
     }
 
     /// The render targets for this frame, in the same order as `scene_panes`.
@@ -270,6 +324,11 @@ impl Panes {
         for pane in self.panes.drain(..) {
             unsafe {
                 let _: () = msg_send![&*pane.outer, removeFromSuperview];
+            }
+        }
+        if let Some(container) = self.container.take() {
+            unsafe {
+                let _: () = msg_send![&*container, removeFromSuperview];
             }
         }
     }
