@@ -21,12 +21,43 @@ const ROW_HEIGHT: f32 = 68.;
 /// WhatsApp allows this many pinned chats.
 const MAX_PINNED: usize = 3;
 const ERROR_SHOWN_FOR: Duration = Duration::from_secs(6);
+/// With Liquid Glass: the New Message circle and the search capsule.
+const COMPOSE_GLASS_SIZE: f32 = 32.;
+const SEARCH_GLASS_HEIGHT: f32 = 32.;
+/// The traffic-light row (52) and the search field with its bottom margin (32 + 8): with
+/// glass they float over the list, which starts below them.
+const SIDEBAR_TOP: f32 = 52. + SEARCH_GLASS_HEIGHT + 8.;
+
+/// A row of the sidebar list.
+#[derive(Clone, PartialEq)]
+enum Row {
+    /// "‹ Archived", back to the main list.
+    ArchivedBack,
+    Pinned,
+    /// The "Archived" entry above the chats.
+    ArchivedEntry,
+    Chat(String),
+}
+
+/// With glass: the soft scroll edge under the floating search field, like the
+/// conversation's under its header. Fades into the sidebar glass's own shade.
+fn top_fade(theme: &Theme) -> impl IntoElement {
+    let fade = linear_gradient(
+        180.,
+        linear_color_stop(theme.sidebar_glass.opacity(0.96), 0.),
+        linear_color_stop(theme.sidebar_glass.opacity(0.), 1.),
+    );
+    div().absolute().top_0().left_0().right_0().h(px(SIDEBAR_TOP + 10.)).bg(fade)
+}
 
 pub struct Sidebar {
     store: Entity<Store>,
     search: Entity<InputState>,
     query: String,
-    scroll: UniformListScrollHandle,
+    /// Everything below the search field scrolls as one list: the archive's back row,
+    /// pinned chats, the Archived entry and the chats.
+    list: ListState,
+    rows: Vec<Row>,
     /// The selection we last revealed in the list.
     last_selected: Option<String>,
     /// Showing archived chats instead of the main list.
@@ -64,7 +95,8 @@ impl Sidebar {
             store,
             search,
             query: String::new(),
-            scroll: UniformListScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            rows: Vec::new(),
             last_selected: None,
             archived_view: false,
             new_chat: None,
@@ -141,9 +173,68 @@ impl Sidebar {
         if let Some(chat) = self.store.read(cx).chats.iter().find(|c| c.jid == jid) {
             self.archived_view = chat.archived;
         }
-        if let Some(ix) = self.visible_jids(cx).iter().position(|j| *j == jid) {
-            let strategy = if from_search { ScrollStrategy::Center } else { ScrollStrategy::Nearest };
-            self.scroll.scroll_to_item(ix, strategy);
+        self.sync_rows(cx);
+        if let Some(ix) = self.rows.iter().position(|r| *r == Row::Chat(jid.clone())) {
+            self.list.scroll_to_reveal_item(ix);
+        }
+    }
+
+    /// The list's rows for the current view and query.
+    fn current_rows(&self, cx: &App) -> Vec<Row> {
+        let chats = &self.store.read(cx).chats;
+        let main_view = self.query.is_empty() && !self.archived_view;
+        let mut rows = Vec::new();
+        if self.archived_view {
+            rows.push(Row::ArchivedBack);
+        }
+        if main_view && chats.iter().any(|c| c.pinned && !c.archived) {
+            rows.push(Row::Pinned);
+        }
+        if main_view && chats.iter().any(|c| c.archived) {
+            rows.push(Row::ArchivedEntry);
+        }
+        rows.extend(self.visible_jids(cx).into_iter().map(Row::Chat));
+        rows
+    }
+
+    /// Brings the list in line with [`Self::current_rows`], splicing only the rows that
+    /// changed so the scroll position stays put when chats move.
+    fn sync_rows(&mut self, cx: &App) {
+        let new = self.current_rows(cx);
+        if new == self.rows {
+            return;
+        }
+        let old = std::mem::replace(&mut self.rows, new);
+        let new = &self.rows;
+        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take_while(|(a, b)| a == b).count();
+        self.list.splice(prefix..old.len() - suffix, new.len() - prefix - suffix);
+    }
+
+    fn render_row(&self, ix: usize, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(ix) else { return div().into_any_element() };
+        let chats = self.store.read(cx).chats.clone();
+        match row {
+            Row::ArchivedBack => self.archived_header(theme, cx).into_any_element(),
+            Row::Pinned => self.pinned_grid(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
+            Row::ArchivedEntry => self.archived_row(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
+            Row::Chat(jid) => {
+                let state = self.store.read(cx);
+                let Some(chat) = chats.iter().find(|c| &c.jid == jid) else { return div().into_any_element() };
+                let photo = state.avatar_cached(jid);
+                let selected = state.selected.as_deref() == Some(jid.as_str());
+                let typing = state.typing.contains(jid);
+                // Ask for photos of rows as they scroll into view.
+                if photo.is_none() {
+                    let (store, jid) = (self.store.clone(), jid.clone());
+                    cx.defer(move |cx| store.update(cx, |s, _| s.request_avatar(&jid)));
+                }
+                let pin_count = chats.iter().filter(|c| c.pinned && !c.archived).count();
+                div()
+                    .px(px(10.))
+                    .child(chat_row(chat, photo, selected, typing, pin_count, theme, self.store.clone()))
+                    .into_any_element()
+            }
         }
     }
 
@@ -151,7 +242,7 @@ impl Sidebar {
         self.query.is_empty() || c.name.to_lowercase().contains(&self.query)
     }
 
-    /// Rows of the scrolling list. Pinned chats sit in the grid above it, except while
+    /// Chat rows of the list. Pinned chats sit in the grid above them, except while
     /// searching.
     fn visible_jids(&self, cx: &App) -> Vec<String> {
         let searching = !self.query.is_empty();
@@ -166,28 +257,59 @@ impl Sidebar {
             .collect()
     }
 
-    fn header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Traffic-light row with New Message at the end: a glass circle with Liquid Glass, like
+    /// macOS 26+ toolbar buttons, otherwise a plain icon button.
+    fn header(&self, glass_on: bool, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = div()
+            .id("new-message")
+            .size(px(if glass_on { COMPOSE_GLASS_SIZE } else { 30. }))
+            .when(glass_on, |d| d.rounded_full())
+            .when(!glass_on, |d| d.rounded(px(6.)));
+        let button = button
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.search_bg))
+            .tooltip(|window, cx| Tooltip::new("New Message").build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                let just_closed = this.new_chat_closed_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
+                match this.new_chat.take() {
+                    Some(_) => cx.notify(),
+                    None if just_closed => {}
+                    None => this.open_new_chat(window, cx),
+                }
+            }))
+            // On glass the icon reads like a toolbar symbol: primary color, a little smaller.
+            .child(if glass_on { glyph(Glyph::Compose, 16., theme.text) } else { glyph(Glyph::Compose, 18., theme.text_secondary) });
         // Room for the traffic lights, which sit in our transparent titlebar.
-        div().h(px(52.)).flex_none().flex().items_center().justify_end().pr(px(12.)).child(
-            div()
-                .id("new-message")
-                .size(px(30.))
-                .rounded(px(6.))
+        div().h(px(52.)).flex_none().flex().items_center().justify_end().pr(px(12.)).child(if glass_on {
+            crate::glass::glass("sidebar-compose", COMPOSE_GLASS_SIZE / 2., button).into_any_element()
+        } else {
+            button.into_any_element()
+        })
+    }
+
+    /// The search field: a glass capsule with a magnifier with Liquid Glass, otherwise a
+    /// filled rounded field.
+    fn search_field(&self, glass_on: bool, theme: &Theme) -> impl IntoElement {
+        let input = Input::new(&self.search).appearance(false).cleanable(true);
+        let field = if glass_on {
+            let field = div()
+                .h(px(SEARCH_GLASS_HEIGHT))
+                .pl(px(10.))
+                .pr(px(4.))
                 .flex()
                 .items_center()
-                .justify_center()
-                .hover(|s| s.bg(theme.search_bg))
-                .tooltip(|window, cx| Tooltip::new("New Message").build(window, cx))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    let just_closed = this.new_chat_closed_at.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
-                    match this.new_chat.take() {
-                        Some(_) => cx.notify(),
-                        None if just_closed => {}
-                        None => this.open_new_chat(window, cx),
-                    }
-                }))
-                .child(glyph(Glyph::Compose, 18., theme.text_secondary)),
-        )
+                .gap(px(4.))
+                .text_size(px(13.))
+                .child(glyph(Glyph::Magnifier, 13., theme.text_secondary))
+                .child(div().flex_1().min_w_0().child(input));
+            crate::glass::glass("sidebar-search", SEARCH_GLASS_HEIGHT / 2., field).into_any_element()
+        } else {
+            div().rounded(px(8.)).bg(theme.search_bg).text_size(px(13.)).child(input).into_any_element()
+        };
+        div().px(px(10.)).pb(px(8.)).child(field)
     }
 
     fn archived_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -256,73 +378,46 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_window(window);
-        let jids = self.visible_jids(cx);
-        let store = self.store.clone();
-        let count = jids.len();
-        let chats = self.store.read(cx).chats.clone();
-        let pin_count = chats.iter().filter(|c| c.pinned && !c.archived).count();
-        let searching = !self.query.is_empty();
+        self.sync_rows(cx);
         let error = self.store.read(cx).last_error.clone();
-        let (pinned, archived_row) = match (searching, self.archived_view) {
-            (false, false) => (self.pinned_grid(&chats, &theme, cx), self.archived_row(&chats, &theme, cx)),
-            _ => (None, None),
-        };
-
-        div()
+        let glass_on = crate::glass::enabled(window);
+        let view = cx.entity();
+        let list = list(self.list.clone(), move |ix, window, cx| {
+            let theme = Theme::for_window(window);
+            view.update(cx, |this, cx| this.render_row(ix, &theme, cx))
+        })
+        .flex_1()
+        // With glass the list runs under the floating search field and New Message button.
+        .when(glass_on, |d| d.size_full().pt(px(SIDEBAR_TOP)));
+        let top = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .when(glass_on, |d| d.absolute().top_0().left_0().right_0())
+            .child(self.header(glass_on, &theme, cx))
+            .child(self.search_field(glass_on, &theme));
+        let content = div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .bg(theme.sidebar_bg)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(self.header(&theme, cx))
-            .child(
-                div().px(px(10.)).pb(px(8.)).child(
-                    div()
-                        .rounded(px(8.))
-                        .bg(theme.search_bg)
-                        .text_size(px(13.))
-                        .child(Input::new(&self.search).appearance(false).cleanable(true)),
-                ),
-            )
-            .when(self.archived_view, |d| d.child(self.archived_header(&theme, cx)))
-            .children(pinned)
-            .children(archived_row)
-            .child(
-                uniform_list("chat-list", count, move |range, window, cx| {
-                    let theme = Theme::for_window(window);
-                    // Ask for photos of rows as they scroll into view.
-                    let missing: Vec<String> = range
-                        .clone()
-                        .filter_map(|ix| jids.get(ix))
-                        .filter(|j| store.read(cx).avatar_cached(j).is_none())
-                        .cloned()
-                        .collect();
-                    if !missing.is_empty() {
-                        let store = store.clone();
-                        cx.defer(move |cx| store.update(cx, |s, _| missing.iter().for_each(|j| s.request_avatar(j))));
-                    }
-                    let state = store.read(cx);
-                    range
-                        .filter_map(|ix| {
-                            let jid = jids.get(ix)?;
-                            let chat = state.chats.iter().find(|c| &c.jid == jid)?;
-                            let selected = state.selected.as_deref() == Some(jid.as_str());
-                            let typing = state.typing.contains(jid);
-                            let photo = state.avatar_cached(jid);
-                            Some(chat_row(chat, photo, selected, typing, pin_count, &theme, store.clone()))
-                        })
-                        .collect()
-                })
-                .track_scroll(&self.scroll)
-                .flex_1()
-                .px(px(10.)),
-            )
+            // With glass the glass edge is the divider, like a native sidebar.
+            .when(!glass_on, |d| d.bg(theme.sidebar_bg).border_r_1().border_color(theme.sidebar_border))
+            .map(|d| if glass_on { d.child(list).child(top_fade(&theme)).child(top) } else { d.child(top).child(list) })
             .when_some(error, |d, e| d.child(error_toast(e, &theme, self.store.clone())))
             .when_some(self.new_chat.as_ref().map(|(p, _)| p.clone()), |d, picker| {
                 d.child(deferred(div().absolute().top(px(46.)).left(px(8.)).right(px(8.)).child(picker)).with_priority(1))
-            })
+            });
+        if !glass_on {
+            return content.into_any_element();
+        }
+        // Liquid Glass: like a macOS 27 sidebar, edge-to-edge regular glass (not floating),
+        // sampling the window background painted beneath it. The list draws inside the glass.
+        div()
+            .size_full()
+            .bg(theme.window_bg)
+            .child(crate::glass::sidebar_glass("sidebar", content))
+            .into_any_element()
     }
 }
 

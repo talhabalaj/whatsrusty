@@ -72,6 +72,9 @@ pub enum PaneMaterial {
         clear: bool,
         /// Optional tint mixed into the glass.
         tint: Option<Hsla>,
+        /// The variant AppKit uses for window sidebars (`NSSplitViewItem` sidebars on
+        /// macOS 27): edge-to-edge, a subtle shade over the window background, no shadow.
+        sidebar: bool,
     },
 }
 
