@@ -35,6 +35,8 @@ pub const MINI_HEADER_HEIGHT: f32 = 40.;
 /// Space reserved under the transcript for the floating composer.
 const COMPOSER_CLEARANCE: f32 = 78.;
 const IMAGE_MAX_W: f32 = 260.;
+/// Narrower than this, the info panel covers the conversation rather than sitting beside it.
+const MIN_CHAT_WIDTH: f32 = 380.;
 const IMAGE_MAX_H: f32 = 340.;
 /// How long a message flashes after jumping to it.
 const HIGHLIGHT: Duration = Duration::from_millis(1600);
@@ -103,6 +105,8 @@ pub struct Conversation {
     messages: Vec<ChatMessage>,
     /// Decoded inline thumbnails, keyed by message id.
     thumbs: HashMap<String, Arc<Image>>,
+    /// Photos and stickers drawn in this view, within a memory budget.
+    media_cache: Entity<crate::media_cache::MediaImageCache>,
     chat_jid: Option<String>,
     is_group: bool,
     /// Message whose tapback tray is open.
@@ -210,6 +214,7 @@ impl Conversation {
             rows: Vec::new(),
             messages: Vec::new(),
             thumbs: HashMap::new(),
+            media_cache: crate::media_cache::MediaImageCache::new(cx),
             chat_jid: None,
             is_group: false,
             // Test hook: open the tapback tray for a message id.
@@ -786,6 +791,7 @@ impl Conversation {
             // Like the main window's: the name in a glass capsule, a glass button at the end.
             let identity = div()
                 .id("chat-header")
+                .min_w_0()
                 .h(px(30.))
                 .pl(px(4.))
                 .pr(px(12.))
@@ -868,6 +874,8 @@ impl Conversation {
                 .id("chat-header")
                 .cursor_pointer()
                 .on_click(move |_, _, cx| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx)))
+                // Shrinks (the name truncates) rather than run under the pop-out button.
+                .min_w_0()
                 .h(px(38.))
                 .pl(px(5.))
                 .pr(px(16.))
@@ -884,6 +892,8 @@ impl Conversation {
                 // Floating over the transcript: clicks stop here (scrolling goes through).
                 .block_mouse_except_scroll()
                 .h(px(HEADER_HEIGHT))
+                // Clear of the pop-out button on both sides, so the name stays centered.
+                .px(px(56.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2300,6 +2310,7 @@ impl Render for Conversation {
             .min_w_0()
             .h_full()
             .relative()
+            .image_cache(self.media_cache.clone())
             // After the composer (whose own popups come first) lets it through.
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 if ev.keystroke.key == "escape" && this.on_escape(cx) {
@@ -2420,11 +2431,24 @@ impl Render for Conversation {
                     cx.notify();
                 })).child(picker)))
             });
+        // Beside the conversation while that keeps a usable width; in a narrower window
+        // the info panel slides over it instead of squeezing it.
+        let room = f32::from(window.viewport_size().width) - crate::SIDEBAR_WIDTH - crate::profile::PANEL_WIDTH;
+        let overlay_panel = room < MIN_CHAT_WIDTH;
         div()
             .size_full()
+            .relative()
             .flex()
             .child(pane)
-            .when_some(profile_open, |d, jid| d.child(crate::profile::panel(&jid, &self.store, glass_on, &theme, cx)))
+            .when_some(profile_open, |d, jid| {
+                let panel = crate::profile::panel(&jid, &self.store, glass_on, &theme, cx);
+                if overlay_panel {
+                    let sheet = div().absolute().top_0().bottom_0().right_0().occlude().shadow_lg().child(panel);
+                    d.child(above_glass(glass_on, "profile-sheet", sheet))
+                } else {
+                    d.child(panel)
+                }
+            })
             .into_any_element()
     }
 }

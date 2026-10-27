@@ -37,9 +37,9 @@ rodio = { version = "0.23", default-features = false, features = ["playback", "w
 # Only for the `snapshots` feature (gpui-kit's own test-support pulls in a conflicting gpui-fast).
 gpui-pre = { version = "0.3.10", optional = true, features = ["test-support"] }
 gpui-pre-macos = { version = "0.3.10", optional = true, features = ["test-support"] }
-image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 # Debug builds whose WA_DEBUG_UI script can save window snapshots ("shot <file.png>"),
 # rendered offscreen, so they work with the screen locked.
-snapshots = ["dep:gpui-pre", "dep:gpui-pre-macos", "dep:image"]
+snapshots = ["dep:gpui-pre", "dep:gpui-pre-macos"]

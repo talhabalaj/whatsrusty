@@ -14,6 +14,7 @@ mod identity;
 mod kinds;
 mod links;
 mod login_item;
+mod media_cache;
 mod mentions;
 mod mini;
 mod new_chat;
@@ -39,7 +40,7 @@ use crate::theme::Theme;
 
 actions!(whatsapp_gpui, [Quit, Logout, CloseWindow]);
 
-const SIDEBAR_WIDTH: f32 = 320.;
+pub const SIDEBAR_WIDTH: f32 = 320.;
 
 struct Root {
     store: Entity<Store>,
@@ -222,6 +223,8 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
         store.update(cx, |s, cx| s.close_lightbox(cx))
     };
     div()
+        // Its full-size photos are freed when it closes (not kept in GPUI's global cache).
+        .image_cache(retain_all("lightbox-images"))
         .id("lightbox")
         // Clicks (on ✕ too) mustn't reach what's under the viewer.
         .occlude()
@@ -462,7 +465,12 @@ fn open_main_window(store: Entity<Store>, cx: &mut App) {
         cx.activate(true);
         return;
     }
-    let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
+    // Test hook: WA_DEBUG_MAIN_SIZE="<w>,<h>" opens the window at that size.
+    let (w, h) = std::env::var("WA_DEBUG_MAIN_SIZE")
+        .ok()
+        .and_then(|v| v.split_once(',').and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?))))
+        .unwrap_or((1080., 720.));
+    let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {

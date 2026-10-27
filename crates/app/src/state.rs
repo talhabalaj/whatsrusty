@@ -583,7 +583,10 @@ impl Store {
             return;
         }
         cx.spawn(async move |this, cx| {
-            let image = cx.background_executor().spawn(async move { load_image(&path) }).await;
+            // List avatars are drawn at 60 pt at most: keep them small. The profile's
+            // large photo (`#full`) keeps its size.
+            let max_px = if jid.ends_with("#full") { None } else { Some(AVATAR_PX) };
+            let image = cx.background_executor().spawn(async move { load_image(&path, max_px) }).await;
             let _ = this.update(cx, |s, cx| {
                 s.avatar_loading.remove(&jid);
                 s.avatars.insert(jid, image);
@@ -1193,8 +1196,45 @@ pub fn view_once_label(kind: wa_backend::ViewOnceKind) -> &'static str {
     }
 }
 
-fn load_image(path: &Path) -> Option<Arc<Image>> {
+/// List avatars' size in pixels (60 pt at 2×, with room to spare).
+const AVATAR_PX: u32 = 160;
+
+/// GPUI keeps every image it draws decoded for the app's lifetime, so a 640 px avatar
+/// costs 1.6 MB however small it's shown: `max_px` scales it down first.
+fn load_image(path: &Path, max_px: Option<u32>) -> Option<Arc<Image>> {
     let bytes = std::fs::read(path).ok()?;
     let format = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) { ImageFormat::Png } else { ImageFormat::Jpeg };
-    Some(Arc::new(Image::from_bytes(format, bytes)))
+    let small = max_px.and_then(|max| {
+        let decoded = image::load_from_memory(&bytes).ok()?;
+        if decoded.width() <= max && decoded.height() <= max {
+            return None;
+        }
+        let mut png = Vec::new();
+        decoded.thumbnail(max, max).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    });
+    Some(Arc::new(match small {
+        Some(png) => Image::from_bytes(ImageFormat::Png, png),
+        None => Image::from_bytes(format, bytes),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatars_load_small() {
+        let dir = std::env::temp_dir().join(format!("wa-avatar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.jpg");
+        image::RgbImage::from_pixel(640, 640, image::Rgb([200, 80, 40])).save(&path).unwrap();
+        let small = load_image(&path, Some(AVATAR_PX)).unwrap();
+        let decoded = image::load_from_memory(small.bytes()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (AVATAR_PX, AVATAR_PX));
+        // The profile's large photo keeps its size.
+        let full = load_image(&path, None).unwrap();
+        assert_eq!(image::load_from_memory(full.bytes()).unwrap().width(), 640);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
