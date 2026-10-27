@@ -155,9 +155,10 @@ impl NativePane {
             if let Some(glass) = &self.glass {
                 let _: () =
                     msg_send![&**glass, setCornerRadius: descriptor.corner_radius.0 as f64 / s];
-                if let PaneMaterial::Glass { clear, tint } = descriptor.material {
+                if let PaneMaterial::Glass { clear, tint, sidebar } = descriptor.material {
                     // NSGlassEffectViewStyle: 0 regular, 1 clear.
                     let _: () = msg_send![&**glass, setStyle: if clear { 1isize } else { 0isize }];
+                    set_sidebar_variant(glass, sidebar);
                     let color: Option<Retained<AnyObject>> = tint.map(|tint| {
                         let rgba = gpui::Rgba::from(tint);
                         msg_send![
@@ -179,6 +180,24 @@ impl NativePane {
         self.layer.set_size(device_size, scale);
         self.applied = Some(state);
         true
+    }
+}
+
+/// Private `NSGlassEffectView` state that AppKit sets on the glass behind a split view's
+/// sidebar (read from a native `NSSplitViewItem(sidebarWithViewController:)` on macOS 27):
+/// `_variant` 17 and `_adaptiveAppearance` 1. A fresh glass view has 0 and 2. Skipped
+/// when the selectors don't exist, which leaves regular glass.
+fn set_sidebar_variant(glass: &AnyObject, sidebar: bool) {
+    let (variant, adaptive): (isize, isize) = if sidebar { (17, 1) } else { (0, 2) };
+    unsafe {
+        let responds: Bool = msg_send![glass, respondsToSelector: sel!(set_variant:)];
+        if responds.as_bool() {
+            let _: () = msg_send![glass, set_variant: variant];
+        }
+        let responds: Bool = msg_send![glass, respondsToSelector: sel!(set_adaptiveAppearance:)];
+        if responds.as_bool() {
+            let _: () = msg_send![glass, set_adaptiveAppearance: adaptive];
+        }
     }
 }
 

@@ -15,13 +15,23 @@ pub fn enabled(window: &Window) -> bool {
 /// with `radius` (use half the height for a capsule). Positioned and sized by the child's
 /// own style; events, focus and hit testing are the child's as usual.
 pub fn glass(id: &'static str, radius: f32, child: impl IntoElement) -> Pane {
+    glass_material(id, radius, false, child)
+}
+
+/// Like [`glass`], with the glass AppKit puts behind window sidebars: edge-to-edge, a
+/// subtle shade over the window background, no shadow.
+pub fn sidebar_glass(id: &'static str, child: impl IntoElement) -> Pane {
+    glass_material(id, 0., true, child)
+}
+
+fn glass_material(id: &'static str, radius: f32, sidebar: bool, child: impl IntoElement) -> Pane {
     // `WA_GLASS=clear`: the clearer glass variant (for comparisons).
     static CLEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let clear = *CLEAR.get_or_init(|| std::env::var("WA_GLASS").is_ok_and(|v| v == "clear"));
     // `WA_GLASS_PLAIN=<id>,…`: those panes get no glass (to measure each view's cost).
     static PLAIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let plain = PLAIN.get_or_init(|| std::env::var("WA_GLASS_PLAIN").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default());
-    let material = if plain.iter().any(|p| p == id) { PaneMaterial::Plain } else { PaneMaterial::Glass { clear, tint: None } };
+    let material = if plain.iter().any(|p| p == id) { PaneMaterial::Plain } else { PaneMaterial::Glass { clear, tint: None, sidebar } };
     Pane { id: pane_id(id), radius: px(radius), material, child: child.into_any_element() }
 }
 
