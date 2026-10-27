@@ -16,6 +16,7 @@ const CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
 const COMPOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M11.5 4.5 H7 A3 3 0 0 0 4 7.5 V17 A3 3 0 0 0 7 20 H16.5 A3 3 0 0 0 19.5 17 V12.5" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round"/><path d="M18.2 3.6 L20.4 5.8 L12.6 13.6 L9.6 14.4 L10.4 11.4 Z" fill="none" stroke="black" stroke-width="1.8" stroke-linejoin="round"/></svg>"#;
 const BELL_SLASH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M7 16.5 V11 A5 5 0 0 1 14.5 6.6 M17 10.5 V16.5 L18.8 18 H6.5 M10 20.2 A2.2 2.2 0 0 0 14 20.2 M12 4.2 V3.4" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.5 4.5 L19.5 19.5" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>"#;
 const ARCHIVE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="4.6" rx="1.3" fill="none" stroke="black" stroke-width="1.8"/><path d="M5.2 9.1 V17.5 A2 2 0 0 0 7.2 19.5 H16.8 A2 2 0 0 0 18.8 17.5 V9.1 M10 13 H14" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round"/></svg>"#;
+const CHEVRON_RIGHT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 4.5 L16.5 12 L9 19.5" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 const CHEVRON_LEFT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M15 4.5 L7.5 12 L15 19.5" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
 const FORWARD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14 5 L20 11 L14 17 M19.5 11 H10.5 C6.4 11 4 13.4 4 17.5 V19" fill="none" stroke="black" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
@@ -43,6 +44,7 @@ pub enum Glyph {
     BellSlash,
     Archive,
     ChevronLeft,
+    ChevronRight,
     Forward,
     ChevronUp,
     ChevronDown,
@@ -69,6 +71,7 @@ pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
         Glyph::BellSlash => BELL_SLASH,
         Glyph::Archive => ARCHIVE,
         Glyph::ChevronLeft => CHEVRON_LEFT,
+        Glyph::ChevronRight => CHEVRON_RIGHT,
         Glyph::Forward => FORWARD,
         Glyph::ChevronUp => CHEVRON_UP,
         Glyph::ChevronDown => CHEVRON_DOWN,

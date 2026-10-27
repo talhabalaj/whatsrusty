@@ -37,6 +37,10 @@ enum Row {
     /// The "Archived" entry above the chats.
     ArchivedEntry,
     Chat(String),
+    /// A community's row (its jid): stands for its groups, which it shows when expanded.
+    Community(String),
+    /// A group shown under its expanded community.
+    CommunityChat(String),
 }
 
 /// With glass: the soft scroll edge under the floating search field, like the
@@ -62,6 +66,8 @@ pub struct Sidebar {
     last_selected: Option<String>,
     /// Showing archived chats instead of the main list.
     archived_view: bool,
+    /// Communities whose groups are shown under them.
+    expanded: std::collections::HashSet<String>,
     /// The New Message picker, with its dismiss subscription.
     new_chat: Option<(Entity<NewChat>, Subscription)>,
     /// When the picker was last dismissed: the click on the compose button that closes it
@@ -99,6 +105,7 @@ impl Sidebar {
             rows: Vec::new(),
             last_selected: None,
             archived_view: false,
+            expanded: Default::default(),
             new_chat: None,
             new_chat_closed_at: None,
             shown_error: None,
@@ -172,9 +179,12 @@ impl Sidebar {
         }
         if let Some(chat) = self.store.read(cx).chats.iter().find(|c| c.jid == jid) {
             self.archived_view = chat.archived;
+            if let Some(community) = &chat.community {
+                self.expanded.insert(community.jid.clone());
+            }
         }
         self.sync_rows(cx);
-        if let Some(ix) = self.rows.iter().position(|r| *r == Row::Chat(jid.clone())) {
+        if let Some(ix) = self.rows.iter().position(|r| matches!(r, Row::Chat(j) | Row::CommunityChat(j) if *j == jid)) {
             self.list.scroll_to_reveal_item(ix);
         }
     }
@@ -193,7 +203,27 @@ impl Sidebar {
         if main_view && chats.iter().any(|c| c.archived) {
             rows.push(Row::ArchivedEntry);
         }
-        rows.extend(self.visible_jids(cx).into_iter().map(Row::Chat));
+        let jids = self.visible_jids(cx);
+        if !main_view {
+            rows.extend(jids.into_iter().map(Row::Chat));
+            return rows;
+        }
+        // A community's groups gather under one row, where its most recent group would be.
+        let community_of = |jid: &str| chats.iter().find(|c| c.jid == jid).and_then(|c| c.community.as_ref()).map(|c| c.jid.clone());
+        let mut seen = std::collections::HashSet::new();
+        for jid in &jids {
+            match community_of(jid) {
+                None => rows.push(Row::Chat(jid.clone())),
+                Some(community) if seen.insert(community.clone()) => {
+                    rows.push(Row::Community(community.clone()));
+                    if self.expanded.contains(&community) {
+                        let members = jids.iter().filter(|j| community_of(j).as_ref() == Some(&community));
+                        rows.extend(members.cloned().map(Row::CommunityChat));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         rows
     }
 
@@ -218,7 +248,9 @@ impl Sidebar {
             Row::ArchivedBack => self.archived_header(theme, cx).into_any_element(),
             Row::Pinned => self.pinned_grid(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
             Row::ArchivedEntry => self.archived_row(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
-            Row::Chat(jid) => {
+            Row::Community(jid) => self.community_row(jid, &chats, theme, cx),
+            Row::Chat(jid) | Row::CommunityChat(jid) => {
+                let member = matches!(row, Row::CommunityChat(_));
                 let state = self.store.read(cx);
                 let Some(chat) = chats.iter().find(|c| &c.jid == jid) else { return div().into_any_element() };
                 let photo = state.avatar_cached(jid);
@@ -232,6 +264,8 @@ impl Sidebar {
                 let pin_count = chats.iter().filter(|c| c.pinned && !c.archived).count();
                 div()
                     .px(px(10.))
+                    // Under its community, indented past the community's avatar.
+                    .when(member, |d| d.pl(px(34.)))
                     .child(chat_row(chat, photo, selected, typing, pin_count, theme, self.store.clone()))
                     .into_any_element()
             }
@@ -251,6 +285,8 @@ impl Sidebar {
             .chats
             .iter()
             .filter(|c| c.archived == self.archived_view)
+            // A community's own chat holds nothing; its groups stand for it.
+            .filter(|c| !c.is_community)
             .filter(|c| searching || self.archived_view || !c.pinned)
             .filter(|c| self.matches(c))
             .map(|c| c.jid.clone())
@@ -339,15 +375,18 @@ impl Sidebar {
             return None;
         }
         let unread = archived.iter().filter(|c| c.unread_count > 0).count();
+        // A full-width row lined up with the chats (icon over the avatars, label over the
+        // names), the unread count and a chevron at its end.
         let row = div()
             .id("archived-row")
-            .mx(px(10.))
-            .h(px(40.))
+            .w_full()
+            .h(px(44.))
             .flex()
             .items_center()
             .gap(px(8.))
-            .pr(px(10.))
+            .pr(px(12.))
             .rounded(px(8.))
+            .cursor_pointer()
             .hover(|s| s.bg(theme.search_bg))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.archived_view = true;
@@ -356,8 +395,109 @@ impl Sidebar {
             .child(div().w(px(14.)).flex_none())
             .child(div().w(px(44.)).flex_none().flex().justify_center().child(glyph(Glyph::Archive, 19., theme.text_secondary)))
             .child(div().flex_1().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).child("Archived"))
-            .when(unread > 0, |d| d.child(div().text_size(px(12.)).text_color(theme.accent).child(unread.to_string())));
+            .when(unread > 0, |d| {
+                d.child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(theme.text_secondary).child(unread.to_string()))
+            })
+            .child(glyph(Glyph::ChevronRight, 11., theme.text_secondary));
+        let row = div().px(px(10.)).pb(px(2.)).child(row);
         Some(row.into_any_element())
+    }
+
+    /// A community: its name, its groups' unread total and latest message; clicking shows
+    /// or hides its groups beneath it.
+    fn community_row(&self, jid: &str, chats: &[ChatSummary], theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let members: Vec<&ChatSummary> =
+            chats.iter().filter(|c| c.community.as_ref().is_some_and(|k| k.jid == jid) && !c.archived).collect();
+        let Some(name) = members.iter().find_map(|c| c.community.as_ref()).map(|k| k.name.clone()) else {
+            return div().into_any_element();
+        };
+        let expanded = self.expanded.contains(jid);
+        let unread = members.iter().any(|c| c.unread_count > 0);
+        let all_muted = members.iter().all(|c| c.muted);
+        let latest = members.iter().filter_map(|c| c.last_message.as_ref().map(|m| (*c, m))).max_by_key(|(_, m)| m.timestamp);
+        let preview = latest
+            .map(|(c, m)| {
+                let text = match (&m.sender_name, m.from_me) {
+                    (_, true) => format!("You: {}", m.text),
+                    (Some(s), false) => format!("{s}: {}", m.text),
+                    _ => m.text.clone(),
+                };
+                crate::links::strip_bidi(&format!("{} · {text}", c.name))
+            })
+            .unwrap_or_else(|| format!("{} groups", members.len()));
+        let time = latest.map(|(_, m)| sidebar_time(m.timestamp)).unwrap_or_default();
+        let photo = self.store.read(cx).avatar_cached(jid);
+        if photo.is_none() {
+            let (store, jid) = (self.store.clone(), jid.to_string());
+            cx.defer(move |cx| store.update(cx, |s, _| s.request_avatar(&jid)));
+        }
+        let secondary = if unread { theme.text } else { theme.text_secondary };
+        let toggle = jid.to_string();
+        let row = div()
+            .id(SharedString::from(format!("community-{jid}")))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pr(px(10.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded.remove(&toggle) {
+                    this.expanded.insert(toggle.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    // Collapsed, the community carries its groups' unread dot.
+                    .when(unread && !expanded, |d| d.child(unread_dot(all_muted, theme))),
+            )
+            .child(avatar(&name, photo, 44., theme))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(1.))
+                    .border_b_1()
+                    .border_color(theme.separator)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.5))
+                                    .font_weight(if unread { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                    .child(name),
+                            )
+                            .child(div().flex_1())
+                            .child(div().flex_none().pl(px(2.)).text_size(px(12.)).text_color(theme.text_secondary).child(time))
+                            .child(glyph(if expanded { Glyph::ChevronDown } else { Glyph::ChevronRight }, 10., theme.text_secondary)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(16.))
+                            .text_color(secondary)
+                            .line_clamp(2)
+                            .text_ellipsis()
+                            .child(preview),
+                    ),
+            );
+        div().px(px(10.)).child(row).into_any_element()
     }
 
     fn pinned_grid(&self, chats: &[ChatSummary], theme: &Theme, cx: &App) -> Option<AnyElement> {

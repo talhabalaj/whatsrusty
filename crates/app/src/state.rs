@@ -108,6 +108,8 @@ pub struct Store {
     /// (`None`: the main window).
     pub lightbox: Option<PathBuf>,
     pub lightbox_in: Option<String>,
+    /// The message whose photo the lightbox shows (for stepping to its neighbours).
+    lightbox_id: Option<String>,
     /// JID whose info panel is open, and the profiles loaded so far.
     pub profile_open: Option<String>,
     pub profiles: HashMap<String, wa_backend::Profile>,
@@ -168,6 +170,7 @@ impl Store {
             replying: HashMap::new(),
             lightbox: None,
             lightbox_in: None,
+            lightbox_id: None,
             profile_open: None,
             profiles: HashMap::new(),
             stickers: Vec::new(),
@@ -331,8 +334,10 @@ impl Store {
                 let focused = self.main_active(cx) && self.selected.as_deref() == Some(chat_jid.as_str());
                 let popped = self.popped.get(&chat_jid).map(|p| p.window);
                 let mini_visible = popped.is_some_and(|w| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false));
-                log::debug!("notify {chat_jid}: focused={focused} mini_visible={mini_visible}");
-                if !focused && !mini_visible {
+                // Archived chats stay quiet, like WhatsApp's "Keep chats archived".
+                let archived = self.chats.iter().any(|c| c.jid == chat_jid && c.archived);
+                log::debug!("notify {chat_jid}: focused={focused} mini_visible={mini_visible} archived={archived}");
+                if !focused && !mini_visible && !archived {
                     cx.show_system_notification(SystemNotification {
                         tag: chat_jid.into(),
                         title: crate::links::strip_bidi(&title).into(),
@@ -687,14 +692,84 @@ impl Store {
     }
 
     pub fn open_lightbox(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.open_lightbox_in(path, None, cx);
+        self.open_lightbox_in(path, None, None, cx);
     }
 
-    /// `mini`: the popped-out chat whose window shows it (`None`: the main window).
-    pub fn open_lightbox_in(&mut self, path: PathBuf, mini: Option<String>, cx: &mut Context<Self>) {
+    /// `id`: the photo's message. `mini`: the popped-out chat whose window shows it (`None`:
+    /// the main window).
+    pub fn open_lightbox_in(&mut self, path: PathBuf, id: Option<String>, mini: Option<String>, cx: &mut Context<Self>) {
         self.lightbox = Some(path);
+        self.lightbox_id = id;
         self.lightbox_in = mini;
         cx.notify();
+    }
+
+    /// The open photo's chat's photos, oldest first: (message id, file once downloaded).
+    fn lightbox_photos(&self) -> (Option<&str>, Vec<(&str, Option<&PathBuf>)>) {
+        let chat = self.lightbox_in.as_deref().or(self.selected.as_deref());
+        let photos = chat
+            .and_then(|c| self.messages.get(c))
+            .into_iter()
+            .flatten()
+            .filter(|m| !m.deleted)
+            .filter_map(|m| match &m.body {
+                MessageBody::Image(media) => Some((m.id.as_str(), media.path.as_ref())),
+                _ => None,
+            })
+            .collect();
+        (chat, photos)
+    }
+
+    fn lightbox_pos(&self, photos: &[(&str, Option<&PathBuf>)]) -> Option<usize> {
+        match &self.lightbox_id {
+            Some(id) => photos.iter().position(|(i, _)| i == id),
+            None => photos.iter().position(|(_, p)| *p == self.lightbox.as_ref()),
+        }
+    }
+
+    /// Whether the lightbox has a downloaded photo before (`-1`) / after (`1`) the open one.
+    pub fn lightbox_can_step(&self, delta: isize) -> bool {
+        let (_, photos) = self.lightbox_photos();
+        let Some(pos) = self.lightbox_pos(&photos) else { return false };
+        let mut ix = pos as isize + delta;
+        while let Some((_, path)) = usize::try_from(ix).ok().and_then(|i| photos.get(i)) {
+            if path.is_some() {
+                return true;
+            }
+            ix += delta;
+        }
+        false
+    }
+
+    /// Show the previous (`-1`) / next (`1`) photo in the lightbox's chat, skipping ones not
+    /// downloaded yet (the nearby ones are fetched, so stepping again reaches them).
+    pub fn step_lightbox(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let (chat, photos) = self.lightbox_photos();
+        let Some(chat) = chat.map(String::from) else { return };
+        let Some(pos) = self.lightbox_pos(&photos) else { return };
+        let missing: Vec<String> = photos
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, p))| p.is_none() && i.abs_diff(pos) <= 4)
+            .map(|(_, (id, _))| id.to_string())
+            .collect();
+        let mut ix = pos as isize + delta;
+        let mut next = None;
+        while let Some((id, path)) = usize::try_from(ix).ok().and_then(|i| photos.get(i)) {
+            if let Some(path) = path {
+                next = Some(((*path).clone(), id.to_string()));
+                break;
+            }
+            ix += delta;
+        }
+        for id in missing {
+            self.request_media(&chat, &id);
+        }
+        if let Some((path, id)) = next {
+            self.lightbox = Some(path);
+            self.lightbox_id = Some(id);
+            cx.notify();
+        }
     }
 
     pub fn close_lightbox(&mut self, cx: &mut Context<Self>) {

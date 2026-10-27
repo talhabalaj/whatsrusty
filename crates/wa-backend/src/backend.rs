@@ -982,6 +982,19 @@ impl Session {
         // One IQ for every group subject instead of one per group.
         match self.client.groups().get_participating().await {
             Ok(groups) => {
+                // Communities themselves (their parent groups), for their names, in case the
+                // groups list leaves them out.
+                let communities = self.client.community().get_participating().await.unwrap_or_else(|e| {
+                    log::debug!("fetching communities: {e}");
+                    Default::default()
+                });
+                let mut links: HashMap<String, (String, Option<String>, bool, String)> = HashMap::new();
+                for (jid, meta) in groups.iter().chain(&communities) {
+                    let jid = jid.to_non_ad_string();
+                    let parent = meta.parent_group_jid.as_ref().map(|p| p.to_non_ad_string());
+                    links.insert(jid.clone(), (jid, parent, meta.is_parent_group, meta.subject.clone()));
+                }
+                let links: Vec<_> = links.into_values().collect();
                 self.shared.store(|s| {
                     s.transaction(|s| {
                         for (jid, meta) in &groups {
@@ -989,7 +1002,7 @@ impl Session {
                                 s.set_chat_name(&jid.to_non_ad_string(), &meta.subject)?;
                             }
                         }
-                        Ok(())
+                        s.set_group_communities(&links)
                     })
                 });
                 let mut requested = self.groups_requested.lock().unwrap_or_else(|e| e.into_inner());

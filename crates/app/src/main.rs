@@ -45,6 +45,7 @@ struct Root {
     store: Entity<Store>,
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
+    lightbox_focus: LightboxFocus,
     _subs: Vec<Subscription>,
 }
 
@@ -68,7 +69,7 @@ impl Root {
                 }
             }),
         ];
-        Self { store, sidebar, conversation, _subs: subs }
+        Self { store, sidebar, conversation, lightbox_focus: LightboxFocus(cx.focus_handle(), false), _subs: subs }
     }
 }
 
@@ -107,17 +108,11 @@ impl Render for Root {
 
         // A photo opened from a mini window shows there instead.
         let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.is_none());
+        follow_lightbox(&mut self.lightbox_focus, lightbox.is_some(), &self.conversation, window, cx);
         div()
             .size_full()
             .relative()
             .font_family(".SystemUIFont")
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                let store = this.store.read(cx);
-                if ev.keystroke.key == "escape" && store.lightbox.is_some() && store.lightbox_in.is_none() {
-                    this.store.update(cx, |s, cx| s.close_lightbox(cx));
-                    cx.stop_propagation();
-                }
-            }))
             .text_color(theme.text)
             .on_action(cx.listener(|this, _: &Logout, _, cx| this.store.read(cx).logout()))
             // ⌘W through this window closes this one (the app-level handler is the fallback).
@@ -144,17 +139,84 @@ impl Render for Root {
                 )
             })
             .when_some(lightbox, |d, path| {
-                d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone())))
+                d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
             })
     }
 }
 
 /// Full-window photo viewer: dimmed backdrop, image fitted to the window, click or
 /// Esc to close.
-fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>) -> impl IntoElement {
+/// The photo viewer's key focus (it takes it while open, so ←/→/Esc reach it rather than
+/// the message field), and whether it was open last frame.
+struct LightboxFocus(FocusHandle, bool);
+
+/// Move key focus into the viewer when it opens, and back to the message field when it closes.
+fn follow_lightbox<T: 'static>(
+    focus: &mut LightboxFocus,
+    open: bool,
+    conversation: &Entity<Conversation>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    if open == focus.1 {
+        return;
+    }
+    focus.1 = open;
+    let (handle, composer) = (focus.0.clone(), conversation.read(cx).composer().clone());
+    window.defer(cx, move |window, cx| {
+        if open {
+            handle.focus(window, cx);
+        } else {
+            composer::Composer::focus(&composer, window, cx);
+        }
+    });
+}
+
+fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &FocusHandle, cx: &App) -> impl IntoElement {
+    let step_button = |delta: isize| {
+        let store = store.clone();
+        let (id, icon) = if delta < 0 { ("lightbox-prev", icons::Glyph::ChevronLeft) } else { ("lightbox-next", icons::Glyph::ChevronRight) };
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .map(|d| if delta < 0 { d.left(px(12.)) } else { d.right(px(12.)) })
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .size(px(36.))
+                    .rounded_full()
+                    .bg(white().opacity(0.15))
+                    .hover(|s| s.bg(white().opacity(0.25)))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icons::glyph(icon, 16., white())),
+            )
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                store.update(cx, |s, cx| s.step_lightbox(delta, cx));
+            })
+    };
+    let (prev, next) = (store.read(cx).lightbox_can_step(-1), store.read(cx).lightbox_can_step(1));
+    let (prev, next) = (prev.then(|| step_button(-1)), next.then(|| step_button(1)));
+    let keys = store.clone();
     let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| store.update(cx, |s, cx| s.close_lightbox(cx));
     div()
         .id("lightbox")
+        .track_focus(focus)
+        .on_key_down(move |ev: &KeyDownEvent, _, cx| {
+            match ev.keystroke.key.as_str() {
+                "left" => keys.update(cx, |s, cx| s.step_lightbox(-1, cx)),
+                "right" => keys.update(cx, |s, cx| s.step_lightbox(1, cx)),
+                "escape" => keys.update(cx, |s, cx| s.close_lightbox(cx)),
+                _ => return,
+            }
+            cx.stop_propagation();
+        })
         .absolute()
         .inset_0()
         .bg(black().opacity(0.88))
@@ -164,6 +226,8 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>) -> impl Into
         .p(px(36.))
         .on_click(close.clone())
         .child(img(path).size_full().object_fit(ObjectFit::Contain))
+        .children(prev)
+        .children(next)
         .child(
             div()
                 .id("lightbox-close")

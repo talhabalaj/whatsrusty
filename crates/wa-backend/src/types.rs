@@ -19,6 +19,17 @@ pub struct ChatSummary {
     pub muted: bool,
     /// Cached profile picture (JPEG on disk), once fetched. See [`Command::FetchAvatar`].
     pub avatar: Option<PathBuf>,
+    /// The community this group belongs to.
+    pub community: Option<CommunityRef>,
+    /// A community itself (its parent group), which holds no conversation of its own.
+    pub is_community: bool,
+}
+
+/// A WhatsApp Community, as one of its groups refers to it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommunityRef {
+    pub jid: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

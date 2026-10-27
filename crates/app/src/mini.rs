@@ -21,6 +21,7 @@ pub struct MiniChat {
     jid: String,
     conversation: Entity<Conversation>,
     title: String,
+    lightbox_focus: crate::LightboxFocus,
     _save_frame: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -40,12 +41,16 @@ pub fn pop_out(store: &Entity<Store>, jid: String, cx: &mut App) {
 }
 
 /// "Open in Main Window": select the chat there and bring the main window forward
-/// (reopening it if it was closed).
+/// (reopening it if it was closed), closing the chat's mini window.
 pub fn open_in_main(store: &Entity<Store>, jid: String, cx: &mut App) {
     let store = store.clone();
     cx.defer(move |cx| {
+        let mini = store.read(cx).popped.get(&jid).map(|p| p.window);
         store.update(cx, |s, cx| s.select(jid, cx));
         crate::open_main_window(store, cx);
+        if let Some(window) = mini {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
     });
 }
 
@@ -176,7 +181,8 @@ impl MiniChat {
         static OPENED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         crate::sidebar::run_debug_ui_script(&format!("WA_DEBUG_UI_MINI_{n}"), window, cx);
-        Self { store, jid, conversation, title: String::new(), _save_frame: None, _subs: subs }
+        let lightbox_focus = crate::LightboxFocus(cx.focus_handle(), false);
+        Self { store, jid, conversation, title: String::new(), lightbox_focus, _save_frame: None, _subs: subs }
     }
 }
 
@@ -191,23 +197,17 @@ impl Render for MiniChat {
             window.set_window_title(&self.title);
         }
         let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.as_deref() == Some(self.jid.as_str()));
+        crate::follow_lightbox(&mut self.lightbox_focus, lightbox.is_some(), &self.conversation, window, cx);
         div()
             .size_full()
             .relative()
             .font_family(".SystemUIFont")
             .text_color(theme.text)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                let store = this.store.read(cx);
-                if ev.keystroke.key == "escape" && store.lightbox.is_some() && store.lightbox_in.as_deref() == Some(this.jid.as_str()) {
-                    this.store.update(cx, |s, cx| s.close_lightbox(cx));
-                    cx.stop_propagation();
-                }
-            }))
             .on_action(|_: &crate::CloseWindow, window, _| window.remove_window())
             .on_action(cx.listener(|this, _: &FindInChat, window, cx| {
                 this.conversation.update(cx, |c, cx| c.open_find(window, cx))
             }))
             .child(self.conversation.clone())
-            .when_some(lightbox, |d, path| d.child(crate::lightbox_overlay(path, self.store.clone())))
+            .when_some(lightbox, |d, path| d.child(crate::lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
     }
 }

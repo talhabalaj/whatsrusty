@@ -88,9 +88,13 @@ impl NewChat {
                 || name.match_indices(&q).any(|(i, _)| !name[..i].ends_with(char::is_alphanumeric))
                 || (digits.len() >= 3 && phone.is_some_and(|p| digits_of(p).contains(&digits)))
         };
+        // Someone known only by their number (no saved or WhatsApp name) shows up only once
+        // a typed number matches it, not among the names.
+        let number_only = |name: &str| !name.chars().any(char::is_alphabetic);
         let mut out: Vec<Candidate> = store
             .contacts
             .iter()
+            .filter(|c| !number_only(&c.name) || (digits.len() >= 3 && phone_like))
             .filter(|c| matches(&c.name, c.phone.as_deref()))
             .map(|c| Candidate::Chat {
                 jid: c.jid.clone(),
