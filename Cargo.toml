@@ -21,12 +21,13 @@ gpui-component = { path = "vendor/gpui-component" }
 # AX clients such as dictation apps can read and confirm insertions.
 # See vendor/gpui-base/src/input/base/a11y_text.rs (search "whatsapp-gpui patch").
 gpui-base = { path = "vendor/gpui-base" }
-# AccessKit attached to the first-responder GPUI view so the focused text field is the
-# system's AXFocusedUIElement. See vendor/gpui-pre-macos/src/window.rs ("whatsapp-gpui patch").
-gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
-# In-window backdrop blur (frosted header/composer): a `BackdropBlur` scene primitive and
-# `Window::paint_backdrop_blur` in gpui-pre, drawn by gpui-pre-apple's Metal renderer.
-# See vendor/gpui-pre/src/scene.rs and vendor/gpui-pre-apple/src/metal_renderer.rs
-# (search "whatsapp-gpui patch").
+# gpui-pre, gpui-pre-apple, gpui-pre-macos (search "whatsapp-gpui patch"):
+# - In-window backdrop blur: a `BackdropBlur` scene primitive and `Window::paint_backdrop_blur`,
+#   drawn by the Metal renderer (vendor/gpui-pre/src/scene.rs, gpui-pre-apple/src/metal_renderer.rs).
+# - Liquid Glass panes: parts of a scene rendered into separate Metal surfaces hosted in
+#   NSGlassEffectViews. See docs/liquid-glass.md.
+# - AccessKit attached to the first-responder GPUI view so the focused text field is the
+#   system's AXFocusedUIElement (vendor/gpui-pre-macos/src/window.rs).
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }

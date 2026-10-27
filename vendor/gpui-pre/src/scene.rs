@@ -52,6 +52,56 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     // whatsapp-gpui patch: in-window backdrop blur.
     pub backdrop_blurs: Vec<BackdropBlur>,
+    // whatsapp-gpui patch: panes. Primitives painted inside a pane go to the pane's own
+    // scene, in pane-local coordinates, so the platform can draw them into a separate
+    // surface (e.g. one hosted inside an NSGlassEffectView, above the main surface).
+    panes: Vec<ScenePane>,
+    active_panes: usize,
+    pane_stack: Vec<usize>,
+}
+
+/// What sits behind a pane's own surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaneMaterial {
+    /// Nothing: a transparent surface stacked above the window's main surface.
+    Plain,
+    /// The platform's glass material (Liquid Glass on macOS 26+), which refracts and
+    /// blurs whatever the main surface draws beneath it.
+    Glass {
+        /// `true` for the clearer, less frosted variant.
+        clear: bool,
+        /// Optional tint mixed into the glass.
+        tint: Option<Hsla>,
+    },
+}
+
+/// A region of the window rendered into its own surface. See [`Scene::push_pane`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneDescriptor {
+    /// Stable across frames, so the platform can reuse its views and layers.
+    pub id: u64,
+    /// In device pixels, aligned to whole pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Corner radius of the glass shape, in device pixels.
+    pub corner_radius: ScaledPixels,
+    /// What the platform puts behind the pane's surface.
+    pub material: PaneMaterial,
+}
+
+/// A pane and the primitives painted into it, translated so the pane's origin is (0, 0).
+#[derive(Default)]
+pub struct ScenePane {
+    /// `None` only for pooled panes not used this frame.
+    pub descriptor: Option<PaneDescriptor>,
+    /// The pane's primitives, in pane-local device pixels.
+    pub scene: Scene,
+}
+
+impl ScenePane {
+    /// The pane's descriptor; always set for panes returned by [`Scene::panes`].
+    pub fn descriptor(&self) -> &PaneDescriptor {
+        self.descriptor.as_ref().expect("active pane without descriptor")
+    }
 }
 
 #[expect(missing_docs)]
@@ -69,6 +119,49 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        // Keep the pane scenes' allocations for the next frame.
+        for pane in &mut self.panes[..self.active_panes] {
+            pane.scene.clear();
+            pane.descriptor = None;
+        }
+        self.active_panes = 0;
+        self.pane_stack.clear();
+    }
+
+    /// Panes painted this frame, in paint order (back to front).
+    pub fn panes(&self) -> &[ScenePane] {
+        &self.panes[..self.active_panes]
+    }
+
+    /// Whether any pane this frame uses the glass material.
+    pub fn has_glass_panes(&self) -> bool {
+        self.panes()
+            .iter()
+            .any(|p| matches!(p.descriptor().material, PaneMaterial::Glass { .. }))
+    }
+
+    /// Route everything painted until [`Scene::pop_pane`] into a new pane.
+    pub fn push_pane(&mut self, descriptor: PaneDescriptor) {
+        self.paint_operations
+            .push(PaintOperation::StartPane(descriptor));
+        if self.active_panes == self.panes.len() {
+            self.panes.push(ScenePane::default());
+        }
+        self.panes[self.active_panes].descriptor = Some(descriptor);
+        self.pane_stack.push(self.active_panes);
+        self.active_panes += 1;
+    }
+
+    pub fn pop_pane(&mut self) {
+        self.pane_stack.pop();
+        self.paint_operations.push(PaintOperation::EndPane);
+    }
+
+    fn current_pane(&mut self) -> Option<(&mut Scene, Point<ScaledPixels>)> {
+        let ix = *self.pane_stack.last()?;
+        let pane = &mut self.panes[ix];
+        let origin = pane.descriptor().bounds.origin;
+        Some((&mut pane.scene, origin))
     }
 
     pub fn len(&self) -> usize {
@@ -76,25 +169,57 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        if let Some((scene, origin)) = self.current_pane() {
+            scene.push_layer_untracked(Bounds::new(bounds.origin - origin, bounds.size));
+            self.paint_operations
+                .push(PaintOperation::StartLayer(bounds));
+            return;
+        }
+        self.push_layer_untracked(bounds);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
+    fn push_layer_untracked(&mut self, bounds: Bounds<ScaledPixels>) {
+        let order = self.primitive_bounds.insert(bounds);
+        self.layer_stack.push(order);
+    }
+
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        match self.current_pane() {
+            Some((scene, _)) => scene.layer_stack.pop(),
+            None => self.layer_stack.pop(),
+        };
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
+        if let Some((scene, origin)) = self.current_pane() {
+            if scene.insert_untracked(primitive.translated(origin)) {
+                self.paint_operations
+                    .push(PaintOperation::Primitive(primitive));
+            }
+            return;
+        }
+        if let Some(primitive) = self.insert_untracked_returning(primitive) {
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+        }
+    }
+
+    /// Inserts without recording a paint operation (pane scenes are never replayed from).
+    fn insert_untracked(&mut self, primitive: Primitive) -> bool {
+        self.insert_untracked_returning(primitive).is_some()
+    }
+
+    fn insert_untracked_returning(&mut self, mut primitive: Primitive) -> Option<Primitive> {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
-            return;
+            return None;
         }
 
         // A blur reads everything under the region it samples, so it must be ordered
@@ -147,8 +272,7 @@ impl Scene {
                 self.backdrop_blurs.push(*blur);
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        Some(primitive)
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -157,6 +281,8 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartPane(descriptor) => self.push_pane(*descriptor),
+                PaintOperation::EndPane => self.pop_pane(),
             }
         }
     }
@@ -174,6 +300,9 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        for pane in &mut self.panes[..self.active_panes] {
+            pane.scene.finish();
+        }
     }
 
     #[cfg_attr(
@@ -232,6 +361,8 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartPane(PaneDescriptor),
+    EndPane,
 }
 
 #[derive(Clone)]
@@ -262,6 +393,67 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropBlur(blur) => &blur.bounds,
         }
+    }
+
+    /// The primitive moved so that `origin` becomes (0, 0).
+    pub fn translated(&self, origin: Point<ScaledPixels>) -> Primitive {
+        fn mask(m: &mut ContentMask<ScaledPixels>, o: Point<ScaledPixels>) {
+            m.bounds.origin = m.bounds.origin - o;
+        }
+        // `M p + t` in window space is `M p' + (t + M o - o)` for `p' = p - o`.
+        fn transform(m: &mut TransformationMatrix, o: Point<ScaledPixels>) {
+            let r = m.rotation_scale;
+            m.translation[0] += r[0][0] * o.x.0 + r[0][1] * o.y.0 - o.x.0;
+            m.translation[1] += r[1][0] * o.x.0 + r[1][1] * o.y.0 - o.y.0;
+        }
+        let mut p = self.clone();
+        match &mut p {
+            Primitive::Shadow(s) => {
+                s.bounds.origin = s.bounds.origin - origin;
+                s.element_bounds.origin = s.element_bounds.origin - origin;
+                mask(&mut s.content_mask, origin);
+            }
+            Primitive::Quad(q) => {
+                q.bounds.origin = q.bounds.origin - origin;
+                mask(&mut q.content_mask, origin);
+            }
+            Primitive::Path(path) => {
+                path.bounds.origin = path.bounds.origin - origin;
+                mask(&mut path.content_mask, origin);
+                for v in &mut path.vertices {
+                    v.xy_position = v.xy_position - origin;
+                    mask(&mut v.content_mask, origin);
+                }
+            }
+            Primitive::Underline(u) => {
+                u.bounds.origin = u.bounds.origin - origin;
+                mask(&mut u.content_mask, origin);
+            }
+            Primitive::MonochromeSprite(s) => {
+                s.bounds.origin = s.bounds.origin - origin;
+                mask(&mut s.content_mask, origin);
+                transform(&mut s.transformation, origin);
+            }
+            Primitive::SubpixelSprite(s) => {
+                s.bounds.origin = s.bounds.origin - origin;
+                mask(&mut s.content_mask, origin);
+                transform(&mut s.transformation, origin);
+            }
+            Primitive::PolychromeSprite(s) => {
+                s.bounds.origin = s.bounds.origin - origin;
+                mask(&mut s.content_mask, origin);
+            }
+            Primitive::Surface(s) => {
+                s.bounds.origin = s.bounds.origin - origin;
+                mask(&mut s.content_mask, origin);
+            }
+            // Inside a pane a blur only sees the pane's own content.
+            Primitive::BackdropBlur(b) => {
+                b.bounds.origin = b.bounds.origin - origin;
+                mask(&mut b.content_mask, origin);
+            }
+        }
+        p
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {

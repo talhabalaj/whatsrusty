@@ -5,7 +5,7 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+    Action, AnyDrag, AnyElement, PaneDescriptor, PaneMaterial, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
@@ -3766,14 +3766,21 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
-        self.paint_deferred_draws(cx);
-
-        if let Some(mut prompt_element) = prompt_element {
-            prompt_element.paint(self, cx);
-        } else if let Some(mut drag_element) = active_drag_element {
-            drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+        // whatsapp-gpui patch: overlays (menus, popovers, prompts, drags, tooltips) are
+        // meant to be above everything, glass panes included, so they get a plain pane of
+        // their own when the window has glass. It costs nothing while nothing is deferred.
+        let overlay_pane = self.next_frame.scene.has_glass_panes()
+            && (!self.next_frame.deferred_draws.is_empty()
+                || prompt_element.is_some()
+                || active_drag_element.is_some()
+                || tooltip_element.is_some());
+        if overlay_pane {
+            let viewport = Bounds::new(Point::default(), self.viewport_size);
+            self.paint_pane(u64::MAX, viewport, Pixels::ZERO, PaneMaterial::Plain, |window| {
+                window.paint_overlays(prompt_element, active_drag_element, tooltip_element, cx)
+            });
+        } else {
+            self.paint_overlays(prompt_element, active_drag_element, tooltip_element, cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3951,6 +3958,23 @@ impl Window {
             self.element_id_stack.clear();
             self.text_style_stack.clear();
             round_start = round_end;
+        }
+    }
+
+    fn paint_overlays(
+        &mut self,
+        prompt_element: Option<AnyElement>,
+        active_drag_element: Option<AnyElement>,
+        tooltip_element: Option<AnyElement>,
+        cx: &mut App,
+    ) {
+        self.paint_deferred_draws(cx);
+        if let Some(mut prompt_element) = prompt_element {
+            prompt_element.paint(self, cx);
+        } else if let Some(mut drag_element) = active_drag_element {
+            drag_element.paint(self, cx);
+        } else if let Some(mut tooltip_element) = tooltip_element {
+            tooltip_element.paint(self, cx);
         }
     }
 
@@ -4541,6 +4565,53 @@ impl Window {
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
+    }
+
+    /// whatsapp-gpui patch: paints `f` into its own surface instead of the window's main
+    /// one. The platform stacks pane surfaces above the main surface in paint order and,
+    /// for [`PaneMaterial::Glass`], puts its glass material behind the pane, sampling the
+    /// main surface beneath. Hit testing, focus and input are unaffected: only where the
+    /// pixels go changes. Content outside `bounds` is clipped.
+    ///
+    /// Platforms without pane support draw nothing for panes, so check
+    /// [`Window::supports_glass_panes`] first.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_pane<R>(
+        &mut self,
+        id: u64,
+        bounds: Bounds<Pixels>,
+        corner_radius: Pixels,
+        material: PaneMaterial,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let scale = self.scale_factor();
+        let scaled = bounds.scale(scale);
+        // Whole device pixels, so the pane's drawable maps 1:1 onto the window.
+        let origin = point(
+            ScaledPixels(scaled.origin.x.0.round()),
+            ScaledPixels(scaled.origin.y.0.round()),
+        );
+        let size = size(
+            ScaledPixels((scaled.origin.x.0 + scaled.size.width.0).round() - origin.x.0),
+            ScaledPixels((scaled.origin.y.0 + scaled.size.height.0).round() - origin.y.0),
+        );
+        self.next_frame.scene.push_pane(PaneDescriptor {
+            id,
+            bounds: Bounds { origin, size },
+            corner_radius: ScaledPixels(corner_radius.0 * scale),
+            material,
+        });
+        let result = self.with_content_mask(Some(ContentMask { bounds }), f);
+        self.next_frame.scene.pop_pane();
+        result
+    }
+
+    /// whatsapp-gpui patch: whether this window renders [`Window::paint_pane`] panes, and
+    /// with which materials.
+    pub fn supports_glass_panes(&self) -> bool {
+        self.platform_window.supports_glass_panes()
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch

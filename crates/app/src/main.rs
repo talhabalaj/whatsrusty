@@ -7,6 +7,7 @@ mod emoji_complete;
 mod find_bar;
 mod forward_picker;
 mod format;
+mod glass;
 mod chrome;
 mod icons;
 mod identity;
@@ -142,7 +143,9 @@ impl Render for Root {
                         .child(text),
                 )
             })
-            .when_some(lightbox, |d, path| d.child(lightbox_overlay(path, self.store.clone())))
+            .when_some(lightbox, |d, path| {
+                d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone())))
+            })
     }
 }
 

@@ -13,6 +13,7 @@ use wa_backend::{ChatMessage, DeliveryStatus, ImageMedia, MediaState, MessageBod
 use crate::audio::AudioPlayer;
 use crate::avatar::avatar;
 use crate::composer::Composer;
+use crate::glass;
 use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
 use crate::forward_picker::{ForwardEvent, ForwardPicker};
 use crate::format::{short_time, transcript_time};
@@ -702,12 +703,15 @@ impl Conversation {
 
     /// Main window: compact centered avatar + name, like Messages (click for info), with
     /// Pop Out at the end. Mini window: avatar + name after the traffic lights, and a
-    /// button that opens the chat in the main window.
+    /// button that opens the chat in the main window. With Liquid Glass the main window's
+    /// avatar + name sit in a glass capsule floating over the transcript instead of a bar.
+    #[allow(clippy::too_many_arguments)]
     fn header(
         &self,
         chat: &wa_backend::ChatSummary,
         typing_label: Option<String>,
         photo: Option<Arc<Image>>,
+        glass_on: bool,
         theme: &Theme,
     ) -> AnyElement {
         let (store, jid) = (self.store.clone(), chat.jid.clone());
@@ -773,16 +777,43 @@ impl Conversation {
         }
         let pop_jid = jid.clone();
         let pop_store = store.clone();
+        let pop_out = icon_button("pop-out", Glyph::PopOut, "Pop Out").right(px(12.)).on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            crate::mini::pop_out(&pop_store, pop_jid.clone(), cx);
+        });
+        if glass_on {
+            let identity = div()
+                .id("chat-header")
+                .cursor_pointer()
+                .on_click(move |_, _, cx| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx)))
+                .h(px(38.))
+                .pl(px(5.))
+                .pr(px(16.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(avatar(&chat.name, photo, 28., theme))
+                .child(names);
+            return div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(HEADER_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(glass::glass("chat-header", 19., identity))
+                .child(pop_out)
+                .into_any_element();
+        }
         bar.h(px(HEADER_HEIGHT))
             .cursor_pointer()
             .on_click(move |_, _, cx| store.update(cx, |s, cx| s.toggle_profile(jid.clone(), cx)))
             .justify_center()
             .child(avatar(&chat.name, photo, 28., theme))
             .child(names)
-            .child(icon_button("pop-out", Glyph::PopOut, "Pop Out").right(px(12.)).on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                crate::mini::pop_out(&pop_store, pop_jid.clone(), cx);
-            }))
+            .child(pop_out)
             .into_any_element()
     }
 
@@ -1834,6 +1865,23 @@ fn typing_bubble(theme: &Theme) -> impl IntoElement {
 }
 
 /// A dimmed layer over the conversation for a dialog; clicking it calls `dismiss`.
+/// With glass, `el` goes into a surface above the glass panes (it covers them).
+pub fn above_glass(glass_on: bool, id: &'static str, el: impl IntoElement) -> AnyElement {
+    if glass_on { glass::above_glass(id, el).into_any_element() } else { el.into_any_element() }
+}
+
+/// Messages' soft scroll edge under the glass bars: the transcript fades into the window
+/// background towards the top (or bottom) edge, so the glass reads over calm content.
+fn edge_fade(top: bool, height: f32, theme: &Theme) -> impl IntoElement {
+    let (solid, clear) = (theme.window_bg.opacity(0.92), theme.window_bg.opacity(0.));
+    let fade = if top {
+        linear_gradient(180., linear_color_stop(solid, 0.), linear_color_stop(clear, 1.))
+    } else {
+        linear_gradient(0., linear_color_stop(solid, 0.), linear_color_stop(clear, 1.))
+    };
+    div().absolute().left_0().right_0().h(px(height)).map(|d| if top { d.top_0() } else { d.bottom_0() }).bg(fade)
+}
+
 fn modal_backdrop(id: &'static str, dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
     div()
         .id(id)
@@ -2006,7 +2054,8 @@ impl Render for Conversation {
             let (store, jid) = (self.store.clone(), jid.to_string());
             cx.defer(move |cx| store.update(cx, |s, cx| s.set_mini_at_latest(&jid, !away, cx)));
         }
-        let header = self.header(&chat, typing_label, header_photo, &theme);
+        let glass_on = glass::enabled(window);
+        let header = self.header(&chat, typing_label, header_photo, glass_on, &theme);
         let confirm = self.confirm_delete.clone();
         let forward = self.forward.as_ref().map(|(p, _)| p.clone());
 
@@ -2046,6 +2095,7 @@ impl Render for Conversation {
                     ),
                 )
             })
+            .when(glass_on && !mini, |d| d.child(edge_fade(true, HEADER_HEIGHT + 12., &theme)))
             .child(header)
             .when_some(find_bar, |d, bar| d.child(div().absolute().top(px(header_height)).left_0().right_0().child(bar)))
             .when_some(self.notice.clone(), |d, text| {
@@ -2060,6 +2110,7 @@ impl Render for Conversation {
                 )
             })
             .when(away, |d| d.child(scroll_button(unseen, bottom, &theme, cx)))
+            .when(glass_on, |d| d.child(edge_fade(false, bottom, &theme)))
             .child(div().absolute().bottom_0().left_0().right_0().child(self.composer.clone()))
             // Files dragged over the conversation: a soft tint and outline; dropped, they're
             // attached. Doesn't occlude, so the transcript still scrolls and takes clicks.
@@ -2095,10 +2146,10 @@ impl Render for Conversation {
             })
             .when_some(confirm, |d, m| {
                 let dialog = self.delete_dialog(&m, &theme, cx);
-                d.child(modal_backdrop("delete-backdrop", cx.listener(|this, _, _, cx| {
+                d.child(above_glass(glass_on, "delete-backdrop", modal_backdrop("delete-backdrop", cx.listener(|this, _, _, cx| {
                     this.confirm_delete = None;
                     cx.notify();
-                })).child(dialog))
+                })).child(dialog)))
             })
             .when_some(self.confirm_link.clone(), |d, link| {
                 let close = |this: &mut Self, cx: &mut Context<Self>| {
@@ -2118,11 +2169,11 @@ impl Render for Conversation {
                 d.child(modal_backdrop("link-backdrop", cx.listener(move |this, _, _, cx| close(this, cx))).child(sheet))
             })
             .when_some(forward, |d, picker| {
-                d.child(modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {
+                d.child(above_glass(glass_on, "forward-backdrop", modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {
                     this.forward = None;
                     Composer::focus(&this.composer, window, cx);
                     cx.notify();
-                })).child(picker))
+                })).child(picker)))
             });
         div()
             .size_full()

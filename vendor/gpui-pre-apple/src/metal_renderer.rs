@@ -109,12 +109,43 @@ impl InstanceBufferPool {
     }
 }
 
+/// whatsapp-gpui patch: the CAMetalLayer a pane is drawn into, and a fingerprint of what
+/// it shows, so unchanged panes aren't drawn and presented again.
+pub struct PaneLayer(metal::MetalLayer, Cell<Option<(u64, Size<DevicePixels>)>>);
+
+impl PaneLayer {
+    /// The `CAMetalLayer`, for hosting in a view.
+    pub fn as_ptr(&self) -> *mut AnyObject {
+        self.0.as_ptr().cast()
+    }
+
+    /// Sets the drawable size (device pixels) and the scale it is displayed at.
+    pub fn set_size(&self, size: Size<DevicePixels>, scale: f32) {
+        self.0
+            .set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+        unsafe {
+            let _: () = objc2::msg_send![self.as_ptr(), setContentsScale: scale as f64];
+        }
+    }
+}
+
+/// whatsapp-gpui patch: a pane scene and the layer it is drawn into.
+pub struct PaneTarget<'a> {
+    /// A layer from [`MetalRenderer::new_pane_layer`] with its drawable size set to `size`.
+    pub layer: &'a PaneLayer,
+    /// The pane's primitives, in pane-local device pixels.
+    pub scene: &'a Scene,
+    /// The pane's size in device pixels.
+    pub size: Size<DevicePixels>,
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    use_display_p3: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -159,7 +190,26 @@ impl MetalRenderer {
         let device = Self::create_device();
         let layer = metal::MetalLayer::new();
         Self::configure_layer(&layer, &device, transparent, use_display_p3);
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        let mut renderer =
+            Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool);
+        renderer.use_display_p3 = use_display_p3;
+        renderer
+    }
+
+    /// whatsapp-gpui patch: a transparent layer for one of the scene's panes, configured
+    /// like the main layer. Its owner sizes it (no autoresizing) and sets its drawable size.
+    pub fn new_pane_layer(&self) -> PaneLayer {
+        let layer = metal::MetalLayer::new();
+        Self::configure_layer(&layer, &self.device, true, self.use_display_p3);
+        #[cfg(target_os = "macos")]
+        {
+            let objc2_layer: &objc2_quartz_core::CAMetalLayer =
+                unsafe { &*layer.as_ptr().cast() };
+            objc2_layer.setAutoresizingMask(objc2_quartz_core::CAAutoresizingMask::empty());
+            objc2_layer.setNeedsDisplayOnBoundsChange(false);
+        }
+        layer.set_presents_with_transaction(self.presents_with_transaction);
+        PaneLayer(layer, Cell::new(None))
     }
 
     /// Creates a renderer for a CAMetalLayer owned by a platform view, such as
@@ -418,6 +468,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            use_display_p3: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -522,6 +573,15 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.draw_with_panes(scene, &[], false);
+    }
+
+    /// whatsapp-gpui patch: draws the main scene and each pane's scene into its own layer
+    /// with one command buffer, so all of them present together. `transaction` presents
+    /// inside the current Core Animation transaction even when the renderer doesn't
+    /// always do so (the caller moved pane views this frame and wants them in sync).
+    pub fn draw_with_panes(&mut self, scene: &Scene, panes: &[PaneTarget<'_>], transaction: bool) {
+        let frame_start = frame_stats::enabled().then(std::time::Instant::now);
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -551,36 +611,91 @@ impl MetalRenderer {
             return;
         };
 
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
-            Ok(command_buffer) => command_buffer,
-            Err(error) => {
-                log::error!("failed to render: {error:#}");
-                return;
-            }
-        };
-
-        if self.presents_with_transaction {
-            command_buffer.commit();
-            command_buffer.wait_until_scheduled();
-            drawable.present();
-        } else {
-            command_buffer.present_drawable(drawable);
-            command_buffer.commit();
-        }
-    }
-
-    fn render_frame(
-        &mut self,
-        scene: &Scene,
-        texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let command_buffer = self.command_queue.new_command_buffer().to_owned();
+        let alpha = if self.opaque { 1. } else { 0. };
+        if let Err(error) = self.encode_scene(
+            scene,
+            &mut writer,
+            &command_buffer,
+            drawable.texture(),
+            viewport_size,
+            alpha,
+        ) {
+            log::error!("failed to render: {error:#}");
+            return;
+        }
+        let mut drawables = vec![drawable.to_owned()];
+        for pane in panes {
+            // Most frames only change the main scene (scrolling under the bars): the pane's
+            // layer keeps showing its last drawable, so don't render or present it again.
+            let fingerprint = scene_fingerprint(pane.scene).map(|hash| (hash, pane.size));
+            if fingerprint.is_some() && pane.layer.1.get() == fingerprint {
+                continue;
+            }
+            let Some(pane_drawable) = pane.layer.0.next_drawable() else {
+                log::error!("failed to retrieve a pane drawable, size: {:?}", pane.size);
+                continue;
+            };
+            if let Err(error) = self.encode_scene(
+                pane.scene,
+                &mut writer,
+                &command_buffer,
+                pane_drawable.texture(),
+                pane.size,
+                0.,
+            ) {
+                log::error!("failed to render a pane: {error:#}");
+                continue;
+            }
+            drawables.push(pane_drawable.to_owned());
+            pane.layer.1.set(fingerprint);
+        }
+        self.release_on_completion(&command_buffer, writer);
+        if let Some(start) = frame_start {
+            frame_stats::record(&command_buffer, &drawables[0], start, drawables.len() - 1);
+        }
+
+        let with_transaction = self.presents_with_transaction || transaction;
+        for pane in panes {
+            if pane.layer.0.presents_with_transaction() != with_transaction {
+                pane.layer.0.set_presents_with_transaction(with_transaction);
+            }
+        }
+        if with_transaction != self.presents_with_transaction {
+            layer.set_presents_with_transaction(with_transaction);
+        }
+        if with_transaction {
+            command_buffer.commit();
+            command_buffer.wait_until_scheduled();
+            for drawable in &drawables {
+                drawable.present();
+            }
+            if with_transaction != self.presents_with_transaction {
+                layer.set_presents_with_transaction(self.presents_with_transaction);
+            }
+        } else {
+            for drawable in &drawables {
+                command_buffer.present_drawable(drawable);
+            }
+            command_buffer.commit();
+        }
+    }
+
+    fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        let instance_bindings = write_instances(scene, writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -592,14 +707,22 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
-        let command_buffer = self.draw_primitives_to_texture(
+        self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
-            &mut writer,
+            writer,
+            command_buffer,
             texture,
             viewport_size,
-        )?;
+            clear_alpha,
+        )
+    }
 
+    fn release_on_completion(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        writer: InstanceBufferWriter,
+    ) {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
@@ -611,7 +734,29 @@ impl MetalRenderer {
         unsafe {
             command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
         }
+    }
 
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    fn render_frame(
+        &mut self,
+        scene: &Scene,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<metal::CommandBuffer> {
+        let mut writer = InstanceBufferWriter::new(
+            &self.device,
+            &self.instance_buffer_pool,
+            self.is_unified_memory,
+        );
+        let command_buffer = self.command_queue.new_command_buffer().to_owned();
+        let alpha = if self.opaque { 1. } else { 0. };
+        self.encode_scene(scene, &mut writer, &command_buffer, texture, viewport_size, alpha)?;
+        // Snapshots show panes where the window would: composite them over the main scene.
+        for pane in scene.panes() {
+            let absolute = window_space_copy(&pane.scene, pane.descriptor().bounds.origin);
+            self.encode_scene(&absolute, &mut writer, &command_buffer, texture, viewport_size, -1.)?;
+        }
+        self.release_on_completion(&command_buffer, writer);
         Ok(command_buffer)
     }
 
@@ -751,19 +896,16 @@ impl MetalRenderer {
         scene: &Scene,
         instance_bindings: &InstanceBindings,
         writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
-        let command_queue = self.command_queue.clone();
-        let command_buffer = command_queue.new_command_buffer();
-        let alpha = if self.opaque { 1. } else { 0. };
-
-        let mut command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            texture,
-            viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
-        );
+        clear_alpha: f64,
+    ) -> Result<()> {
+        // A negative alpha loads the texture instead of clearing it (pane composited onto
+        // the main texture).
+        let clear = (clear_alpha >= 0.).then(|| metal::MTLClearColor::new(0., 0., 0., clear_alpha));
+        let mut command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear);
 
         for batch in scene.batches() {
             match batch {
@@ -847,7 +989,7 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     /// whatsapp-gpui patch: blurs the frame under `blur` and draws it back over its bounds.
@@ -1470,6 +1612,78 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
+/// whatsapp-gpui patch: a hash of everything a scene draws, or `None` if it can't tell
+/// (paths and video surfaces are always redrawn).
+fn scene_fingerprint(scene: &Scene) -> Option<u64> {
+    use std::hash::Hasher;
+    if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
+        return None;
+    }
+    fn bytes<T>(items: &[T]) -> &[u8] {
+        // SAFETY: GPU primitives are plain `repr(C)` data without padding (see
+        // `PaddedBool32`); they're copied byte for byte into instance buffers too.
+        unsafe { slice::from_raw_parts(items.as_ptr().cast::<u8>(), mem::size_of_val(items)) }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in [
+        bytes(&scene.shadows),
+        bytes(&scene.quads),
+        bytes(&scene.underlines),
+        bytes(&scene.monochrome_sprites),
+        bytes(&scene.subpixel_sprites),
+        bytes(&scene.polychrome_sprites),
+    ] {
+        hasher.write_usize(part.len());
+        hasher.write(part);
+    }
+    Some(hasher.finish())
+}
+
+/// whatsapp-gpui patch: a pane's scene moved back from pane-local to window coordinates,
+/// keeping its draw order, so snapshots can draw it over the main scene.
+#[cfg(any(test, feature = "test-support"))]
+fn window_space_copy(scene: &Scene, origin: Point<ScaledPixels>) -> Scene {
+    use gpui::Primitive;
+    let back = point(ScaledPixels(-origin.x.0), ScaledPixels(-origin.y.0));
+    let mut copy = Scene::default();
+    for p in &scene.shadows {
+        if let Primitive::Shadow(p) = Primitive::Shadow(*p).translated(back) {
+            copy.shadows.push(p);
+        }
+    }
+    for p in &scene.quads {
+        if let Primitive::Quad(p) = Primitive::Quad(*p).translated(back) {
+            copy.quads.push(p);
+        }
+    }
+    for p in &scene.paths {
+        if let Primitive::Path(p) = Primitive::Path(p.clone()).translated(back) {
+            copy.paths.push(p);
+        }
+    }
+    for p in &scene.underlines {
+        if let Primitive::Underline(p) = Primitive::Underline(*p).translated(back) {
+            copy.underlines.push(p);
+        }
+    }
+    for p in &scene.monochrome_sprites {
+        if let Primitive::MonochromeSprite(p) = Primitive::MonochromeSprite(*p).translated(back) {
+            copy.monochrome_sprites.push(p);
+        }
+    }
+    for p in &scene.polychrome_sprites {
+        if let Primitive::PolychromeSprite(p) = Primitive::PolychromeSprite(*p).translated(back) {
+            copy.polychrome_sprites.push(p);
+        }
+    }
+    for p in &scene.surfaces {
+        if let Primitive::Surface(p) = Primitive::Surface(p.clone()).translated(back) {
+            copy.surfaces.push(p);
+        }
+    }
+    copy
+}
+
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
@@ -1935,6 +2149,10 @@ mod tests {
     }
 }
 
+
+// whatsapp-gpui patch: kept out of this file, which cbindgen scans for the shader header.
+#[path = "frame_stats.rs"]
+mod frame_stats;
 /// whatsapp-gpui patch: mirrors `BackdropBlurPass` in shaders.metal.
 #[repr(C)]
 struct BackdropBlurPass {

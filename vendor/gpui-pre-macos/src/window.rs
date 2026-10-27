@@ -649,6 +649,8 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
+    // whatsapp-gpui patch: native views hosting the scene's panes.
+    panes: crate::panes::Panes,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -1080,6 +1082,7 @@ impl MacWindow {
                     false,
                     use_display_p3,
                 ),
+                panes: Default::default(),
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1365,6 +1368,7 @@ impl Drop for MacWindow {
         // the adapter here so the native view, its `CAMetalLayer` and the
         // renderer's command queue are actually released with the window.
         drop(this.accesskit_adapter.take());
+        this.panes.clear();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -2098,7 +2102,30 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        if scene.panes().is_empty() && this.panes.is_empty() {
+            this.renderer.draw(scene);
+            return;
+        }
+        let state = &mut *this;
+        let scale = state.scale_factor();
+        let transaction =
+            state
+                .panes
+                .sync(state.native_view.as_ptr(), scale, scene.panes(), &state.renderer);
+        let targets = state.panes.targets(scene.panes());
+        state
+            .renderer
+            .draw_with_panes(scene, &targets, transaction.is_some());
+        drop(targets);
+        // Committing the transaction runs AppKit's display-cycle observers, which call back
+        // into the GPUI view (e.g. `_opaqueRectForWindowMoveWhenInTitlebar`) and lock the
+        // window state: release it first.
+        drop(this);
+        drop(transaction);
+    }
+
+    fn supports_glass_panes(&self) -> bool {
+        crate::panes::glass_available()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

@@ -1127,12 +1127,36 @@ impl Render for Composer {
                 .into_any_element(),
         };
 
+        // With Liquid Glass the band is clear: the + button and the field are glass shapes
+        // floating over the transcript. Without it, a solid band like Messages before 26.
+        let glass_on = crate::glass::enabled(window);
+        let attach = if glass_on {
+            let hover = theme.search_bg;
+            div()
+                .id("attach")
+                .flex_none()
+                .size(px(COMPOSER_HEIGHT))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+        } else {
+            round_button("attach", COMPOSER_HEIGHT, &theme)
+        }
+        .child(glyph(Glyph::Plus, 18., theme.text_secondary))
+        .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)));
+        let field = div().flex_1().min_w_0().flex().flex_col().rounded(px(17.));
+        // Without glass the field lets the frosted bar show through a little, like Messages'.
+        let field = if glass_on { field } else { surface(field, &theme).bg(theme.surface_bg.opacity(0.55)) };
+
         div()
             .relative()
             .w_full()
-            .child(crate::chrome::frosted(theme.bar_tint))
-            .border_t_1()
-            .border_color(theme.separator)
+            .when(!glass_on, |d| {
+                d.child(crate::chrome::frosted(theme.bar_tint)).border_t_1().border_color(theme.separator)
+            })
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             // ↑ is bound to the input's MoveUp action, which runs before key-down listeners.
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| this.on_move_up(window, cx)))
@@ -1157,15 +1181,13 @@ impl Render for Composer {
             .gap(px(8.))
             .px(px(14.))
             .py(px(10.))
-            .child(
-                round_button("attach", COMPOSER_HEIGHT, &theme)
-                    .child(glyph(Glyph::Plus, 18., theme.text_secondary))
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx))),
-            )
-            .child(
-                surface(div().flex_1().min_w_0().flex().flex_col().rounded(px(17.)), &theme)
-                    // Lets the frosted bar show through a little, like Messages' field.
-                    .bg(theme.surface_bg.opacity(0.55))
+            .child(if glass_on {
+                crate::glass::glass("composer-attach", COMPOSER_HEIGHT / 2., attach).into_any_element()
+            } else {
+                attach.into_any_element()
+            })
+            .child({
+                let field = field
                     .when_some(self.mic_notice.clone(), |d, notice| {
                         let detail = div()
                             .id("mic-settings")
@@ -1250,7 +1272,12 @@ impl Render for Composer {
                                         ),
                                 )
                             }),
-                    ),
-            )
+                    );
+                if glass_on {
+                    crate::glass::glass("composer-field", 17., field).into_any_element()
+                } else {
+                    field.into_any_element()
+                }
+            })
     }
 }
