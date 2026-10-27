@@ -15,7 +15,14 @@ pub fn enabled(window: &Window) -> bool {
 /// with `radius` (use half the height for a capsule). Positioned and sized by the child's
 /// own style; events, focus and hit testing are the child's as usual.
 pub fn glass(id: &'static str, radius: f32, child: impl IntoElement) -> Pane {
-    Pane { id: pane_id(id), radius: px(radius), material: PaneMaterial::Glass { clear: false, tint: None }, child: child.into_any_element() }
+    // `WA_GLASS=clear`: the clearer glass variant (for comparisons).
+    static CLEAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let clear = *CLEAR.get_or_init(|| std::env::var("WA_GLASS").is_ok_and(|v| v == "clear"));
+    // `WA_GLASS_PLAIN=<id>,…`: those panes get no glass (to measure each view's cost).
+    static PLAIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let plain = PLAIN.get_or_init(|| std::env::var("WA_GLASS_PLAIN").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default());
+    let material = if plain.iter().any(|p| p == id) { PaneMaterial::Plain } else { PaneMaterial::Glass { clear, tint: None } };
+    Pane { id: pane_id(id), radius: px(radius), material, child: child.into_any_element() }
 }
 
 /// Paints `child` into a plain surface stacked above the glass, for things that must

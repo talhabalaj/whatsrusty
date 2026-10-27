@@ -182,14 +182,15 @@ impl NativePane {
     }
 }
 
-/// Glass panes share one `NSGlassEffectContainerView` covering the GPUI view, which lets
-/// the system render them together (`GPUI_GLASS_CONTAINER=0` puts each glass view
-/// directly in the GPUI view instead, for comparisons). Plain panes stay above it.
+/// `GPUI_GLASS_CONTAINER=1` puts glass panes in one `NSGlassEffectContainerView`
+/// covering the GPUI view (plain panes stay above it). Off by default: measured on macOS
+/// 27 it cost ~15% more WindowServer GPU time than separate glass views, not less (see
+/// docs/liquid-glass.md).
 fn use_container() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         classes().glass_container.is_some()
-            && std::env::var("GPUI_GLASS_CONTAINER").map_or(true, |v| v != "0")
+            && std::env::var("GPUI_GLASS_CONTAINER").is_ok_and(|v| v == "1")
     })
 }
 
