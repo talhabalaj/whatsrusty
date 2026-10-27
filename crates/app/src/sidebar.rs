@@ -28,6 +28,30 @@ const SEARCH_GLASS_HEIGHT: f32 = 32.;
 /// glass they float over the list, which starts below them.
 const SIDEBAR_TOP: f32 = 52. + SEARCH_GLASS_HEIGHT + 8.;
 
+actions!(sidebar, [NewMessage, SearchChats, NextChat, PreviousChat]);
+
+pub fn init(cx: &mut App) {
+    // Also in text fields (the composer, search), which would otherwise take them.
+    for context in [None, Some("Input")] {
+        cx.bind_keys([
+            KeyBinding::new("cmd-n", NewMessage, context),
+            KeyBinding::new("alt-cmd-f", SearchChats, context),
+            KeyBinding::new("ctrl-tab", NextChat, context),
+            KeyBinding::new("ctrl-shift-tab", PreviousChat, context),
+        ]);
+    }
+}
+
+/// What the list's keyboard cursor can rest on.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    ArchivedBack,
+    Pin(String),
+    ArchivedEntry,
+    Community(String),
+    Chat(String),
+}
+
 /// A row of the sidebar list.
 #[derive(Clone, PartialEq)]
 enum Row {
@@ -68,6 +92,11 @@ pub struct Sidebar {
     archived_view: bool,
     /// Communities whose groups are shown under them.
     expanded: std::collections::HashSet<String>,
+    /// Key focus for the list itself (↑/↓ move `cursor`, Enter opens).
+    list_focus: FocusHandle,
+    cursor: Option<Target>,
+    /// Whether the list had key focus this frame (rows draw the cursor's ring then).
+    list_focused: bool,
     /// The New Message picker, with its dismiss subscription.
     new_chat: Option<(Entity<NewChat>, Subscription)>,
     /// When the picker was last dismissed: the click on the compose button that closes it
@@ -91,9 +120,22 @@ impl Sidebar {
                 cx.notify();
             }),
             cx.subscribe_in(&search, window, |this, state, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    this.query = state.read(cx).value().to_lowercase();
-                    cx.notify();
+                match ev {
+                    InputEvent::Change => {
+                        this.query = state.read(cx).value().to_lowercase();
+                        cx.notify();
+                    }
+                    // Enter: open the first match.
+                    InputEvent::PressEnter { .. } if !this.query.is_empty() => {
+                        let first = this.targets(cx).into_iter().find_map(|(t, _)| match t {
+                            Target::Pin(j) | Target::Chat(j) => Some(j),
+                            _ => None,
+                        });
+                        if let Some(jid) = first {
+                            this.store.update(cx, |s, cx| s.open_chat(jid, cx));
+                        }
+                    }
+                    _ => {}
                 }
             }),
         ];
@@ -106,6 +148,9 @@ impl Sidebar {
             last_selected: None,
             archived_view: false,
             expanded: Default::default(),
+            list_focus: cx.focus_handle(),
+            cursor: None,
+            list_focused: false,
             new_chat: None,
             new_chat_closed_at: None,
             shown_error: None,
@@ -245,10 +290,19 @@ impl Sidebar {
         let Some(row) = self.rows.get(ix) else { return div().into_any_element() };
         let chats = self.store.read(cx).chats.clone();
         match row {
-            Row::ArchivedBack => self.archived_header(theme, cx).into_any_element(),
+            Row::ArchivedBack => {
+                let el = self.archived_header(theme, cx).into_any_element();
+                self.ring(&Target::ArchivedBack, el, 10., 10., theme)
+            }
             Row::Pinned => self.pinned_grid(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
-            Row::ArchivedEntry => self.archived_row(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
-            Row::Community(jid) => self.community_row(jid, &chats, theme, cx),
+            Row::ArchivedEntry => {
+                let el = self.archived_row(&chats, theme, cx).unwrap_or_else(|| div().into_any_element());
+                self.ring(&Target::ArchivedEntry, el, 10., 10., theme)
+            }
+            Row::Community(jid) => {
+                let el = self.community_row(jid, &chats, theme, cx);
+                self.ring(&Target::Community(jid.clone()), el, 10., 10., theme)
+            }
             Row::Chat(jid) | Row::CommunityChat(jid) => {
                 let member = matches!(row, Row::CommunityChat(_));
                 let state = self.store.read(cx);
@@ -262,14 +316,204 @@ impl Sidebar {
                     cx.defer(move |cx| store.update(cx, |s, _| s.request_avatar(&jid)));
                 }
                 let pin_count = chats.iter().filter(|c| c.pinned && !c.archived).count();
-                div()
+                let el = div()
                     .px(px(10.))
                     // Under its community, indented past the community's avatar.
                     .when(member, |d| d.pl(px(34.)))
                     .child(chat_row(chat, photo, selected, typing, pin_count, theme, self.store.clone()))
-                    .into_any_element()
+                    .into_any_element();
+                self.ring(&Target::Chat(jid.clone()), el, if member { 34. } else { 10. }, 10., theme)
             }
         }
+    }
+
+    /// Where the cursor can go, in order, with the list row each sits in.
+    fn targets(&self, cx: &App) -> Vec<(Target, usize)> {
+        let chats = &self.store.read(cx).chats;
+        let mut out = Vec::new();
+        for (ix, row) in self.rows.iter().enumerate() {
+            match row {
+                Row::ArchivedBack => out.push((Target::ArchivedBack, ix)),
+                Row::Pinned => out.extend(
+                    chats.iter().filter(|c| c.pinned && !c.archived).map(|c| (Target::Pin(c.jid.clone()), ix)),
+                ),
+                Row::ArchivedEntry => out.push((Target::ArchivedEntry, ix)),
+                Row::Community(jid) => out.push((Target::Community(jid.clone()), ix)),
+                Row::Chat(jid) | Row::CommunityChat(jid) => out.push((Target::Chat(jid.clone()), ix)),
+            }
+        }
+        out
+    }
+
+    /// Put the cursor on `target` (if it's in the list) and scroll it into view.
+    fn move_cursor(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
+        let targets = self.targets(cx);
+        let Some((target, row)) = target.and_then(|t| targets.into_iter().find(|(x, _)| *x == t)) else { return };
+        self.cursor = Some(target);
+        self.list.scroll_to_reveal_item(row);
+        cx.notify();
+    }
+
+    /// Key focus into the list: the cursor on the open chat if it's listed, else the first row.
+    fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.targets(cx);
+        let selected = self.store.read(cx).selected.clone();
+        let start = selected
+            .and_then(|j| targets.iter().find(|(t, _)| matches!(t, Target::Pin(x) | Target::Chat(x) if *x == j)))
+            .or_else(|| targets.iter().find(|(t, _)| matches!(t, Target::Pin(_) | Target::Chat(_))))
+            .or(targets.first())
+            .map(|(t, _)| t.clone());
+        self.list_focus.focus(window, cx);
+        self.move_cursor(start, cx);
+    }
+
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// The community a chat belongs to, when it's listed under it.
+    fn community_of(&self, jid: &str, cx: &App) -> Option<String> {
+        let chat = self.store.read(cx).chats.iter().find(|c| c.jid == jid)?;
+        chat.community.as_ref().map(|c| c.jid.clone()).filter(|c| self.expanded.contains(c))
+    }
+
+    /// Enter / Space on the cursor: open the chat (and type in it), toggle the community,
+    /// go into or out of the archive.
+    fn activate(&mut self, target: Target, cx: &mut Context<Self>) {
+        match target {
+            Target::Pin(jid) | Target::Chat(jid) => self.store.update(cx, |s, cx| s.open_chat(jid, cx)),
+            Target::Community(jid) => {
+                if !self.expanded.remove(&jid) {
+                    self.expanded.insert(jid);
+                }
+            }
+            Target::ArchivedEntry => self.archived_view = true,
+            Target::ArchivedBack => self.archived_view = false,
+        }
+        cx.notify();
+    }
+
+    /// Keys while the list has focus. False: not ours (let it through).
+    fn on_list_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let targets = self.targets(cx);
+        let pos = self.cursor.as_ref().and_then(|c| targets.iter().position(|(t, _)| t == c));
+        let at = |i: usize| targets.get(i).map(|(t, _)| t.clone());
+        match key {
+            "down" => {
+                let next = pos.map_or(0, |p| (p + 1).min(targets.len().saturating_sub(1)));
+                self.move_cursor(at(next), cx);
+            }
+            "up" => match pos {
+                // Above the first row: back up into the search field.
+                Some(0) | None => self.focus_search(window, cx),
+                Some(p) => self.move_cursor(at(p - 1), cx),
+            },
+            "home" => self.move_cursor(at(0), cx),
+            "end" => self.move_cursor(at(targets.len().saturating_sub(1)), cx),
+            "enter" | "space" => {
+                if let Some(target) = self.cursor.clone() {
+                    self.activate(target, cx);
+                    self.sync_rows(cx);
+                    let cursor = self.cursor.clone();
+                    self.move_cursor(cursor, cx);
+                }
+            }
+            "right" => match self.cursor.clone() {
+                Some(Target::Community(jid)) if !self.expanded.contains(&jid) => {
+                    self.expanded.insert(jid);
+                    cx.notify();
+                }
+                _ => {}
+            },
+            "left" => match self.cursor.clone() {
+                Some(Target::Community(jid)) if self.expanded.contains(&jid) => {
+                    self.expanded.remove(&jid);
+                    cx.notify();
+                }
+                // From a community's group up to the community.
+                Some(Target::Chat(jid)) => {
+                    if let Some(community) = self.community_of(&jid, cx) {
+                        self.move_cursor(Some(Target::Community(community)), cx);
+                    }
+                }
+                _ => {}
+            },
+            "escape" => {
+                let community = match &self.cursor {
+                    Some(Target::Chat(jid)) => self.community_of(jid, cx),
+                    _ => None,
+                };
+                if let Some(community) = community {
+                    // Out of a community's groups: fold it up.
+                    self.expanded.remove(&community);
+                    self.sync_rows(cx);
+                    self.move_cursor(Some(Target::Community(community)), cx);
+                } else if self.archived_view {
+                    self.archived_view = false;
+                    self.sync_rows(cx);
+                    self.move_cursor(Some(Target::ArchivedEntry), cx);
+                } else if !self.query.is_empty() {
+                    self.focus_search(window, cx);
+                } else {
+                    // Back to typing in the open chat.
+                    self.cursor = None;
+                    self.store.update(cx, |_, cx| cx.emit(FocusComposer));
+                }
+                cx.notify();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// ⌃Tab / ⌃⇧Tab: the next / previous chat in the list's order (pinned first).
+    pub fn step_chat(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let chats: Vec<String> = self
+            .targets(cx)
+            .into_iter()
+            .filter_map(|(t, _)| match t {
+                Target::Pin(j) | Target::Chat(j) => Some(j),
+                _ => None,
+            })
+            .collect();
+        if chats.is_empty() {
+            return;
+        }
+        let selected = self.store.read(cx).selected.clone();
+        let pos = selected.and_then(|s| chats.iter().position(|j| *j == s));
+        let next = match pos {
+            Some(p) => (p as isize + delta).rem_euclid(chats.len() as isize) as usize,
+            None => 0,
+        };
+        let jid = chats[next].clone();
+        self.store.update(cx, |s, cx| s.select(jid, cx));
+    }
+
+    /// ⌘N.
+    pub fn new_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_chat.is_none() {
+            self.open_new_chat(window, cx);
+        }
+    }
+
+    /// ⌥⌘F: into the search field (out of the archive).
+    pub fn search_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_search(window, cx);
+    }
+
+    /// The cursor's ring, over a row's element (`inset`: its horizontal margins).
+    fn ring(&self, target: &Target, el: AnyElement, left: f32, right: f32, theme: &Theme) -> AnyElement {
+        let on = self.list_focused && self.cursor.as_ref() == Some(target);
+        div()
+            .relative()
+            .child(el)
+            .when(on, |d| {
+                d.child(
+                    div().absolute().top_0().bottom_0().left(px(left)).right(px(right)).rounded(px(8.)).border_2().border_color(theme.accent),
+                )
+            })
+            .into_any_element()
     }
 
     fn matches(&self, c: &ChatSummary) -> bool {
@@ -509,7 +753,8 @@ impl Sidebar {
         let pin_count = pinned.len();
         let tiles = pinned.into_iter().map(|chat| {
             let selected = state.selected.as_deref() == Some(chat.jid.as_str());
-            pinned_tile(chat, state.avatar_cached(&chat.jid), selected, pin_count, theme, self.store.clone())
+            let focused = self.list_focused && self.cursor == Some(Target::Pin(chat.jid.clone()));
+            pinned_tile(chat, state.avatar_cached(&chat.jid), selected, focused, pin_count, theme, self.store.clone())
         });
         Some(div().px(px(10.)).pb(px(6.)).flex().children(tiles).into_any_element())
     }
@@ -521,6 +766,10 @@ impl Render for Sidebar {
         self.sync_rows(cx);
         let error = self.store.read(cx).last_error.clone();
         let glass_on = crate::glass::enabled(window);
+        self.list_focused = self.list_focus.is_focused(window);
+        if !self.list_focused {
+            self.cursor = None;
+        }
         let view = cx.entity();
         let list = list(self.list.clone(), move |ix, window, cx| {
             let theme = Theme::for_window(window);
@@ -541,6 +790,37 @@ impl Render for Sidebar {
             .relative()
             .flex()
             .flex_col()
+            .track_focus(&self.list_focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let key = ev.keystroke.key.as_str();
+                if this.list_focus.is_focused(window) {
+                    if this.on_list_key(key, window, cx) {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                // In the search field: Esc clears the search, then leaves the archive.
+                if key != "escape" {
+                    return;
+                }
+                if !this.query.is_empty() {
+                    this.query.clear();
+                    this.search.update(cx, |s, cx| s.set_value("", window, cx));
+                } else if this.archived_view {
+                    this.archived_view = false;
+                } else {
+                    return;
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            // ↓ in the search field moves into the list (the field takes it as a caret move).
+            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::MoveDown, window, cx| {
+                if this.search.read(cx).focus_handle(cx).is_focused(window) {
+                    this.focus_list(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             // With glass the glass edge is the divider, like a native sidebar.
             .when(!glass_on, |d| d.bg(theme.sidebar_bg).border_r_1().border_color(theme.sidebar_border))
             .map(|d| if glass_on { d.child(list).child(top_fade(&theme)).child(top) } else { d.child(top).child(list) })
@@ -660,6 +940,7 @@ fn pinned_tile(
     chat: &ChatSummary,
     photo: Option<std::sync::Arc<Image>>,
     selected: bool,
+    focused: bool,
     pin_count: usize,
     theme: &Theme,
     store: Entity<Store>,
@@ -677,6 +958,8 @@ fn pinned_tile(
         .items_center()
         .gap(px(5.))
         .rounded(px(10.))
+        .relative()
+        .when(focused, |d| d.child(div().absolute().inset_0().rounded(px(10.)).border_2().border_color(theme.accent)))
         .on_click(move |_, _, cx| {
             let jid = jid.clone();
             click_store.update(cx, |s, cx| s.select(jid, cx));

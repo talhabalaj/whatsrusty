@@ -108,7 +108,8 @@ impl Render for Root {
 
         // A photo opened from a mini window shows there instead.
         let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.is_none());
-        follow_lightbox(&mut self.lightbox_focus, lightbox.is_some(), &self.conversation, window, cx);
+        let video = store.video.clone().filter(|_| store.video_in.is_none());
+        follow_lightbox(&mut self.lightbox_focus, lightbox.is_some() || video.is_some(), &self.conversation, window, cx);
         div()
             .size_full()
             .relative()
@@ -120,6 +121,14 @@ impl Render for Root {
             .on_action(cx.listener(|this, _: &conversation::FindInChat, window, cx| {
                 this.conversation.update(cx, |c, cx| c.open_find(window, cx))
             }))
+            .on_action(cx.listener(|this, _: &sidebar::NewMessage, window, cx| {
+                this.sidebar.update(cx, |s, cx| s.new_message(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &sidebar::SearchChats, window, cx| {
+                this.sidebar.update(cx, |s, cx| s.search_chats(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &sidebar::NextChat, _, cx| this.sidebar.update(cx, |s, cx| s.step_chat(1, cx))))
+            .on_action(cx.listener(|this, _: &sidebar::PreviousChat, _, cx| this.sidebar.update(cx, |s, cx| s.step_chat(-1, cx))))
             .child(body)
             .when_some(banner, |d, text| {
                 d.child(
@@ -141,11 +150,13 @@ impl Render for Root {
             .when_some(lightbox, |d, path| {
                 d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
             })
+            .when_some(video, |d, video| {
+                let overlay = video_overlay(video, None, self.store.clone(), &self.lightbox_focus.0);
+                d.child(conversation::above_glass(glass::enabled(window), "video", overlay))
+            })
     }
 }
 
-/// Full-window photo viewer: dimmed backdrop, image fitted to the window, click or
-/// Esc to close.
 /// The photo viewer's key focus (it takes it while open, so ←/→/Esc reach it rather than
 /// the message field), and whether it was open last frame.
 struct LightboxFocus(FocusHandle, bool);
@@ -172,6 +183,8 @@ fn follow_lightbox<T: 'static>(
     });
 }
 
+/// Full-window photo viewer: dimmed backdrop, image fitted to the window, click or
+/// Esc to close, ←/→ for the chat's other photos.
 fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &FocusHandle, cx: &App) -> impl IntoElement {
     let step_button = |delta: isize| {
         let store = store.clone();
@@ -251,6 +264,68 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
         )
 }
 
+
+/// The in-app video player: AVKit's player (see `video_player`) fitted into the window
+/// over a dimmed backdrop. Esc, a click outside the video or ✕ closes it; Space plays and
+/// pauses. `key`: which window's player (`None`: the main window).
+fn video_overlay(video: state::OpenVideo, key: Option<String>, store: Entity<Store>, focus: &FocusHandle) -> impl IntoElement {
+    let (keys, close_store) = (store.clone(), store.clone());
+    let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| close_store.update(cx, |s, cx| s.close_video(cx));
+    let toggle_key = key.clone();
+    let (w, h) = match (video.width, video.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w as f32, h as f32),
+        _ => (16., 9.),
+    };
+    div()
+        .id("video")
+        .absolute()
+        .inset_0()
+        .bg(black().opacity(0.88))
+        .track_focus(focus)
+        .on_key_down(move |ev: &KeyDownEvent, _, cx| {
+            match ev.keystroke.key.as_str() {
+                "escape" => keys.update(cx, |s, cx| s.close_video(cx)),
+                "space" => video_player::toggle(&toggle_key),
+                _ => return,
+            }
+            cx.stop_propagation();
+        })
+        .on_click(close.clone())
+        .px(px(36.))
+        .pt(px(56.))
+        .pb(px(36.))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    // The video's aspect, as large as fits, centered.
+                    let scale = (f32::from(bounds.size.width) / w).min(f32::from(bounds.size.height) / h);
+                    let size = size(px(w * scale), px(h * scale));
+                    let origin = bounds.origin + point((bounds.size.width - size.width) / 2., (bounds.size.height - size.height) / 2.);
+                    if !video_player::place(&key, &video.path, Bounds::new(origin, size), window) {
+                        window.request_animation_frame();
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .child(
+            div()
+                .id("video-close")
+                .absolute()
+                .top(px(14.))
+                .right(px(16.))
+                .size(px(30.))
+                .rounded_full()
+                .bg(white().opacity(0.15))
+                .hover(|s| s.bg(white().opacity(0.25)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icons::glyph(icons::Glyph::Close, 14., white()))
+                .on_click(close),
+        )
+}
 
 fn live_backend() -> wa_backend::BackendHandle {
     let config = wa_backend::BackendConfig { data_dir: identity::data_dir(), device_name: identity::APP_NAME.into() };
@@ -427,6 +502,7 @@ fn main() {
         recorder::warm_up();
         text_replace::TextReplacements::init(cx);
         conversation::init(cx);
+        sidebar::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| {
@@ -533,7 +609,8 @@ fn main() {
             audio::AudioPlayer::toggle(cx, "debug-play", std::path::Path::new(&path));
         }
         if let Some(path) = std::env::var_os("WA_DEBUG_VIDEO") {
-            video_player::play(std::path::Path::new(&path), "Test video", None, None);
+            let video = state::OpenVideo { path: path.into(), width: None, height: None };
+            debug_store.update(cx, |s, cx| s.open_video_in(video, None, cx));
         }
         cx.activate(true);
     });

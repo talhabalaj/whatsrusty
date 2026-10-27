@@ -110,6 +110,10 @@ pub struct Store {
     pub lightbox_in: Option<String>,
     /// The message whose photo the lightbox shows (for stepping to its neighbours).
     lightbox_id: Option<String>,
+    /// Video playing over the app, and the mini window's chat it opened in (`None`: the
+    /// main window).
+    pub video: Option<OpenVideo>,
+    pub video_in: Option<String>,
     /// JID whose info panel is open, and the profiles loaded so far.
     pub profile_open: Option<String>,
     pub profiles: HashMap<String, wa_backend::Profile>,
@@ -137,6 +141,14 @@ impl EventEmitter<StoreEvent> for Store {}
 
 /// Ask the composer to take keyboard focus (a chat was just picked in New Message).
 pub struct FocusComposer;
+
+/// A video shown in the in-app player.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenVideo {
+    pub path: PathBuf,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
 impl EventEmitter<FocusComposer> for Store {}
 
 impl Store {
@@ -171,6 +183,8 @@ impl Store {
             lightbox: None,
             lightbox_in: None,
             lightbox_id: None,
+            video: None,
+            video_in: None,
             profile_open: None,
             profiles: HashMap::new(),
             stickers: Vec::new(),
@@ -545,6 +559,7 @@ impl Store {
         self.replying.clear();
         self.lightbox = None;
         self.lightbox_in = None;
+        self.close_video(cx);
         self.profile_open = None;
         self.profiles.clear();
         self.stickers.clear();
@@ -768,6 +783,21 @@ impl Store {
         if let Some((path, id)) = next {
             self.lightbox = Some(path);
             self.lightbox_id = Some(id);
+            cx.notify();
+        }
+    }
+
+    /// Play a video over the window it was opened from (`mini`: that chat's mini window).
+    pub fn open_video_in(&mut self, video: OpenVideo, mini: Option<String>, cx: &mut Context<Self>) {
+        self.close_video(cx);
+        self.video = Some(video);
+        self.video_in = mini;
+        cx.notify();
+    }
+
+    pub fn close_video(&mut self, cx: &mut Context<Self>) {
+        if self.video.take().is_some() {
+            crate::video_player::close(&self.video_in);
             cx.notify();
         }
     }

@@ -47,6 +47,7 @@ pub fn video(
     m: &ChatMessage,
     v: &VideoMedia,
     thumb: Option<Arc<Image>>,
+    mini: Option<String>,
     theme: &Theme,
     cx: &mut App,
 ) -> Stateful<Div> {
@@ -91,9 +92,12 @@ pub fn video(
         .child(div().absolute().bottom(px(8.)).right(px(if v.round { 70. } else { 8. })).child(pill(status.unwrap_or(badge))))
         .on_click({
             let (store, chat, id, path) = (store.clone(), m.chat_jid.clone(), m.id.clone(), v.path.clone());
-            let (title, w, h) = (m.sender_name.clone().unwrap_or_else(|| "Video".into()), v.width, v.height);
+            let (width, height) = (v.width, v.height);
             move |_, _, cx| match &path {
-                Some(p) => crate::video_player::play(p, &title, w, h),
+                Some(p) => store.update(cx, |s, cx| {
+                    let video = crate::state::OpenVideo { path: p.clone(), width, height };
+                    s.open_video_in(video, mini.clone(), cx)
+                }),
                 None => store.update(cx, |s, _| s.request_media(&chat, &id)),
             }
         })
