@@ -18,6 +18,20 @@ pub fn glass(id: &'static str, radius: f32, child: impl IntoElement) -> Pane {
     glass_material(id, radius, false, child)
 }
 
+/// A round glass button, like macOS 26 toolbar buttons: `button` (with its id, icon,
+/// handlers and position) gets the circle's size, shape and hover, then glass behind it.
+pub fn circle_button(id: &'static str, size: f32, hover: Hsla, button: Stateful<Div>) -> Pane {
+    let button = button
+        .size(px(size))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover));
+    glass(id, size / 2., button)
+}
+
 /// Like [`glass`], with the glass AppKit puts behind window sidebars: edge-to-edge, a
 /// subtle shade over the window background, no shadow.
 pub fn sidebar_glass(id: &'static str, child: impl IntoElement) -> Pane {

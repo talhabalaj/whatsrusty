@@ -186,6 +186,8 @@ struct Shared {
     /// The sticker list may have changed (debounced, sent if the UI asked for it).
     stickers_dirty: Notify,
     preview_slots: Semaphore,
+    /// The app is in front (`Command::SetActive`): online to WhatsApp only then.
+    active: AtomicBool,
 }
 
 #[derive(Default)]
@@ -276,6 +278,7 @@ impl Shared {
             chats_dirty: Notify::new(),
             stale: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(0),
+            active: AtomicBool::new(false),
             blocking_jobs: Arc::new(Semaphore::new(BLOCKING_PERMITS as usize)),
             own_jid: Mutex::new(None),
             own_lid: Mutex::new(None),
@@ -729,6 +732,7 @@ impl EventHandler for Forwarder {
             EventKind::Messages,
             EventKind::Receipt,
             EventKind::ChatPresence,
+            EventKind::OfflineSyncCompleted,
             EventKind::ContactUpdate,
             EventKind::PushNameUpdate,
             EventKind::PinUpdate,
@@ -939,6 +943,29 @@ impl Session {
         }
     }
 
+    /// Online while the app is in front, offline otherwise (see `Command::SetActive`).
+    async fn apply_presence(&self) {
+        let presence = self.client.presence();
+        let result = if self.shared.active.load(Ordering::Relaxed) {
+            presence.set_available().await
+        } else {
+            presence.set_unavailable().await
+        };
+        if let Err(e) = result {
+            log::debug!("presence: {e:?}");
+        }
+    }
+
+    /// The library sends "available" by itself after connecting (and after its offline
+    /// catch-up): re-apply ours once that's out.
+    fn correct_presence_soon(self: &Arc<Self>) {
+        let session = self.clone();
+        self.track(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            session.apply_presence().await;
+        }));
+    }
+
     fn request_group_name(&self, jid: &str) {
         let first = self.groups_requested.lock().unwrap_or_else(|e| e.into_inner()).insert(jid.to_owned());
         if first {
@@ -1044,7 +1071,11 @@ impl Session {
                 // Read receipts that couldn't be sent before.
                 let session = self.clone();
                 self.track(tokio::spawn(async move { send_receipts(&session.shared, &session, None).await }));
+                self.correct_presence_soon();
             }
+            // The library goes online after a connect's offline catch-up: undo that if the
+            // app isn't in front.
+            E::OfflineSyncCompleted(_) => self.correct_presence_soon(),
             E::Disconnected(d) => {
                 shared.emit(Event::Connection(ConnectionState::Disconnected { reason: d.reason.to_string() }));
             }
@@ -1655,6 +1686,12 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 }
                 (Some((unread, 0)), _) if unread > 0 => shared.mark_chats_dirty(),
                 _ => {}
+            }
+        }
+        Command::SetActive { active } => {
+            shared.active.store(active, Ordering::Relaxed);
+            if let Some(session) = session {
+                session.apply_presence().await;
             }
         }
         Command::SetTyping { chat_jid, typing } => {

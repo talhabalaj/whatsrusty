@@ -11,6 +11,21 @@ pub fn trailing_query(text: &str) -> Option<&str> {
     (before_ok && valid).then_some(query)
 }
 
+/// How many emoji `text` is, when it's nothing but 1–5 of them (spaces allowed): such
+/// messages show large, without a bubble, like WhatsApp.
+pub fn emoji_only(text: &str) -> Option<usize> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let mut n = 0;
+    for g in text.graphemes(true).filter(|g| !g.trim().is_empty()) {
+        let emoji = emojis::get(g).or_else(|| emojis::get(g.trim_end_matches('\u{fe0f}')));
+        if emoji.is_none() || n == 5 {
+            return None;
+        }
+        n += 1;
+    }
+    (n > 0).then_some(n)
+}
+
 /// `text` ending in a complete `:shortcode:` with that shortcode replaced by its emoji.
 pub fn expand_complete(text: &str) -> Option<String> {
     let body = text.strip_suffix(':')?;
@@ -126,6 +141,19 @@ pub fn suggest(query: &str, limit: usize) -> Vec<Suggestion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_only_messages() {
+        assert_eq!(emoji_only("❤️"), Some(1));
+        assert_eq!(emoji_only("😂😂 👍"), Some(3));
+        assert_eq!(emoji_only("👍🏽"), Some(1));
+        assert_eq!(emoji_only("👨‍👩‍👧"), Some(1));
+        assert_eq!(emoji_only("😀😀😀😀😀"), Some(5));
+        assert_eq!(emoji_only("😀😀😀😀😀😀"), None);
+        assert_eq!(emoji_only("ok 👍"), None);
+        assert_eq!(emoji_only("1"), None);
+        assert_eq!(emoji_only("  "), None);
+    }
 
     #[test]
     fn finds_trailing_query() {

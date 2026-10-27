@@ -774,12 +774,57 @@ impl Conversation {
             .top_0()
             .left_0()
             .right_0()
+            // Over the transcript: clicks stop here (scrolling goes through).
+            .block_mouse_except_scroll()
             .child(frosted(theme.bar_tint))
             .border_b_1()
             .border_color(theme.separator)
             .flex()
             .items_center()
             .gap(px(8.));
+        if self.binding.fixed().is_some() && glass_on {
+            // Like the main window's: the name in a glass capsule, a glass button at the end.
+            let identity = div()
+                .id("chat-header")
+                .h(px(30.))
+                .pl(px(4.))
+                .pr(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(avatar(&chat.name, photo, 22., theme))
+                .child(names);
+            let expand = div()
+                .id("open-in-main")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .my_auto()
+                .right(px(8.))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open in Main Window").build(window, cx))
+                .child(glyph(Glyph::Expand, 13., theme.text))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::mini::open_in_main(&store, jid.clone(), cx);
+                });
+            return div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                // Floating over the transcript: clicks stop here (scrolling goes through).
+                .block_mouse_except_scroll()
+                .h(px(MINI_HEADER_HEIGHT))
+                .flex()
+                .items_center()
+                .justify_center()
+                // Clear of the traffic lights.
+                .pl(px(70.))
+                .pr(px(44.))
+                .child(glass::glass("chat-header", 15., identity))
+                .child(glass::circle_button("chat-open-in-main", 28., theme.search_bg, expand))
+                .into_any_element();
+        }
         if self.binding.fixed().is_some() {
             return bar
                 .h(px(MINI_HEADER_HEIGHT))
@@ -798,11 +843,27 @@ impl Conversation {
         }
         let pop_jid = jid.clone();
         let pop_store = store.clone();
+        let (glass_pop_store, glass_pop_jid) = (store.clone(), jid.clone());
         let pop_out = icon_button("pop-out", Glyph::PopOut, "Pop Out").right(px(12.)).on_click(move |_, _, cx| {
             cx.stop_propagation();
             crate::mini::pop_out(&pop_store, pop_jid.clone(), cx);
         });
         if glass_on {
+            // A glass circle like the sidebar's New Message button.
+            let pop_out = div()
+                .id("pop-out")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .my_auto()
+                .right(px(12.))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Pop Out").build(window, cx))
+                .child(glyph(Glyph::PopOut, 15., theme.text))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::mini::pop_out(&glass_pop_store, glass_pop_jid.clone(), cx);
+                });
+            let pop_out = glass::circle_button("chat-pop-out", 32., theme.search_bg, pop_out);
             let identity = div()
                 .id("chat-header")
                 .cursor_pointer()
@@ -820,6 +881,8 @@ impl Conversation {
                 .top_0()
                 .left_0()
                 .right_0()
+                // Floating over the transcript: clicks stop here (scrolling goes through).
+                .block_mouse_except_scroll()
                 .h(px(HEADER_HEIGHT))
                 .flex()
                 .items_center()
@@ -922,6 +985,15 @@ impl Conversation {
             )
             .into_any_element(),
             MessageBody::Voice(media) => voice_content(&self.store, m, media, from_me, last, theme, window, cx),
+            // Just a few emoji: large, without a bubble, like WhatsApp.
+            MessageBody::Text(t) if found.is_none() && let Some(n) = crate::emoji_complete::emoji_only(t) => {
+                let size = match n {
+                    1 => 52.,
+                    2 | 3 => 42.,
+                    _ => 34.,
+                };
+                div().px(px(2.)).text_size(px(size)).line_height(px(size * 1.2)).child(t.trim().to_string()).into_any_element()
+            }
             MessageBody::Text(t) => bubble(found_text(format!("text-{}", m.id).into(), t, found, &m.mentions, from_me, theme, cx), from_me, last, theme)
                 .into_any_element(),
             MessageBody::Unsupported { label } => {
@@ -1093,7 +1165,8 @@ impl Conversation {
                         d.child(div().flex_none().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button))
                     }),
             )
-            .when(m.edited, |d| {
+            // With a status line below, "Edited" joins it ("Edited · Read 8:36 PM").
+            .when(m.edited && status.is_none(), |d| {
                 d.child(
                     div()
                         .pt(px(2.))
@@ -1113,7 +1186,7 @@ impl Conversation {
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if *failed { theme.failed } else { theme.text_secondary })
-                        .child(label.clone())
+                        .child(if m.edited { format!("Edited · {label}") } else { label.clone() })
                         .when(*failed, |d| {
                             d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
                                 let target = retry_target.clone();
@@ -1737,7 +1810,13 @@ fn found_text(
     let (text, links) = (linked.text, linked.links);
     let matches = found.map(|(query, _)| match_ranges(&text, query)).unwrap_or_default();
     if matches.is_empty() && mentioned.is_empty() && links.is_empty() {
-        return text_content(&text, false);
+        // Plain text can be selected (drag, ⌘C). Links and mentions need clicks, which
+        // the selectable text doesn't take; their menu's Copy covers them.
+        let selection = if from_me { white().opacity(0.35) } else { theme.accent.opacity(0.35) };
+        return div()
+            .text_size(px(14.))
+            .line_height(px(19.))
+            .child(gpui_kit::base::SelectableText::new(id, text).selection_color(selection));
     }
     let current = found.is_some_and(|(_, current)| current);
     let find_style = HighlightStyle {
@@ -2021,6 +2100,7 @@ fn modal_backdrop(id: &'static str, dismiss: impl Fn(&MouseDownEvent, &mut Windo
 fn scroll_button(unseen: usize, bottom: f32, theme: &Theme, cx: &mut Context<Conversation>) -> impl IntoElement {
     div()
         .absolute()
+        .block_mouse_except_scroll()
         .right(px(18.))
         .bottom(px(bottom + 10.))
         .child(
@@ -2149,7 +2229,8 @@ fn status_label(m: &ChatMessage) -> (String, bool) {
         DeliveryStatus::Sent => ("Sent".into(), false),
         DeliveryStatus::Delivered => ("Delivered".into(), false),
         DeliveryStatus::Read => (format!("Read {}", short_time(m.timestamp)), false),
-        DeliveryStatus::Failed => ("Not Delivered · Try Again".into(), true),
+        // Red, beside the bubble's red "!": that says it didn't go.
+        DeliveryStatus::Failed => ("Try Again".into(), true),
     }
 }
 
@@ -2256,9 +2337,11 @@ impl Render for Conversation {
                     ),
                 )
             })
-            .when(glass_on && !mini, |d| d.child(edge_fade(true, HEADER_HEIGHT + 12., &theme)))
+            .when(glass_on, |d| d.child(edge_fade(true, header_height + 12., &theme)))
             .child(header)
-            .when_some(find_bar, |d, bar| d.child(div().absolute().top(px(header_height)).left_0().right_0().child(bar)))
+            .when_some(find_bar, |d, bar| {
+                d.child(div().absolute().top(px(header_height)).left_0().right_0().block_mouse_except_scroll().child(bar))
+            })
             .when_some(self.notice.clone(), |d, text| {
                 d.child(
                     div().absolute().top(px(top + 10.)).left_0().right_0().flex().justify_center().child(
@@ -2272,7 +2355,8 @@ impl Render for Conversation {
             })
             .when(away, |d| d.child(scroll_button(unseen, bottom, &theme, cx)))
             .when(glass_on, |d| d.child(edge_fade(false, bottom, &theme)))
-            .child(div().absolute().bottom_0().left_0().right_0().child(self.composer.clone()))
+            // Floating over the transcript: clicks on it stop there (scrolling goes through).
+            .child(div().absolute().bottom_0().left_0().right_0().block_mouse_except_scroll().child(self.composer.clone()))
             // Files dragged over the conversation: a soft tint and outline; dropped, they're
             // attached. Doesn't occlude, so the transcript still scrolls and takes clicks.
             .child({
@@ -2340,7 +2424,7 @@ impl Render for Conversation {
             .size_full()
             .flex()
             .child(pane)
-            .when_some(profile_open, |d, jid| d.child(crate::profile::panel(&jid, &self.store, &theme, cx)))
+            .when_some(profile_open, |d, jid| d.child(crate::profile::panel(&jid, &self.store, glass_on, &theme, cx)))
             .into_any_element()
     }
 }

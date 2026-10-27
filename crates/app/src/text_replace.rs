@@ -20,7 +20,8 @@ impl TextReplacements {
         cx.set_global(this.clone());
         cx.background_executor()
             .spawn(async move {
-                let map = load();
+                let mut map = builtin();
+                map.extend(load());
                 log::info!("loaded {} text replacements", map.len());
                 if let Ok(mut w) = this.0.write() {
                     *w = map;
@@ -36,6 +37,11 @@ impl TextReplacements {
         let map = this.0.read().ok()?;
         expand_with(&map, text)
     }
+}
+
+/// Shortcuts WhatsApp expands itself (the user's own replacements win).
+fn builtin() -> HashMap<String, String> {
+    [("<3", "❤️"), ("</3", "💔")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
 fn is_boundary(c: char) -> bool {

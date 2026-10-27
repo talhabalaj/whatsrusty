@@ -143,6 +143,8 @@ impl MiniChat {
             }),
             // Coming to the window reads the chat, if its newest messages are on screen.
             cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                this.store.update(cx, |s, cx| s.window_activation_changed(active, cx));
                 let store = this.store.read(cx);
                 if window.is_window_active() && store.popped.get(&this.jid).is_some_and(|p| p.at_latest) {
                     store.mark_read_if_unread(&this.jid);
