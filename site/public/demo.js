@@ -1,6 +1,8 @@
 // A live, clickable replica of the app window: messages arrive, the "user" replies,
 // and visitors can pick any conversation or type their own message.
 
+import { liquidGlass } from './glass.js';
+
 const chats = [
   { id: 'ayesha', name: 'Ayesha Khan', time: '7:26 PM', msgs: [
     { text: 'Are we still on for tonight?' },
@@ -58,6 +60,10 @@ const visitorReplies = [
 ];
 
 export function startDemo(root) {
+  liquidGlass(root, [
+    { el: root.querySelector('.d-thread'), bg: [30 / 255, 30 / 255, 30 / 255], fade: h => [64, h - 58] },
+    { el: root.querySelector('.d-list'), bg: [42 / 255, 39 / 255, 38 / 255], fade: () => [98, 0] },
+  ]);
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const $ = selector => root.querySelector(selector);
   const list = $('.d-list'), thread = $('.d-thread'), title = $('.d-head strong'), titleAvatar = $('.d-head .d-av');
