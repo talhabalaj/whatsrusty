@@ -2734,8 +2734,6 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d862bc8f2e27710039013d075ac4995892e9687ff207fa530f880cbcd513936f"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3077,8 +3075,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-macos"
 version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e07a5e5c84f0b2160c194a1c852cc89d1942db66867938ceabcd7f763cb4386"
 dependencies = [
  "accesskit",
  "accesskit_macos",

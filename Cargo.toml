@@ -17,6 +17,13 @@ log = "0.4"
 # Skips a startup font enumeration that blocks the UI for seconds on macOS.
 # See vendor/gpui-component/src/theme/system_font.rs (search "whatsapp-gpui patch").
 gpui-component = { path = "vendor/gpui-component" }
+# Editor text exposed to accessibility (text runs, caret, character count) so macOS
+# AX clients such as dictation apps can read and confirm insertions.
+# See vendor/gpui-base/src/input/base/a11y_text.rs (search "whatsapp-gpui patch").
+gpui-base = { path = "vendor/gpui-base" }
+# AccessKit attached to the first-responder GPUI view so the focused text field is the
+# system's AXFocusedUIElement. See vendor/gpui-pre-macos/src/window.rs ("whatsapp-gpui patch").
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
 # In-window backdrop blur (frosted header/composer): a `BackdropBlur` scene primitive and
 # `Window::paint_backdrop_blur` in gpui-pre, drawn by gpui-pre-apple's Metal renderer.
 # See vendor/gpui-pre/src/scene.rs and vendor/gpui-pre-apple/src/metal_renderer.rs
