@@ -19,6 +19,7 @@ mod mentions;
 mod mini;
 mod new_chat;
 mod mock;
+mod native_menu;
 mod pairing;
 mod profile;
 mod recorder;
