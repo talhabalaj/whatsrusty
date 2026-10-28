@@ -224,7 +224,7 @@ pub fn location(m: &ChatMessage, l: &LocationInfo, thumb: Option<Arc<Image>>, th
         .bg(bg)
         .cursor_pointer()
         .child(div().w_full().h(px(140.)).bg(theme.search_bg).map(|d| match thumb {
-            Some(t) => d.child(img(t).size_full().object_fit(ObjectFit::Cover)),
+            Some(t) => d.child(img(t).w(px(CARD_W)).h(px(140.)).aspect_ratio(CARD_W / 140.).object_fit(ObjectFit::Cover)),
             None => d.flex().items_center().justify_center().text_size(px(34.)).child("📍"),
         }))
         .child(

@@ -664,7 +664,10 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     continue;
                 };
                 match &mut m.body {
-                    MessageBody::Image(img) => img.path = mock_photo(),
+                    // Portrait photos (the album's) get a portrait crop.
+                    MessageBody::Image(img) => {
+                        img.path = if img.height > img.width { mock_portrait_photo() } else { mock_photo() }
+                    }
                     MessageBody::Voice(v) => v.path = mock_voice(v.duration_secs),
                     _ => continue,
                 }
@@ -855,6 +858,23 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
 }
 
 /// A real photo for the mock: a macOS wallpaper thumbnail converted to JPEG.
+fn mock_portrait_photo() -> Option<std::path::PathBuf> {
+    let out = std::env::temp_dir().join("wa-mock-photo-portrait.jpg");
+    if !out.exists() {
+        let ok = std::process::Command::new("sips")
+            .args(["-z", "900", "500"])
+            .arg(mock_photo()?)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 fn mock_photo() -> Option<std::path::PathBuf> {
     let out = std::env::temp_dir().join("wa-mock-photo.jpg");
     if !out.exists() {
