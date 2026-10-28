@@ -6,13 +6,10 @@ use std::cell::Cell;
 use std::ops::Range;
 
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use linkify::{LinkFinder, LinkKind};
 use url::{Host, Url};
 
-use crate::chrome::surface;
-use crate::theme::Theme;
 
 const TRAILING: &[char] = &['”', '’', '»', '›', '」', '』', '、', '。', '，', '！', '？', '：', '；', '）'];
 
@@ -340,14 +337,9 @@ pub fn open(link: &Link, cx: &mut App) {
     cx.open_url(link.url.as_str());
 }
 
-/// Bubble text with its links clickable: normal ones open, suspicious ones call
-/// `confirm` (which shows [`confirm_sheet`]); hovering shows where a link goes.
-pub fn interactive(
-    id: SharedString,
-    text: StyledText,
-    links: Vec<Link>,
-    confirm: impl Fn(Link, &mut Window, &mut App) + 'static,
-) -> Div {
+/// Bubble text with its links clickable: normal ones open, suspicious ones ask first
+/// ([`confirm`]); hovering shows where a link goes.
+pub fn interactive(id: SharedString, text: StyledText, links: Vec<Link>) -> Div {
     let hits = links.iter().map(Link::hit_range).collect();
     let links = std::rc::Rc::new(links);
     let tips = links.clone();
@@ -376,93 +368,25 @@ pub fn interactive(
         )
 }
 
-/// "This link may not be what it looks like": the real destination (ASCII / punycode
-/// host) emphasized, why it's suspicious, and Open / Cancel.
-pub fn confirm_sheet(
-    link: &Link,
-    theme: &Theme,
-    on_open: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let button = |key: &'static str, label: &'static str, primary: bool| {
-        div()
-            .id(key)
-            .h(px(28.))
-            .flex_1()
-            .rounded(px(7.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(13.))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(if primary { white() } else { theme.text })
-            .map(|d| if primary { d.bg(theme.accent) } else { d.bg(theme.search_bg) })
-            .cursor_pointer()
-            .hover(|s| s.opacity(0.85))
-            .child(label)
-    };
+/// "This link may not be what it looks like" (a native alert): the real destination
+/// (ASCII / punycode host), why it's suspicious, and Cancel / Open Link.
+pub fn confirm(link: Link, window: &mut Window, cx: &mut App) {
     let mut full = link.url.to_string();
     if full.chars().count() > 160 {
         full = full.chars().take(160).collect::<String>() + "…";
     }
     let mut reasons: Vec<&str> = link.warnings.iter().map(|w| w.describe()).collect();
     reasons.dedup();
-    surface(div(), theme)
-        .id("link-dialog")
-        .occlude()
-        .w(px(320.))
-        .p(px(18.))
-        .rounded(px(12.))
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(6.))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(div().text_size(px(22.)).text_color(hsla(36. / 360., 0.95, 0.5, 1.)).child("\u{26A0}\u{FE0E}"))
-        .child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.text)
-                .text_center()
-                .child("This link may not be what it looks like"),
-        )
-        .child(div().text_size(px(11.5)).text_color(theme.text_secondary).child("It really goes to:"))
-        .child(
-            div()
-                .max_w_full()
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(6.))
-                .bg(theme.search_bg)
-                .text_size(px(14.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.text)
-                .text_center()
-                .child(link.destination.clone()),
-        )
-        .child(div().max_w_full().text_size(px(10.5)).text_center().text_color(theme.text_secondary).child(full))
-        .child(
-            div()
-                .pb(px(8.))
-                .flex()
-                .flex_col()
-                .items_center()
-                .text_size(px(11.5))
-                .line_height(px(15.))
-                .text_center()
-                .text_color(theme.text_secondary)
-                .children(reasons.into_iter().map(|r| div().child(r))),
-        )
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .gap(px(8.))
-                .child(button("link-cancel", "Cancel", true).on_click(on_cancel))
-                .child(button("link-open", "Open Link", false).on_click(on_open)),
-        )
+    let detail = format!("It really goes to {}\n{full}\n\n{}", link.destination, reasons.join("\n"));
+    // Cancel first: Return doesn't open it.
+    let answers = [PromptButton::cancel("Cancel"), PromptButton::new("Open Link")];
+    let answer = window.prompt(PromptLevel::Warning, "This link may not be what it looks like", Some(&detail), &answers, cx);
+    cx.spawn(async move |cx| {
+        if answer.await == Ok(1) {
+            cx.update(|cx| open(&link, cx));
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

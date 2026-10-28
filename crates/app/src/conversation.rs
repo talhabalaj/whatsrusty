@@ -13,6 +13,7 @@ use wa_backend::{ChatMessage, DeliveryStatus, ImageMedia, MediaState, MessageBod
 use crate::audio::AudioPlayer;
 use crate::avatar::avatar;
 use crate::composer::Composer;
+use crate::native_menu::Item;
 use crate::glass;
 use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
 use crate::forward_picker::{ForwardEvent, ForwardPicker};
@@ -111,12 +112,6 @@ pub struct Conversation {
     is_group: bool,
     /// Message whose tapback tray is open.
     picker_for: Option<String>,
-    /// Where its context menu opened (right-click), in window coordinates.
-    menu_at: Option<Point<Pixels>>,
-    /// Message whose "Delete…" confirmation is showing.
-    confirm_delete: Option<ChatMessage>,
-    /// Suspicious link clicked: "This link may not be what it looks like" is showing.
-    confirm_link: Option<crate::links::Link>,
     forward: Option<(Entity<ForwardPicker>, Subscription)>,
     find: Option<Find>,
     /// A quoted message / search hit to scroll to once it's loaded.
@@ -184,8 +179,6 @@ impl Conversation {
                 StoreEvent::AccountReset => {
                     this.find = None;
                     this.forward = None;
-                    this.confirm_delete = None;
-                    this.confirm_link = None;
                     this.pending_jump = None;
                     this.rows.clear();
                     this.messages.clear();
@@ -219,9 +212,6 @@ impl Conversation {
             is_group: false,
             // Test hook: open the tapback tray for a message id.
             picker_for: None,
-            menu_at: None,
-            confirm_delete: None,
-            confirm_link: None,
             forward: None,
             find: None,
             pending_jump: None,
@@ -283,8 +273,6 @@ impl Conversation {
             self.away.set(false);
             self.pending_jump = None;
             self.highlight = None;
-            self.confirm_delete = None;
-            self.confirm_link = None;
             self.picker_for = None;
             self.find = None;
         }
@@ -630,9 +618,7 @@ impl Conversation {
 
     /// Esc closes the topmost thing open over the conversation; false if nothing was.
     fn on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.confirm_link.take().is_some() || self.confirm_delete.take().is_some() {
-            cx.notify();
-        } else if self.picker_for.is_some() {
+        if self.picker_for.is_some() {
             self.close_menu(cx);
         } else if self.binding.fixed().is_none() && self.store.read(cx).profile_open.is_some() {
             self.store.update(cx, |s, cx| s.close_profile(cx));
@@ -644,7 +630,6 @@ impl Conversation {
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         self.picker_for = None;
-        self.menu_at = None;
         cx.notify();
     }
 
@@ -684,7 +669,11 @@ impl Conversation {
                                     this.open_forward(m, window, cx);
                                 }
                             }
-                            "WA_DEBUG_DELETE" => this.confirm_delete = find_message(this),
+                            "WA_DEBUG_DELETE" => {
+                                if let Some(m) = find_message(this) {
+                                    this.confirm_delete(m, window, cx);
+                                }
+                            }
                             "WA_DEBUG_PICKER" => this.picker_for = Some(value.clone()),
                             // "<id>|everyone", "<id>|me", "<id>|retry", "<id>|fwd:<chat>"
                             "WA_DEBUG_ACT" => {
@@ -704,12 +693,11 @@ impl Conversation {
                             }
                             "WA_DEBUG_MENU" => {
                                 // Right-click near the message's bubble.
-                                if let Some(row) = this.row_of(&value) {
+                                if let (Some(row), Some(m)) = (this.row_of(&value), find_message(this)) {
                                     let at = this.list.bounds_for_item(row).map_or(point(px(640.), px(420.)), |b| {
                                         point(b.origin.x + px(260.), b.origin.y + b.size.height - px(10.))
                                     });
-                                    this.picker_for = Some(value.clone());
-                                    this.menu_at = Some(at);
+                                    this.open_message_menu(&m, at, window, cx);
                                 }
                             }
                             "WA_DEBUG_JUMP" => this.jump_to(value.clone(), None, true, cx),
@@ -1004,7 +992,7 @@ impl Conversation {
                 };
                 div().px(px(2.)).text_size(px(size)).line_height(px(size * 1.2)).child(t.trim().to_string()).into_any_element()
             }
-            MessageBody::Text(t) => bubble(found_text(format!("text-{}", m.id).into(), t, found, &m.mentions, from_me, theme, cx), from_me, last, theme)
+            MessageBody::Text(t) => bubble(found_text(format!("text-{}", m.id).into(), t, found, &m.mentions, from_me, theme), from_me, last, theme)
                 .into_any_element(),
             MessageBody::Unsupported { label } => {
                 bubble(text_content(label, true), from_me, last, theme).into_any_element()
@@ -1038,7 +1026,6 @@ impl Conversation {
         let react_button = hover_button(format!("react-{}", m.id), Glyph::Smile).on_click(cx.listener(
             move |this, _, _, cx| {
                 this.picker_for = Some(react_id.clone());
-                this.menu_at = None;
                 cx.notify();
             },
         ));
@@ -1110,10 +1097,9 @@ impl Conversation {
                         ),
                 )
             })
-            .when(picker_open && !m.deleted, |d| d.child(self.reaction_picker(m, from_me, theme, cx)))
-            .when(picker_open && self.menu_at.is_some(), |d| d.child(self.message_menu(m, theme, cx)));
+            .when(picker_open && !m.deleted, |d| d.child(self.reaction_picker(m, from_me, theme, cx)));
 
-        let right_click_id = m.id.clone();
+        let right_clicked = m.clone();
         let row = div()
             .id(SharedString::from(format!("row-{}", m.id)))
             .group(group.clone())
@@ -1208,10 +1194,8 @@ impl Conversation {
             // Right-click opens the tapback tray and the message's menu, like Messages.
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    this.picker_for = Some(right_click_id.clone());
-                    this.menu_at = Some(ev.position);
-                    cx.notify();
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    this.open_message_menu(&right_clicked, ev.position, window, cx);
                 }),
             );
 
@@ -1353,163 +1337,93 @@ impl Conversation {
         .with_priority(1)
     }
 
-    /// The right-click menu: Reply, Copy, Forward…, Edit, Delete…, at the cursor.
-    fn message_menu(&self, m: &ChatMessage, theme: &Theme, cx: &mut Context<Self>) -> Deferred {
-        let at = self.menu_at.unwrap_or_default();
-        let item = |key: &str, label: &'static str, destructive: bool| {
-            let (fg, hover_bg) = (if destructive { theme.failed } else { theme.text }, theme.accent);
-            div()
-                .id(SharedString::from(format!("menu-{key}-{}", m.id)))
-                .h(px(24.))
-                .mx(px(5.))
-                .px(px(9.))
-                .rounded(px(5.))
-                .flex()
-                .items_center()
-                .text_size(px(13.))
-                .text_color(fg)
-                .hover(move |s| s.bg(hover_bg).text_color(white()))
-                .child(label)
+    /// Right-click: the tapback tray over the bubble and the message's menu (native), like
+    /// Messages. The tray stays after the menu closes, for a reaction.
+    fn open_message_menu(&mut self, m: &ChatMessage, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_for = Some(m.id.clone());
+        cx.notify();
+        let this = cx.entity().downgrade();
+        let act = move |f: fn(&mut Self, ChatMessage, &mut Window, &mut Context<Self>), target: &ChatMessage| {
+            let (this, target) = (this.clone(), target.clone());
+            move |window: &mut Window, cx: &mut App| {
+                let _ = this.update(cx, |this, cx| {
+                    this.close_menu(cx);
+                    f(this, target, window, cx);
+                });
+            }
         };
-        let mut items: Vec<AnyElement> = Vec::new();
+        let mut items = Vec::new();
         if !m.deleted {
-            let target = m.clone();
-            items.push(
-                item("reply", "Reply", false)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.store.update(cx, |s, cx| s.set_replying_to(&target.chat_jid, Some(target.clone()), cx));
-                        this.close_menu(cx);
+            items.push(Item::action(
+                "Reply",
+                act(
+                    |this, target, window, cx| {
+                        this.store.update(cx, |s, cx| s.set_replying_to(&target.chat_jid.clone(), Some(target), cx));
                         Composer::focus(&this.composer, window, cx);
-                    }))
-                    .into_any_element(),
-            );
+                    },
+                    m,
+                ),
+            ));
         }
-        if let Some(text) = copy_text(m) {
-            items.push(
-                item("copy", "Copy", false)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                        this.close_menu(cx);
-                    }))
-                    .into_any_element(),
-            );
+        if copy_text(m).is_some() {
+            items.push(Item::action(
+                "Copy",
+                act(
+                    |_, target, _, cx| {
+                        if let Some(text) = copy_text(&target) {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    },
+                    m,
+                ),
+            ));
         }
         if Store::can_forward(m) {
-            let target = m.clone();
-            items.push(
-                item("forward", "Forward…", false)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.close_menu(cx);
-                        this.open_forward(target.clone(), window, cx);
-                    }))
-                    .into_any_element(),
-            );
+            items.push(Item::action("Forward…", act(|this, target, window, cx| this.open_forward(target, window, cx), m)));
         }
         if Store::can_edit(m) {
-            let target = m.clone();
-            items.push(
-                item("edit", "Edit", false)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.close_menu(cx);
-                        Composer::start_edit(&this.composer, target.clone(), window, cx);
-                    }))
-                    .into_any_element(),
-            );
+            items.push(Item::action(
+                "Edit",
+                act(|this, target, window, cx| Composer::start_edit(&this.composer, target, window, cx), m),
+            ));
         }
         // A queued send would still go out after its row is gone: no Delete while sending.
         let sending = m.from_me && m.status == DeliveryStatus::Pending;
-        if !items.is_empty() && !sending {
-            items.push(div().h(px(1.)).mx(px(10.)).my(px(4.)).bg(theme.separator).into_any_element());
+        if !sending {
+            if !items.is_empty() {
+                items.push(Item::Separator);
+            }
+            items.push(Item::action("Delete…", act(|this, target, window, cx| this.confirm_delete(target, window, cx), m)));
         }
-        let target = m.clone();
-        items.extend((!sending).then(|| {
-            item("delete", "Delete…", true)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.close_menu(cx);
-                    this.confirm_delete = Some(target.clone());
-                    cx.notify();
-                }))
-                .into_any_element()
-        }));
-        deferred(
-            anchored().position(at).snap_to_window_with_margin(px(8.)).child(
-                surface(div(), theme)
-                    .id(SharedString::from(format!("menu-{}", m.id)))
-                    .occlude()
-                    .min_w(px(180.))
-                    .py(px(5.))
-                    .rounded(px(8.))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .children(items),
-            ),
-        )
-        .with_priority(2)
+        if !items.is_empty() {
+            crate::native_menu::show(items, at, window, cx);
+        }
     }
 
-    /// "Delete Message?" alert: for everyone (my recent messages) and/or just for me.
-    fn delete_dialog(&self, m: &ChatMessage, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let everyone = Store::can_delete_for_everyone(m);
+    /// "Delete Message?" alert (native): for everyone (my recent messages) and/or just for me.
+    fn confirm_delete(&mut self, m: ChatMessage, window: &mut Window, cx: &mut Context<Self>) {
+        let everyone = Store::can_delete_for_everyone(&m);
         let detail = if everyone {
             "Delete it for everyone in this chat, or only on your devices."
         } else {
             "It will be deleted on your devices. Others in the chat can still see it."
         };
-        let button = |key: &'static str, label: &'static str, primary: bool, destructive: bool| {
-            let fg = if primary { white() } else if destructive { theme.failed } else { theme.text };
-            div()
-                .id(key)
-                .h(px(28.))
-                .w_full()
-                .rounded(px(7.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(fg)
-                .map(|d| if primary { d.bg(theme.failed) } else { d.bg(theme.search_bg) })
-                .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
-                .child(label)
+        // Return picks the first: the one that can be undone least, so not that.
+        let answers: &[PromptButton] = if everyone {
+            &[PromptButton::new("Delete for Me"), PromptButton::new("Delete for Everyone"), PromptButton::cancel("Cancel")]
+        } else {
+            &[PromptButton::new("Delete for Me"), PromptButton::cancel("Cancel")]
         };
-        let delete = |for_everyone: bool| {
-            let target = m.clone();
-            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
-                this.store.read(cx).delete_message(&target, for_everyone);
-                this.confirm_delete = None;
-                cx.notify();
-            })
-        };
-        surface(div(), theme)
-            .id("delete-dialog")
-            .occlude()
-            .w(px(280.))
-            .p(px(18.))
-            .rounded(px(12.))
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(6.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(theme.text).child("Delete Message?"))
-            .child(
-                div()
-                    .pb(px(8.))
-                    .text_size(px(11.5))
-                    .line_height(px(15.))
-                    .text_center()
-                    .text_color(theme.text_secondary)
-                    .child(detail),
-            )
-            .when(everyone, |d| d.child(button("delete-everyone", "Delete for Everyone", true, true).on_click(delete(true))))
-            .child(button("delete-me", "Delete for Me", !everyone, true).on_click(delete(false)))
-            .child(button("delete-cancel", "Cancel", false, false).on_click(cx.listener(|this, _, _, cx| {
-                this.confirm_delete = None;
-                cx.notify();
-            })))
+        let answer = window.prompt(PromptLevel::Warning, "Delete Message?", Some(detail), answers, cx);
+        cx.spawn(async move |this, cx| {
+            let for_everyone = match answer.await {
+                Ok(0) => false,
+                Ok(1) if everyone => true,
+                _ => return,
+            };
+            let _ = this.update(cx, |this, cx| this.store.read(cx).delete_message(&m, for_everyone));
+        })
+        .detach();
     }
 
     /// Who's typing in this chat (JID, display name), for group typing labels.
@@ -1721,7 +1635,7 @@ impl Conversation {
                 .when(from_me, |d| d.items_end())
                 .child(frame)
                 .child(bubble(
-                    found_text(format!("caption-{}", m.id).into(), caption, found, &m.mentions, from_me, theme, cx),
+                    found_text(format!("caption-{}", m.id).into(), caption, found, &m.mentions, from_me, theme),
                     from_me,
                     last,
                     theme,
@@ -1814,7 +1728,6 @@ fn found_text(
     mentions: &[wa_backend::Mention],
     from_me: bool,
     theme: &Theme,
-    cx: &Context<Conversation>,
 ) -> Div {
     let (text, mentioned) = crate::mentions::display(text, mentions);
     let linked = crate::links::linkify(&text, &mentioned);
@@ -1884,13 +1797,7 @@ fn found_text(
     if links.is_empty() {
         return body.child(styled);
     }
-    let this = cx.entity().downgrade();
-    body.child(crate::links::interactive(id, styled, links, move |link, _, cx| {
-        let _ = this.update(cx, |this, cx| {
-            this.confirm_link = Some(link);
-            cx.notify();
-        });
-    }))
+    body.child(crate::links::interactive(id, styled, links))
 }
 
 fn text_content(text: &str, italic: bool) -> Div {
@@ -2304,7 +2211,6 @@ impl Render for Conversation {
         }
         let glass_on = glass::enabled(window);
         let header = self.header(&chat, typing_label, header_photo, glass_on, &theme);
-        let confirm = self.confirm_delete.clone();
         let forward = self.forward.as_ref().map(|(p, _)| p.clone());
 
         let pane = div()
@@ -2401,30 +2307,6 @@ impl Render for Conversation {
                     )
                     .with_priority(0),
                 )
-            })
-            .when_some(confirm, |d, m| {
-                let dialog = self.delete_dialog(&m, &theme, cx);
-                d.child(above_glass(glass_on, "delete-backdrop", modal_backdrop("delete-backdrop", cx.listener(|this, _, _, cx| {
-                    this.confirm_delete = None;
-                    cx.notify();
-                })).child(dialog)))
-            })
-            .when_some(self.confirm_link.clone(), |d, link| {
-                let close = |this: &mut Self, cx: &mut Context<Self>| {
-                    this.confirm_link = None;
-                    cx.notify();
-                };
-                let target = link.clone();
-                let sheet = crate::links::confirm_sheet(
-                    &link,
-                    &theme,
-                    cx.listener(move |this, _, _, cx| {
-                        crate::links::open(&target, cx);
-                        close(this, cx);
-                    }),
-                    cx.listener(move |this, _, _, cx| close(this, cx)),
-                );
-                d.child(modal_backdrop("link-backdrop", cx.listener(move |this, _, _, cx| close(this, cx))).child(sheet))
             })
             .when_some(forward, |d, picker| {
                 d.child(above_glass(glass_on, "forward-backdrop", modal_backdrop("forward-backdrop", cx.listener(|this, _, window, cx| {

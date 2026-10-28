@@ -37,7 +37,7 @@ thread_local! {
     static ESCAPE_MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
-fn gpui_view(window: &Window) -> Option<Retained<NSView>> {
+pub(crate) fn gpui_view(window: &Window) -> Option<Retained<NSView>> {
     let Ok(handle) = HasWindowHandle::window_handle(window) else { return None };
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
     // SAFETY: GPUI's live content view, on the main thread.

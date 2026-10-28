@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use crate::native_menu::Item;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -882,69 +882,64 @@ fn error_toast(text: String, theme: &Theme, store: Entity<Store>) -> impl IntoEl
         .child(text)
 }
 
-/// Right-click menu of a chat (row or pinned tile).
+/// Right-click menu of a chat (row or pinned tile): a native menu.
 fn with_chat_menu<E>(element: E, chat: &ChatSummary, pin_count: usize, store: Entity<Store>) -> impl IntoElement
 where
     E: InteractiveElement + ParentElement + Styled + IntoElement + 'static,
 {
     let chat = chat.clone();
-    element.context_menu(move |menu, window, cx| chat_menu(menu, &chat, pin_count, &store, window, cx))
+    element.on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, window, cx| {
+        cx.stop_propagation();
+        crate::native_menu::show(chat_menu(&chat, pin_count, &store), ev.position, window, cx);
+    })
 }
 
-fn chat_menu(
-    menu: PopupMenu,
-    chat: &ChatSummary,
-    pin_count: usize,
-    store: &Entity<Store>,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
+fn chat_menu(chat: &ChatSummary, pin_count: usize, store: &Entity<Store>) -> Vec<Item> {
     let jid = chat.jid.clone();
-    let mut menu = menu.min_w(px(180.));
+    let mut items = Vec::new();
     let j = jid.clone();
-    menu = menu.item(menu_item(store, "Pop Out", move |s, cx| crate::mini::pop_out(s, j.clone(), cx))).separator();
+    items.push(menu_item(store, "Pop Out", move |s, cx| crate::mini::pop_out(s, j.clone(), cx)));
+    items.push(Item::Separator);
     if !chat.archived {
         let pinned = chat.pinned;
         let j = jid.clone();
-        menu = menu.item(
+        items.push(
             menu_item(store, if pinned { "Unpin" } else { "Pin" }, move |s, cx| s.read(cx).set_pinned(&j, !pinned))
-                .disabled(!pinned && pin_count >= MAX_PINNED),
+                .enabled(pinned || pin_count < MAX_PINNED),
         );
     }
     let j = jid.clone();
-    menu = menu.item(match chat.unread_count > 0 {
+    items.push(match chat.unread_count > 0 {
         true => menu_item(store, "Mark as Read", move |s, cx| s.read(cx).mark_read(&j)),
         false => menu_item(store, "Mark as Unread", move |s, cx| s.update(cx, |s, cx| s.mark_unread(&j, cx))),
     });
-    menu = menu.separator();
+    items.push(Item::Separator);
     if chat.muted {
         let j = jid.clone();
-        menu = menu.item(menu_item(store, "Unmute", move |s, cx| s.read(cx).set_muted(&j, 0)));
+        items.push(menu_item(store, "Unmute", move |s, cx| s.read(cx).set_muted(&j, 0)));
     } else {
-        let (j, store) = (jid.clone(), store.clone());
-        menu = menu.submenu("Mute", window, cx, move |m, _, _| {
-            let option = |label: &str, secs: Option<i64>| {
-                let (j, store) = (j.clone(), store.clone());
-                PopupMenuItem::new(label.to_string()).on_click(move |_, _, cx| {
-                    let until = secs.map_or(i64::MAX, |s| chrono::Utc::now().timestamp() + s);
-                    store.read(cx).set_muted(&j, until);
-                })
-            };
-            m.min_w(px(140.))
-                .item(option("For 8 Hours", Some(8 * 3600)))
-                .item(option("For 1 Week", Some(7 * 86_400)))
-                .item(option("Always", None))
-        });
+        let option = |label: &str, secs: Option<i64>| {
+            let j = jid.clone();
+            menu_item(store, label, move |s, cx| {
+                let until = secs.map_or(i64::MAX, |s| chrono::Utc::now().timestamp() + s);
+                s.read(cx).set_muted(&j, until);
+            })
+        };
+        items.push(Item::submenu(
+            "Mute",
+            vec![option("For 8 Hours", Some(8 * 3600)), option("For 1 Week", Some(7 * 86_400)), option("Always", None)],
+        ));
     }
     let archived = chat.archived;
-    menu.item(menu_item(store, if archived { "Unarchive" } else { "Archive" }, move |s, cx| {
+    items.push(menu_item(store, if archived { "Unarchive" } else { "Archive" }, move |s, cx| {
         s.read(cx).set_archived(&jid, !archived)
-    }))
+    }));
+    items
 }
 
-fn menu_item(store: &Entity<Store>, label: &str, f: impl Fn(&Entity<Store>, &mut App) + 'static) -> PopupMenuItem {
+fn menu_item(store: &Entity<Store>, label: &str, f: impl FnOnce(&Entity<Store>, &mut App) + 'static) -> Item {
     let store = store.clone();
-    PopupMenuItem::new(label.to_string()).on_click(move |_, _, cx| f(&store, cx))
+    Item::action(label, move |_, cx| f(&store, cx))
 }
 
 /// Unread marker: blue dot, like Messages (gray when the chat is muted).
