@@ -45,6 +45,13 @@ pub fn sticker_file(data_dir: &Path, id: &str, ext: &str) -> PathBuf {
     data_dir.join("media").join("stickers").join(format!("{}.{ext}", crate::media::file_component(id)))
 }
 
+/// Marks a favorite whose file is gone for good (expired on the CDN, and no stored message
+/// has it to ask a phone for a re-upload): not shown, not fetched again, until a message
+/// with it turns up.
+pub fn gone_marker(data_dir: &Path, id: &str) -> PathBuf {
+    sticker_file(data_dir, id, "gone")
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

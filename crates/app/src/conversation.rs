@@ -1581,8 +1581,10 @@ impl Conversation {
                 let (store, chat, id) = (self.store.clone(), m.chat_jid.clone(), m.id.clone());
                 cx.defer(move |cx| store.update(cx, |s, _| s.request_media(&chat, &id)));
             }
+            // The tile's aspect ratio, not the photo's: an image's own ratio otherwise wins
+            // and a wide or tall photo spills out of its tile instead of being cropped.
             let photo = |src: ImageSource| {
-                img(src).size_full().object_fit(ObjectFit::Cover).rounded_tl(r(tl)).rounded_tr(r(tr)).rounded_br(r(br)).rounded_bl(r(bl))
+                img(src).w(px(w)).h(px(h)).aspect_ratio(w / h).object_fit(ObjectFit::Cover).rounded_tl(r(tl)).rounded_tr(r(tr)).rounded_br(r(br)).rounded_bl(r(bl))
             };
             let picture: AnyElement = match (&media.path, self.thumbs.get(&m.id)) {
                 (Some(path), _) => photo(path.clone().into()).into_any_element(),

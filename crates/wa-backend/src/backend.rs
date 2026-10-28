@@ -92,6 +92,8 @@ const FAVORITES_RETRY: [Duration; 4] =
     [Duration::ZERO, Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(90)];
 /// A sticker preview that couldn't be made isn't tried again for this long.
 const PREVIEW_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// How long sticker previews wait after WhatsApp says "rate-overlimit".
+const PREVIEW_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(15 * 60);
 /// Sticker messages searched for one with a favorite's file (to re-upload it from).
 const STICKER_ANCHOR_SCAN: u32 = 2000;
 
@@ -203,6 +205,8 @@ struct StickerPanel {
     previews_failed: HashMap<String, tokio::time::Instant>,
     /// Stickers whose file is gone from the CDN.
     expired: HashSet<String>,
+    /// WhatsApp said "rate-overlimit": no preview fetches until then.
+    paused_until: Option<tokio::time::Instant>,
 }
 
 /// An own reaction stored before it was sent.
@@ -946,13 +950,13 @@ impl Session {
     /// Online while the app is in front, offline otherwise (see `Command::SetActive`).
     async fn apply_presence(&self) {
         let presence = self.client.presence();
-        let result = if self.shared.active.load(Ordering::Relaxed) {
-            presence.set_available().await
-        } else {
-            presence.set_unavailable().await
-        };
-        if let Err(e) = result {
-            log::debug!("presence: {e:?}");
+        let active = self.shared.active.load(Ordering::Relaxed);
+        let result = if active { presence.set_available().await } else { presence.set_unavailable().await };
+        // While this device shows as online, the phone holds back its notifications:
+        // keep a trace of what WhatsApp was last told.
+        match result {
+            Ok(()) => log::info!("presence: {}", if active { "online" } else { "offline" }),
+            Err(e) => log::warn!("presence ({}): {e:?}", if active { "online" } else { "offline" }),
         }
     }
 
@@ -3353,8 +3357,12 @@ impl Shared {
             return Vec::new();
         }
         let list = self.sticker_candidates();
+        let data_dir = &self.config.data_dir;
         let refs: Vec<StickerRef> = list
             .iter()
+            // Gone for good: there's nothing to show or send (the list for previews keeps
+            // them, in case a message with one turns up).
+            .filter(|c| !stickers::gone_marker(data_dir, &c.id).is_file())
             .map(|c| StickerRef {
                 id: c.id.clone(),
                 preview: self.sticker_preview(c),
@@ -3481,8 +3489,19 @@ impl Session {
             }
         }
         for c in todo {
+            let gone = stickers::gone_marker(data_dir, &c.id);
+            if gone.is_file() {
+                if c.anchor.is_none() {
+                    continue;
+                }
+                // A message with it turned up: its sender's phone can re-upload it.
+                let _ = std::fs::remove_file(&gone);
+            }
             {
                 let mut panel = self.shared.stickers.lock().unwrap_or_else(|e| e.into_inner());
+                if panel.paused_until.is_some_and(|until| tokio::time::Instant::now() < until) {
+                    return;
+                }
                 let recently_failed =
                     panel.previews_failed.get(&c.id).is_some_and(|at| at.elapsed() < PREVIEW_RETRY_AFTER);
                 if recently_failed || !panel.previews_in_flight.insert(c.id.clone()) {
@@ -3494,6 +3513,8 @@ impl Session {
                 let shared = session.shared.clone();
                 let _guard = PreviewGuard { shared: shared.clone(), id: c.id.clone() };
                 let result = match shared.preview_slots.acquire().await {
+                    // Rate-limited while this one waited for a slot: leave it for later.
+                    Ok(_) if shared.stickers.lock().unwrap_or_else(|e| e.into_inner()).paused_until.is_some_and(|until| tokio::time::Instant::now() < until) => return,
                     Ok(_permit) => session.make_sticker_preview(&c).await,
                     Err(e) => Err(e.into()),
                 };
@@ -3503,9 +3524,17 @@ impl Session {
                         shared.stickers_dirty.notify_one();
                     }
                     Err(e) => {
-                        log::info!("stickers: no preview for {} ({:?}): {e:#}", c.id, c.source);
                         let now = tokio::time::Instant::now();
-                        shared.stickers.lock().unwrap_or_else(|e| e.into_inner()).previews_failed.insert(c.id, now);
+                        let mut panel = shared.stickers.lock().unwrap_or_else(|e| e.into_inner());
+                        if format!("{e:#}").contains("rate-overlimit") {
+                            // Each failed download costs WhatsApp a media-connection
+                            // request: stop them all for a while, then retry.
+                            log::info!("stickers: rate-limited; previews paused for {PREVIEW_RATE_LIMIT_PAUSE:?}");
+                            panel.paused_until = Some(now + PREVIEW_RATE_LIMIT_PAUSE);
+                        } else {
+                            log::info!("stickers: no preview for {} ({:?}): {e:#}", c.id, c.source);
+                            panel.previews_failed.insert(c.id, now);
+                        }
                     }
                 }
             }));
@@ -3576,6 +3605,9 @@ impl Session {
         match self.client.download(media.downloadable()).await {
             Err(e) if matches!(e.http_status(), Some(403 | 404 | 410)) => {
                 self.shared.set_sticker_expired(&c.id, true);
+                let marker = stickers::gone_marker(&self.shared.config.data_dir, &c.id);
+                let _ = marker.parent().map(std::fs::create_dir_all);
+                let _ = std::fs::write(&marker, b"");
                 Err(e.context("expired on the CDN, and no stored message has it to ask for a re-upload"))
             }
             other => other,
