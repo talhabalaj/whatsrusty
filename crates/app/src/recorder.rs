@@ -19,7 +19,7 @@ use objc2::rc::Retained;
 use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
 
 /// One level-meter bar per this much audio.
-const LEVEL_EVERY: Duration = Duration::from_millis(60);
+pub const LEVEL_EVERY: Duration = Duration::from_millis(60);
 /// WhatsApp's limit is far longer, but notes are held in memory: stop at 15 minutes.
 pub const MAX_LENGTH: Duration = Duration::from_secs(15 * 60);
 
@@ -33,14 +33,19 @@ struct Captured {
     /// Accumulator for the current level bar.
     level_sum: f64,
     level_n: usize,
-    /// Recent loudest bar (dBFS), decaying: the meter is relative to it.
-    peak_db: f64,
+    meter: Meter,
+    /// When the first audio arrived (the microphone takes a moment to start).
+    first_audio: Option<Instant>,
     error: Option<String>,
 }
 
 impl Captured {
     fn push(&mut self, mono: impl Iterator<Item = f32>) {
         let per_level = (self.rate as f64 * LEVEL_EVERY.as_secs_f64()) as usize;
+        let mut mono = mono.peekable();
+        if self.first_audio.is_none() && mono.peek().is_some() {
+            self.first_audio = Some(Instant::now());
+        }
         for s in mono {
             let s = s.clamp(-1., 1.);
             self.samples.push((s * f32::from(i16::MAX)) as i16);
@@ -49,27 +54,54 @@ impl Captured {
             if self.level_n >= per_level.max(1) {
                 let rms = (self.level_sum / self.level_n as f64).sqrt();
                 let db = 20. * rms.max(1e-6).log10();
-                self.levels.push(meter_level(db, &mut self.peak_db));
+                self.levels.push(self.meter.level(db));
                 (self.level_sum, self.level_n) = (0., 0);
             }
         }
     }
 }
 
-/// The meter's reference never drops below this, so room noise stays small.
-const FLOOR_DB: f64 = -60.;
+/// Below this a slice is digital silence (the microphone starting, or reconfiguring).
+const SILENCE_DB: f64 = -90.;
 
-/// One meter bar (0.04..=1) for a slice at `db` dBFS. Relative to the recent peak, like
-/// Messages: macOS sets the built-in microphone's gain as it likes (it can drop ~45 dB a
-/// second into a recording), so absolute levels would flatten to dots while someone talks.
-fn meter_level(db: f64, peak_db: &mut f64) -> f32 {
-    /// The peak fades by this much per bar (~33 dB/s), so a loud start doesn't mute the rest.
-    const DECAY_DB: f64 = 2.;
-    /// Below this the reference stops following, so room noise stays small.
-    /// Dynamic range shown on the meter.
-    const RANGE_DB: f64 = 30.;
-    *peak_db = db.max(*peak_db - DECAY_DB).max(FLOOR_DB);
-    ((db - (*peak_db - RANGE_DB)) / RANGE_DB).clamp(0.04, 1.) as f32
+/// Turns each slice's loudness into a bar (0.04..=1). Relative to the room, like Messages:
+/// macOS sets the built-in microphone's gain as it likes (it can drop ~45 dB a second
+/// into a recording), so absolute levels would flatten to dots while someone talks.
+/// Bars span from just above the background noise to the recent loudest slice.
+#[derive(Default)]
+struct Meter {
+    /// Background noise (dBFS): follows quieter slices at once, louder ones slowly.
+    noise_db: Option<f64>,
+    /// Recent loudest slice (dBFS), decaying.
+    peak_db: f64,
+}
+
+impl Meter {
+    fn level(&mut self, db: f64) -> f32 {
+        /// The peak fades by this much per bar (~33 dB/s), so a loud start doesn't mute the rest.
+        const DECAY_DB: f64 = 2.;
+        /// Share of the gap the noise estimate rises by per bar (~1 s to settle).
+        const NOISE_RISE: f64 = 0.05;
+        /// The first noise estimate is at most this, so a recording that starts with
+        /// speech shows it (a quieter moment then lowers the estimate at once).
+        const FIRST_NOISE_DB: f64 = -45.;
+        /// Sound this far above the noise starts to show.
+        const GATE_DB: f64 = 6.;
+        /// The smallest span shown, so steady sound doesn't fill the meter.
+        const MIN_RANGE_DB: f64 = 10.;
+        if db < SILENCE_DB {
+            return 0.04;
+        }
+        let noise = match self.noise_db {
+            Some(n) if db > n => n + (db - n) * NOISE_RISE,
+            Some(_) => db,
+            None => db.min(FIRST_NOISE_DB),
+        };
+        self.noise_db = Some(noise);
+        self.peak_db = db.max(self.peak_db - DECAY_DB);
+        let gate = noise + GATE_DB;
+        ((db - gate) / (self.peak_db - gate).max(MIN_RANGE_DB)).clamp(0.04, 1.) as f32
+    }
 }
 
 pub struct Recorder {
@@ -122,7 +154,7 @@ impl Recorder {
     /// Start recording right away. Failures (no microphone, access denied) show up in
     /// [`Recorder::error`]. `WA_DEBUG_FAKE_MIC` records a synthetic voice instead.
     pub fn start() -> Self {
-        let captured = Arc::new(Mutex::new(Captured { peak_db: FLOOR_DB, ..Captured::default() }));
+        let captured = Arc::new(Mutex::new(Captured::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (c, s) = (captured.clone(), stop.clone());
         if std::env::var_os("WA_DEBUG_FAKE_MIC").is_some() {
@@ -148,10 +180,16 @@ impl Recorder {
         self.started.elapsed()
     }
 
-    /// The last `n` meter levels (0..=1), oldest first.
-    pub fn levels(&self, n: usize) -> Vec<f32> {
-        let Ok(c) = self.captured.lock() else { return Vec::new() };
-        c.levels[c.levels.len().saturating_sub(n)..].to_vec()
+    /// The last `n` meter levels (0..=1), oldest first, and how many there are in all
+    /// (one per [`LEVEL_EVERY`] of audio).
+    pub fn levels(&self, n: usize) -> (Vec<f32>, usize) {
+        let Ok(c) = self.captured.lock() else { return (Vec::new(), 0) };
+        (c.levels[c.levels.len().saturating_sub(n)..].to_vec(), c.levels.len())
+    }
+
+    /// How long audio has been arriving (zero until the microphone starts).
+    pub fn audio_elapsed(&self) -> Duration {
+        self.captured.lock().ok().and_then(|c| c.first_audio).map_or(Duration::ZERO, |t| t.elapsed())
     }
 
     /// Keep recording when another app reconfigures the microphone (a call app, or one
@@ -329,25 +367,30 @@ mod tests {
 
     #[test]
     fn meter_recovers_after_the_microphone_gain_drops() {
-        let mut peak = FLOOR_DB;
+        let mut meter = Meter::default();
         // Loud for 0.7 s, then macOS turns the gain down ~45 dB while the speech goes on.
-        let loud: Vec<f32> = (0..12).map(|_| meter_level(-3., &mut peak)).collect();
+        let loud: Vec<f32> = (0..12).map(|_| meter.level(-3.)).collect();
         assert!(loud.iter().all(|l| *l > 0.9), "{loud:?}");
-        let after: Vec<f32> = (0..60).map(|i| meter_level(if i % 4 == 0 { -62. } else { -48. }, &mut peak)).collect();
-        // Within ~1.5 s (25 bars) speech shows as tall bars again, pauses as shorter ones.
+        let after: Vec<f32> = (0..60).map(|i| meter.level(if i % 4 == 0 { -62. } else { -48. })).collect();
+        // Within ~1.5 s (25 bars) speech shows as tall bars again (its pauses are only
+        // 14 dB quieter here), pauses as short ones.
         for (i, l) in after.iter().enumerate().skip(25) {
             if i % 4 == 0 {
-                assert!(*l < 0.65, "pause {i}: {after:?}");
+                assert!(*l < 0.2, "pause {i}: {after:?}");
             } else {
-                assert!(*l > 0.75, "speech {i}: {after:?}");
+                assert!(*l > 0.55, "speech {i}: {after:?}");
             }
         }
     }
 
     #[test]
     fn room_noise_stays_small() {
-        let mut peak = FLOOR_DB;
-        let noise: Vec<f32> = (0..50).map(|_| meter_level(-85., &mut peak)).collect();
-        assert!(noise.iter().all(|l| *l < 0.2), "{noise:?}");
+        // A fan or a quiet room, steady or wobbling a little, after a moment of startup silence.
+        let mut meter = Meter::default();
+        let startup: Vec<f32> = (0..5).map(|_| meter.level(-107.)).collect();
+        let noise: Vec<f32> = (0..80).map(|i| meter.level(-40. + [0., 1.5, -1., 2.][i % 4])).collect();
+        assert!(startup.iter().chain(&noise).all(|l| *l < 0.2), "{startup:?} {noise:?}");
+        // Speech over it stands out.
+        assert!(meter.level(-20.) > 0.9);
     }
 }

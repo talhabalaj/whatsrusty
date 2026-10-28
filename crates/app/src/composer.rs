@@ -25,8 +25,14 @@ const SEND_INSET: f32 = 3.;
 const THUMB: f32 = 64.;
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tiff", "tif", "bmp"];
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "m4v"];
-/// Level-meter bars shown while recording.
-const LEVEL_BARS: usize = 56;
+/// Level-meter bars kept for the recording meter (enough to fill a wide window).
+const LEVEL_BARS: usize = 400;
+/// Meter bar width and spacing.
+const LEVEL_BAR_W: f32 = 3.;
+const LEVEL_PITCH: f32 = 5.;
+/// The meter runs this far behind real time, so audio (which arrives in chunks) is
+/// there before its bar slides in, and the meter scrolls at an even speed.
+const LEVEL_LAG: Duration = Duration::from_millis(150);
 
 pub struct Composer {
     store: Entity<Store>,
@@ -850,7 +856,9 @@ impl Composer {
     /// Instead of the text while recording: cancel, a red dot, the time and a live meter.
     fn render_recording(&self, rec: &Recorder, height: f32, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let secs = rec.elapsed().as_secs();
-        let levels = rec.levels(LEVEL_BARS);
+        let (levels, total) = rec.levels(LEVEL_BARS);
+        let elapsed = rec.audio_elapsed();
+        let color = theme.accent;
         div()
             .flex_1()
             .min_w_0()
@@ -888,9 +896,10 @@ impl Composer {
                     .child(format!("{}:{:02}", secs / 60, secs % 60)),
             )
             .child(
-                div().flex_1().min_w_0().h(px(22.)).overflow_hidden().flex().items_center().justify_end().gap(px(2.)).children(
-                    levels.into_iter().map(|l| div().flex_none().w(px(3.)).h(px(3. + 17. * l)).rounded_full().bg(theme.accent)),
-                ),
+                canvas(|_, _, _| {}, move |bounds, _, window, _| level_meter(bounds, &levels, total, elapsed, color, window))
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(22.)),
             )
     }
 
@@ -1318,4 +1327,43 @@ impl Render for Composer {
                 }
             })
     }
+}
+
+/// The recording meter: one bar per [`crate::recorder::LEVEL_EVERY`], newest on the right,
+/// filling the width and sliding left smoothly (redrawn every frame while recording).
+fn level_meter(bounds: Bounds<Pixels>, levels: &[f32], total: usize, elapsed: Duration, color: Hsla, window: &mut Window) {
+    window.request_animation_frame();
+    let every = crate::recorder::LEVEL_EVERY.as_secs_f32();
+    // Bars elapsed on the meter's clock; never ahead of the audio by more than a bar.
+    let clock = (elapsed.saturating_sub(LEVEL_LAG).as_secs_f32() / every).min(total as f32 + 1.);
+    let (left, right) = (f32::from(bounds.origin.x), f32::from(bounds.right()));
+    let mid = f32::from(bounds.center().y);
+    let max_h = f32::from(bounds.size.height);
+    // Bars fade in over this much of the left edge.
+    let fade = 28.;
+    let first = total - levels.len();
+    // The newest bar slides in from under the right edge. Before the first, silence:
+    // the meter is full width from the start.
+    let n = ((right - left) / LEVEL_PITCH) as usize + 2;
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        for k in 0..n {
+            // Bar index `index` (negative before the recording), newest first.
+            let index = clock.floor() as i64 - k as i64;
+            let age = clock - index as f32;
+            let x = right - age * LEVEL_PITCH;
+            if age < 0. || x < left {
+                continue;
+            }
+            let level = usize::try_from(index)
+                .ok()
+                .and_then(|i| i.checked_sub(first))
+                .and_then(|i| levels.get(i))
+                .copied()
+                .unwrap_or(0.);
+            let h = 3. + (max_h - 5.) * level;
+            let alpha = ((x - left) / fade).clamp(0., 1.);
+            let bar = Bounds::new(point(px(x), px(mid - h / 2.)), size(px(LEVEL_BAR_W), px(h)));
+            window.paint_quad(fill(bar, color.opacity(alpha)).corner_radii(px(LEVEL_BAR_W / 2.)));
+        }
+    });
 }
