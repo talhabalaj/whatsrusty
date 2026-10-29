@@ -40,8 +40,17 @@ if [[ $DRY_RUN == 0 ]]; then
 fi
 
 if [[ -z "${BUILD_NUMBER:-}" ]]; then
-  current="$(curl -sf "$ORIGIN/downloads/manifest.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build"])' 2>/dev/null || true)"
-  BUILD_NUMBER=$(( ${current:-0} + 1 ))
+  # The published build + 1, or 1 before the first release. A lookup that fails is an
+  # error: falling back to 1 would build a number below the live one.
+  manifest="$(mktemp)"
+  status="$(curl -sL --retry 4 --retry-all-errors -o "$manifest" -w '%{http_code}' "$ORIGIN/downloads/manifest.json" || true)"
+  case "$status" in
+    200) current="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"])' "$manifest")" ;;
+    404) current=0 ;;
+    *) echo "error: couldn't read the published build number (HTTP ${status:-none}); set BUILD_NUMBER" >&2; exit 1 ;;
+  esac
+  rm -f "$manifest"
+  BUILD_NUMBER=$(( current + 1 ))
 fi
 [[ "$BUILD_NUMBER" =~ ^[0-9]+$ ]]
 
