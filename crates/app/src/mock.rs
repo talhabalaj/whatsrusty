@@ -263,6 +263,7 @@ fn seed() -> Fake {
         caption: None,
         gif: false,
         round: false,
+        size_bytes: Some(8_400_000),
         state: MediaState::Idle,
     }));
     // WA_MOCK_STICKER=<file.webp> shows that (e.g. animated) sticker instead of a failed one.
@@ -523,6 +524,18 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 let local_more = page.len() < older.len();
                 let remote = chat_jid == LONG_CHAT && !fake.phone_only.is_empty();
                 let _ = ev.send(Event::Messages { chat_jid: chat_jid.clone(), messages: page, has_more: local_more || remote });
+                if chat_jid == "120363000000000001@g.us" && before.is_none() {
+                    // Everyone has read my snacks message (and replied since).
+                    let reads = ["Ali", "Omar", "Sara"]
+                        .map(|name| wa_backend::GroupRead {
+                            jid: format!("{name}@s.whatsapp.net"),
+                            name: name.into(),
+                            message_id: format!("{chat_jid}-2"),
+                            timestamp: now() - 86_400 - 3 * 3600 + 300,
+                        })
+                        .to_vec();
+                    let _ = ev.send(Event::GroupReads { chat_jid: chat_jid.clone(), reads });
+                }
                 if before.is_some() && !local_more && remote {
                     // Simulate the phone answering an on-demand request with 50 messages.
                     let _ = ev.send(Event::HistoryLoading { chat_jid: chat_jid.clone(), loading: true, exhausted: false });
@@ -663,6 +676,21 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) else {
                     continue;
                 };
+                // WA_MOCK_SLOW_DOWNLOAD: take a couple of seconds, reporting progress.
+                if std::env::var_os("WA_MOCK_SLOW_DOWNLOAD").is_some() {
+                    let mut busy = m.clone();
+                    match &mut busy.body {
+                        MessageBody::Image(i) => i.state = MediaState::Downloading,
+                        MessageBody::Voice(v) => v.state = MediaState::Downloading,
+                        _ => {}
+                    }
+                    let _ = ev.send(Event::MessageUpserted(busy));
+                    for step in 1..=10 {
+                        thread::sleep(Duration::from_millis(250));
+                        let (chat_jid, message_id) = (chat_jid.clone(), message_id.clone());
+                        let _ = ev.send(Event::DownloadProgress { chat_jid, message_id, fraction: step as f32 / 10. });
+                    }
+                }
                 match &mut m.body {
                     // Portrait photos (the album's) get a portrait crop.
                     MessageBody::Image(img) => {
@@ -672,6 +700,18 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     _ => continue,
                 }
                 let _ = ev.send(Event::MessageUpserted(m.clone()));
+            }
+            Command::ListMedia { chat_jid, limit } => {
+                let items = fake
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| m.chat_jid == chat_jid && !m.deleted)
+                    .filter(|m| matches!(m.body, MessageBody::Image(_) | MessageBody::Video(_)))
+                    .take(limit as usize)
+                    .cloned()
+                    .collect();
+                let _ = ev.send(Event::ChatMedia { chat_jid, items });
             }
             Command::SendImage { chat_jid, path, client_id, caption, .. } => {
                 let mut m = msg(&chat_jid, 0, true, None, "", now());
@@ -814,6 +854,7 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                         caption,
                         gif: false,
                         round: false,
+                        size_bytes: None,
                         state: MediaState::Idle,
                     })
                 } else {

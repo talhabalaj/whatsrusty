@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
 use wa_backend::{
-    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, MessageBody, SearchHit,
+    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, GroupRead, MessageBody,
+    SearchHit,
 };
 
 /// Emitted when the visible transcript changes, so the conversation view can
@@ -75,6 +76,27 @@ pub struct History {
 /// How long the info panel shows "Loading…" before falling back to "Not available".
 const PROFILE_WAIT: Duration = Duration::from_secs(6);
 
+/// Photos and videos the info panel shows at most.
+const MEDIA_TILES: u32 = 60;
+
+/// A photo or video in a chat's info panel, its thumbnail decoded once.
+pub struct MediaTile {
+    pub message: ChatMessage,
+    pub thumb: Option<Arc<Image>>,
+}
+
+impl MediaTile {
+    fn new(message: ChatMessage) -> Self {
+        let thumb = match &message.body {
+            MessageBody::Image(i) => i.thumbnail.as_ref(),
+            MessageBody::Video(v) => v.thumbnail.as_ref(),
+            _ => None,
+        };
+        let thumb = thumb.map(|t| Arc::new(Image::from_bytes(ImageFormat::Jpeg, t.clone())));
+        Self { message, thumb }
+    }
+}
+
 /// How long to wait before re-asking for older history after an empty answer.
 const OLDER_RETRY: Duration = Duration::from_secs(20);
 
@@ -84,6 +106,12 @@ pub struct Store {
     pub sync_progress: Option<u8>,
     pub chats: Vec<ChatSummary>,
     pub messages: HashMap<String, Vec<ChatMessage>>,
+    /// Downloads under way: how far each has got (0..1), by (chat, message id).
+    download_progress: HashMap<(String, String), f32>,
+    /// Photos and videos of a chat for the info panel, newest first (after `ListMedia`).
+    chat_media: HashMap<String, Vec<MediaTile>>,
+    /// How far each member of a group has read my messages, per group chat.
+    pub group_reads: HashMap<String, Vec<GroupRead>>,
     pub typing: HashSet<String>,
     /// Who is typing in each chat (JID, name), for group typing indicators. `typing` holds
     /// the chats with anyone in here (or a 1:1 typing indicator without a sender).
@@ -174,6 +202,9 @@ impl Store {
             sync_progress: None,
             chats: Vec::new(),
             messages: HashMap::new(),
+            group_reads: HashMap::new(),
+            download_progress: HashMap::new(),
+            chat_media: HashMap::new(),
             typing: HashSet::new(),
             typists: HashMap::new(),
             search_results: None,
@@ -289,7 +320,21 @@ impl Store {
                     self.set_typist(&chat_jid, Some(&m.sender_jid), None, false);
                 }
                 if media_settled(&m.body) {
-                    self.media_requested.remove(&(chat_jid.clone(), m.id.clone()));
+                    let key = (chat_jid.clone(), m.id.clone());
+                    self.download_progress.remove(&key);
+                    self.media_requested.remove(&key);
+                }
+                // Keep an open info panel's media current (downloads, new photos).
+                if matches!(m.body, MessageBody::Image(_) | MessageBody::Video(_))
+                    && let Some(tiles) = self.chat_media.get_mut(&chat_jid)
+                {
+                    match tiles.iter_mut().find(|t| t.message.id == m.id) {
+                        Some(t) if m.deleted => t.message.deleted = true,
+                        Some(t) => *t = MediaTile::new(m.clone()),
+                        None if !m.deleted => tiles.insert(0, MediaTile::new(m.clone())),
+                        None => {}
+                    }
+                    tiles.retain(|t| !t.message.deleted);
                 }
                 // Only keep transcripts the user has opened; the chat list carries previews.
                 if let Some(list) = self.messages.get_mut(&chat_jid) {
@@ -330,6 +375,19 @@ impl Store {
                     }
                     cx.emit(StoreEvent::TranscriptChanged { chat_jid, change: Change::Updated });
                 }
+            }
+            Event::DownloadProgress { chat_jid, message_id, fraction } => {
+                self.download_progress.insert((chat_jid, message_id), fraction);
+                cx.notify();
+            }
+            Event::ChatMedia { chat_jid, items } => {
+                let tiles = items.into_iter().map(MediaTile::new).collect();
+                self.chat_media.insert(chat_jid, tiles);
+                cx.notify();
+            }
+            Event::GroupReads { chat_jid, reads } => {
+                self.group_reads.insert(chat_jid.clone(), reads);
+                cx.emit(StoreEvent::TranscriptChanged { chat_jid, change: Change::Updated });
             }
             Event::Typing { chat_jid, sender_name, typing, sender_jid } => {
                 self.set_typist(&chat_jid, sender_jid.as_deref(), sender_name, typing);
@@ -396,6 +454,7 @@ impl Store {
             // An open info panel follows the conversation, like Messages' details pane.
             if self.profile_open.is_some() && self.profile_open == self.selected {
                 self.request_profile(&jid, cx);
+                self.send(Command::ListMedia { chat_jid: jid.clone(), limit: MEDIA_TILES });
                 self.profile_open = Some(jid.clone());
             }
         }
@@ -558,6 +617,9 @@ impl Store {
         self.phone_lookups.clear();
         self.typing.clear();
         self.typists.clear();
+        self.group_reads.clear();
+        self.download_progress.clear();
+        self.chat_media.clear();
         self.search_results = None;
         self.avatars.clear();
         self.avatar_requested.clear();
@@ -688,6 +750,7 @@ impl Store {
             self.profile_open = None;
         } else {
             self.request_profile(&jid, cx);
+            self.send(Command::ListMedia { chat_jid: jid.clone(), limit: MEDIA_TILES });
             self.profile_open = Some(jid);
         }
         cx.notify();
@@ -702,6 +765,16 @@ impl Store {
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
+    }
+
+    /// How far the download of a message's media has got (0..1), while it runs.
+    pub fn download_progress(&self, chat_jid: &str, id: &str) -> Option<f32> {
+        self.download_progress.get(&(chat_jid.to_string(), id.to_string())).copied()
+    }
+
+    /// A chat's photos and videos for its info panel (`None` until they've loaded).
+    pub fn chat_media(&self, chat_jid: &str) -> Option<&[MediaTile]> {
+        self.chat_media.get(chat_jid).map(Vec::as_slice)
     }
 
     /// Still worth showing "Loading…" for `jid`'s profile details.

@@ -19,7 +19,7 @@ use crate::extract::{
 };
 use crate::stickers::StickerSync;
 use crate::types::{
-    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, LocationInfo, MediaState, Mention, MessageBody,
+    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, GroupRead, LocationInfo, MediaState, Mention, MessageBody,
     MessagePreview, PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
@@ -193,6 +193,18 @@ const MIGRATIONS: &[&str] = &[
         parent TEXT,
         is_parent INTEGER NOT NULL DEFAULT 0,
         name TEXT
+    );
+    "#,
+    // 10: how far each group member has read my messages.
+    r#"
+    CREATE TABLE group_reads (
+        chat_jid   TEXT NOT NULL,
+        -- Canonical, like `messages.sender_jid`.
+        reader_jid TEXT NOT NULL,
+        -- The newest of my messages they've read, and its timestamp.
+        message_id TEXT NOT NULL,
+        ts         INTEGER NOT NULL,
+        PRIMARY KEY (chat_jid, reader_jid)
     );
     "#,
 ];
@@ -920,7 +932,8 @@ impl Store {
             .execute_batch(
                 "DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM aliases;
                  DELETE FROM avatars; DELETE FROM pending_edits; DELETE FROM pending_receipts;
-                 DELETE FROM reactions; DELETE FROM favorite_stickers; DELETE FROM removed_recent_stickers;",
+                 DELETE FROM reactions; DELETE FROM favorite_stickers; DELETE FROM removed_recent_stickers;
+                 DELETE FROM group_reads;",
             )?;
         Ok(())
     }
@@ -1094,6 +1107,16 @@ impl Store {
             params![lid, pn],
         )?;
         c.execute("DELETE FROM reactions WHERE chat_jid = ?1 OR sender_jid = ?1", [lid])?;
+        // Group reads by the LID reader: the further one wins.
+        c.execute(
+            "INSERT INTO group_reads (chat_jid, reader_jid, message_id, ts)
+             SELECT chat_jid, ?2, message_id, ts FROM group_reads WHERE reader_jid = ?1 AND true
+             ON CONFLICT (chat_jid, reader_jid) DO UPDATE SET
+                message_id = CASE WHEN excluded.ts > ts THEN excluded.message_id ELSE message_id END,
+                ts = MAX(ts, excluded.ts)",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM group_reads WHERE reader_jid = ?1", [lid])?;
         c.execute(
             "DELETE FROM reactions WHERE chat_jid = ?1
                 AND target_id IN (SELECT id FROM messages WHERE chat_jid = ?1 AND revoked = 1)",
@@ -1862,6 +1885,49 @@ impl Store {
         Ok(changed)
     }
 
+    /// `reader` read my messages `ids` in group `chat_jid`: move how far they've read to
+    /// the newest of them, if that's further. Returns whether it moved.
+    pub fn record_group_read(&self, chat_jid: &str, reader: &str, ids: &[String]) -> Result<bool> {
+        let (chat, reader) = (self.canonical(chat_jid)?, self.canonical(reader)?);
+        let mut newest: Option<(i64, String)> = None;
+        let mut stmt =
+            self.conn.prepare_cached("SELECT ts FROM messages WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1")?;
+        for id in ids {
+            let ts: Option<i64> = stmt.query_row(params![chat, id], |r| r.get(0)).optional()?;
+            if let Some(ts) = ts
+                && newest.as_ref().is_none_or(|(n, _)| ts > *n)
+            {
+                newest = Some((ts, id.clone()));
+            }
+        }
+        let Some((ts, id)) = newest else { return Ok(false) };
+        let changed = self.conn.execute(
+            "INSERT INTO group_reads (chat_jid, reader_jid, message_id, ts) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (chat_jid, reader_jid) DO UPDATE SET message_id = excluded.message_id, ts = excluded.ts
+             WHERE excluded.ts > ts",
+            params![chat, reader, id, ts],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// How far each member of group `chat_jid` has read my messages, by name.
+    pub fn group_reads(&self, chat_jid: &str) -> Result<Vec<GroupRead>> {
+        let chat = self.canonical(chat_jid)?;
+        let rows: Vec<(String, String, i64)> = self
+            .conn
+            .prepare_cached("SELECT reader_jid, message_id, ts FROM group_reads WHERE chat_jid = ?1")?
+            .query_map([&chat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut reads = rows
+            .into_iter()
+            .map(|(jid, message_id, timestamp)| {
+                Ok(GroupRead { name: self.sender_display_name(&jid, None)?, jid, message_id, timestamp })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        reads.sort_by_key(|r| r.name.to_lowercase());
+        Ok(reads)
+    }
+
     /// Fail every own message still `Pending` (its send was cut off). Returns
     /// (canonical chat, id) of each.
     pub fn fail_pending(&self) -> Result<Vec<(String, String)>> {
@@ -2297,6 +2363,21 @@ impl Store {
         Ok((messages, has_more))
     }
 
+    /// The chat's photos and videos (not deleted), newest first.
+    pub fn load_media(&self, chat_jid: &str, limit: u32) -> Result<Vec<ChatMessage>> {
+        let chat = self.canonical(chat_jid)?;
+        let rows: Vec<MessageRow> = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE chat_jid = ?1 AND kind IN ({KIND_IMAGE}, {KIND_VIDEO}) AND revoked = 0
+                 ORDER BY ts DESC, rowid DESC LIMIT ?2"
+            ))?
+            .query_map(params![chat, limit], MessageRow::from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        self.to_chat_messages(&chat, rows)
+    }
+
     /// The oldest stored message of a chat: the anchor for asking the phone for older history.
     pub fn oldest_message(&self, chat_jid: &str) -> Result<Option<OldestRef>> {
         let chat = self.canonical(chat_jid)?;
@@ -2563,6 +2644,28 @@ mod tests {
         // Own messages never count as unread.
         s.insert_message(&msg(ALICE, "2", ME, "yo", 11), true).unwrap();
         assert_eq!(s.unread_count(ALICE).unwrap(), 1);
+    }
+
+    #[test]
+    fn group_reads_only_move_forward() {
+        let s = store();
+        s.insert_message(&msg(GROUP, "1", ME, "one", 10), true).unwrap();
+        s.insert_message(&msg(GROUP, "2", ME, "two", 20), true).unwrap();
+        s.insert_message(&msg(GROUP, "3", ALICE, "theirs", 30), true).unwrap();
+        let ids = |v: &[&str]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        let at = |s: &Store| s.group_reads(GROUP).unwrap().into_iter().map(|r| (r.jid, r.message_id)).collect::<Vec<_>>();
+
+        // The newest of mine in the receipt; not theirs, not unknown ones.
+        assert!(s.record_group_read(GROUP, BOB_LID, &ids(&["1", "2", "3", "nope"])).unwrap());
+        assert_eq!(at(&s), [(BOB_LID.to_string(), "2".to_string())]);
+        // An older receipt arriving late doesn't move them back.
+        assert!(!s.record_group_read(GROUP, BOB_LID, &ids(&["1"])).unwrap());
+        assert!(!s.record_group_read(GROUP, BOB_LID, &ids(&["3"])).unwrap());
+
+        // Learning the LID's number folds it in.
+        s.add_alias(BOB_LID, BOB).unwrap();
+        assert!(!s.record_group_read(GROUP, BOB, &ids(&["1"])).unwrap());
+        assert_eq!(at(&s), [(BOB.to_string(), "2".to_string())]);
     }
 
     #[test]
@@ -3145,7 +3248,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE pending_edits DROP COLUMN stored_at; ALTER TABLE messages DROP COLUMN forwarded;
                      DROP TABLE deleted_for_me; ALTER TABLE chats DROP COLUMN marked_unread;
-                     DROP TABLE group_community;
+                     DROP TABLE group_community; DROP TABLE group_reads;
                      PRAGMA user_version = 3",
                 )
                 .unwrap();

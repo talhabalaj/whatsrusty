@@ -856,6 +856,11 @@ impl StoredMedia {
         each_media!(self, m => m.mimetype.as_deref())
     }
 
+    /// Size of the decrypted file, when the message says.
+    pub fn file_length(&self) -> Option<u64> {
+        each_media!(self, m => m.file_length)
+    }
+
     pub fn media_key(&self) -> Option<&[u8]> {
         each_media!(self, m => m.media_key.as_deref())
     }
@@ -923,6 +928,7 @@ impl StoredMedia {
                 caption: nonempty_caption(m.caption.as_deref()),
                 gif: m.gif_playback == Some(true),
                 round: matches!(self, StoredMedia::Ptv(_)),
+                size_bytes: m.file_length.filter(|l| *l > 0),
                 state,
             }),
             StoredMedia::Document(m) => MessageBody::Document(DocumentMedia {
@@ -1179,6 +1185,7 @@ mod tests {
             caption: Some("clip".into()),
             gif: false,
             round: false,
+            size_bytes: None,
             state: MediaState::Idle,
         };
         assert_eq!(body_of(&video), Some(MessageBody::Video(expected.clone())));

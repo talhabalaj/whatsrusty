@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use wa_backend::{ChatMessage, DeliveryStatus, ImageMedia, MediaState, MessageBody, QuotedMessage, VoiceMedia};
+use crate::download::Fetch;
+use wa_backend::{ChatMessage, DeliveryStatus, GroupRead, ImageMedia, MediaState, MessageBody, QuotedMessage, VoiceMedia};
 
 use crate::audio::AudioPlayer;
 use crate::avatar::avatar;
@@ -93,7 +94,17 @@ impl ChatBinding {
 enum Row {
     Separator(i64),
     /// `messages[ix..ix + span]`: more than one for an album of photos.
-    Message { ix: usize, span: usize, first: bool, last: bool, show_name: bool, status: Option<(String, bool)> },
+    ///
+    /// `readers`: group members (JID, name) who have read up to this message.
+    Message {
+        ix: usize,
+        span: usize,
+        first: bool,
+        last: bool,
+        show_name: bool,
+        status: Option<(String, bool)>,
+        readers: Vec<(String, String)>,
+    },
     Typing,
 }
 
@@ -266,7 +277,11 @@ impl Conversation {
             if switched { HashMap::new() } else { self.messages.iter().map(|m| (m.id.clone(), m.clone())).collect() };
         self.messages = self.chat_jid.as_ref().and_then(|j| store.messages.get(j)).cloned().unwrap_or_default();
         let typing = self.chat_jid.as_ref().is_some_and(|j| store.typing.contains(j));
-        self.rows = build_rows(&self.messages, typing);
+        let reads = match &self.chat_jid {
+            Some(j) if self.is_group => store.group_reads.get(j).map(Vec::as_slice).unwrap_or_default(),
+            _ => &[],
+        };
+        self.rows = build_rows(&self.messages, typing, reads);
         if switched {
             self.thumbs.clear();
             self.unseen = 0;
@@ -916,9 +931,9 @@ impl Conversation {
                 .font_weight(FontWeight::MEDIUM)
                 .child(transcript_time(*ts))
                 .into_any_element(),
-            Some(Row::Message { ix, span, first, last, show_name, status }) => {
+            Some(Row::Message { ix, span, first, last, show_name, status, readers }) => {
                 let album = &self.messages[*ix..*ix + *span];
-                self.render_message(album, *first, *last, *show_name, status.as_ref(), theme, window, cx)
+                self.render_message(album, *first, *last, *show_name, status.as_ref(), readers, theme, window, cx)
             }
             Some(Row::Typing) => self.typing_row(theme, cx),
             None => div().into_any_element(),
@@ -934,6 +949,7 @@ impl Conversation {
         last: bool,
         show_name: bool,
         status: Option<&(String, bool)>,
+        readers: &[(String, String)],
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -962,7 +978,7 @@ impl Conversation {
             MessageBody::Image(media) => self.image_content(m, media, from_me, last, found, theme, cx),
             MessageBody::Video(v) => crate::kinds::video(&self.store, m, v, thumb, self.binding.fixed().map(String::from), theme, cx).into_any_element(),
             MessageBody::Document(d) => {
-                bubble(div().child(crate::kinds::document(&self.store, m, d, from_me, theme)), from_me, last, theme)
+                bubble(div().child(crate::kinds::document(&self.store, m, d, from_me, theme, cx)), from_me, last, theme)
                     .into_any_element()
             }
             MessageBody::Sticker(s) => crate::kinds::sticker(&self.store, m, s, theme, cx).into_any_element(),
@@ -1191,6 +1207,7 @@ impl Conversation {
                         }),
                 )
             })
+            .when(!readers.is_empty(), |d| d.child(self.read_heads(&m.id, readers, theme, cx)))
             // Right-click opens the tapback tray and the message's menu, like Messages.
             .on_mouse_down(
                 MouseButton::Right,
@@ -1210,6 +1227,42 @@ impl Conversation {
                 .into_any_element(),
             None => row.into_any_element(),
         }
+    }
+
+    /// Messenger-style "seen" heads: a tiny picture of each group member who has read up
+    /// to this message, their names on hover.
+    fn read_heads(&self, id: &str, readers: &[(String, String)], theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        const SIZE: f32 = 15.;
+        const MAX: usize = 6;
+        // With more than fit, the last place says how many more.
+        let shown = if readers.len() > MAX { MAX - 1 } else { readers.len() };
+        let tip = format!("Read by {}", names_label(readers));
+        div()
+            .id(SharedString::from(format!("read-{id}")))
+            .pt(px(3.))
+            .pr(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .children(readers[..shown].iter().map(|(jid, name)| {
+                div()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.window_bg)
+                    .child(avatar(name, self.photo_for(jid, cx), SIZE, theme))
+            }))
+            .when(readers.len() > shown, |d| {
+                d.child(
+                    div()
+                        .pl(px(2.))
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_secondary)
+                        .child(format!("+{}", readers.len() - shown)),
+                )
+            })
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
     }
 
     fn photo_for(&self, jid: &str, cx: &mut Context<Self>) -> Option<Arc<Image>> {
@@ -1506,6 +1559,8 @@ impl Conversation {
                 (None, None) => round(div().size_full().bg(theme.bubble_in)).into_any_element(),
             };
             let (path, store, mini, id) = (media.path.clone(), self.store.clone(), mini.clone(), m.id.clone());
+            let fetch = Fetch::of(media.path.is_some(), media.state, self.store.read(cx).download_progress(&m.chat_jid, &id));
+            let chat = m.chat_jid.clone();
             div()
                 .id(SharedString::from(format!("img-{}", m.id)))
                 .relative()
@@ -1514,6 +1569,7 @@ impl Conversation {
                 .h(px(h))
                 .cursor_pointer()
                 .child(picture)
+                .when(!fetch.ready() && more == 0, |d| d.child(round(crate::download::not_downloaded(fetch, 36.))))
                 .when(more > 0, |d| {
                     d.child(
                         round(div())
@@ -1529,10 +1585,10 @@ impl Conversation {
                             .child(format!("+{more}")),
                     )
                 })
-                .on_click(move |_, _, cx| {
-                    if let Some(path) = path.clone() {
-                        store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx));
-                    }
+                .on_click(move |_, _, cx| match path.clone() {
+                    Some(path) => store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx)),
+                    None if fetch == Fetch::Failed => store.update(cx, |s, _| s.request_media(&chat, &id)),
+                    None => {}
                 })
                 .into_any_element()
         };
@@ -1591,11 +1647,8 @@ impl Conversation {
             (None, None) => div().size_full().bg(theme.bubble_in).into_any_element(),
         };
         let (path, store, mini, id) = (media.path.clone(), self.store.clone(), self.binding.fixed().map(String::from), m.id.clone());
-        let overlay = match (media.path.is_some(), media.state) {
-            (true, _) => None,
-            (false, MediaState::Failed) => Some("Couldn't download"),
-            (false, _) => Some("Downloading…"),
-        };
+        let fetch = Fetch::of(media.path.is_some(), media.state, self.store.read(cx).download_progress(&m.chat_jid, &id));
+        let chat = m.chat_jid.clone();
         let frame = div()
             .id(SharedString::from(format!("img-{}", m.id)))
             .relative()
@@ -1607,24 +1660,11 @@ impl Conversation {
             .border_color(theme.separator)
             .cursor_pointer()
             .child(picture)
-            .when_some(overlay, |d, label| {
-                d.child(
-                    div().absolute().inset_0().flex().items_end().justify_center().pb(px(10.)).child(
-                        div()
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded_full()
-                            .bg(black().opacity(0.45))
-                            .text_color(white())
-                            .text_size(px(11.))
-                            .child(label),
-                    ),
-                )
-            })
-            .on_click(move |_, _, cx| {
-                if let Some(path) = path.clone() {
-                    store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx));
-                }
+            .when(!fetch.ready(), |d| d.child(crate::download::not_downloaded(fetch, 44.)))
+            .on_click(move |_, _, cx| match path.clone() {
+                Some(path) => store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), mini.clone(), cx)),
+                None if fetch == Fetch::Failed => store.update(cx, |s, _| s.request_media(&chat, &id)),
+                None => {}
             });
         match media.caption.as_deref().filter(|c| !c.trim().is_empty()) {
             None => frame.into_any_element(),
@@ -1851,21 +1891,33 @@ fn voice_content(
     let gutter = if !from_me && m.chat_jid.ends_with("@g.us") { 38. } else { 0. };
     let room = f32::from(window.viewport_size().width) - 96. - gutter - 24. - 28. - 18. - 34.;
     let bars = waveform_bars(&media.waveform, ((room / 4.5) as usize).clamp(12, 30));
-    let ready = media.path.is_some();
+    let fetch = Fetch::of(media.path.is_some(), media.state, store.read(cx).download_progress(&m.chat_jid, &m.id));
     let (path, id, chat) = (media.path.clone(), m.id.clone(), m.chat_jid.clone());
+    // Play once it's here; until then a down arrow, ringed by the progress while it comes.
+    let icon = match fetch {
+        Fetch::Ready if playing => glyph(Glyph::Pause, 13., white()),
+        Fetch::Ready => glyph(Glyph::Play, 13., white()),
+        _ => glyph(Glyph::ArrowDown, 14., white()),
+    };
     let button = div()
         .id(SharedString::from(format!("play-{}", m.id)))
+        .relative()
         .flex_none()
         .size(px(28.))
         .rounded_full()
         .flex()
         .items_center()
         .justify_center()
+        .cursor_pointer()
         .bg(if from_me { white().opacity(0.22) } else { theme.accent })
-        .child(glyph(if playing { Glyph::Pause } else { Glyph::Play }, 13., white()))
+        .child(icon)
+        .when_some(match fetch { Fetch::Downloading(p) => Some(p), _ => None }, |d, p| {
+            d.child(crate::download::ring(p, 2., white()).inset(px(1.5)))
+        })
         .on_click(cx.listener(move |this, _, _, cx| match &path {
             Some(path) => AudioPlayer::toggle(cx, &id, path),
-            None => this.store.update(cx, |s, _| s.request_media(&chat, &id)),
+            None if !matches!(fetch, Fetch::Downloading(_)) => this.store.update(cx, |s, _| s.request_media(&chat, &id)),
+            None => {}
         }));
 
     let content = div()
@@ -1891,13 +1943,9 @@ fn voice_content(
                 .min_w(px(30.))
                 .text_size(px(12.))
                 .text_color(fg.opacity(0.8))
-                .child(match (ready, media.state) {
-                    (false, MediaState::Downloading) => "…".to_string(),
-                    (false, MediaState::Failed) => "!".to_string(),
-                    _ => format!("{}:{:02}", shown_secs / 60, shown_secs % 60),
-                }),
+                .child(format!("{}:{:02}", shown_secs / 60, shown_secs % 60)),
         );
-    if !ready && media.state == MediaState::Idle {
+    if fetch == Fetch::Missing {
         // Fetch voice notes as they scroll into view so play starts instantly.
         let store = store.clone();
         let (chat, id) = (m.chat_jid.clone(), m.id.clone());
@@ -2062,7 +2110,7 @@ fn scroll_button(unseen: usize, bottom: f32, theme: &Theme, cx: &mut Context<Con
 #[derive(PartialEq)]
 enum RowKey {
     Separator(i64),
-    Message { id: String, span: usize, first: bool, last: bool, show_name: bool, status: bool },
+    Message { id: String, span: usize, first: bool, last: bool, show_name: bool, status: bool, readers: Vec<String> },
     Typing,
 }
 
@@ -2070,20 +2118,22 @@ fn row_keys(rows: &[Row], messages: &[ChatMessage]) -> Vec<RowKey> {
     rows.iter()
         .map(|r| match r {
             Row::Separator(ts) => RowKey::Separator(*ts),
-            Row::Message { ix, span, first, last, show_name, status } => RowKey::Message {
+            Row::Message { ix, span, first, last, show_name, status, readers } => RowKey::Message {
                 id: messages[*ix].id.clone(),
                 span: *span,
                 first: *first,
                 last: *last,
                 show_name: *show_name,
                 status: status.is_some(),
+                readers: readers.iter().map(|(jid, _)| jid.clone()).collect(),
             },
             Row::Typing => RowKey::Typing,
         })
         .collect()
 }
 
-fn build_rows(messages: &[ChatMessage], typing: bool) -> Vec<Row> {
+/// `reads`: how far each group member has read (empty outside groups).
+fn build_rows(messages: &[ChatMessage], typing: bool, reads: &[GroupRead]) -> Vec<Row> {
     let mut rows = Vec::with_capacity(messages.len() + 8);
     let last_mine = messages.iter().rposition(|m| m.from_me && !m.deleted);
     let mut ix = 0;
@@ -2105,8 +2155,17 @@ fn build_rows(messages: &[ChatMessage], typing: bool) -> Vec<Row> {
         let next_separates = next.is_some_and(|n| n.timestamp - end.timestamp > SEPARATOR_GAP_SECS);
         let last = next.is_none_or(|n| next_separates || !same(end, n) || n.quoted.is_some());
         let mine = last_mine.is_some_and(|l| (ix..ix + span).contains(&l));
-        let status = (mine || (end.from_me && end.status == DeliveryStatus::Failed)).then(|| status_label(end));
-        rows.push(Row::Message { ix, span, first, last: last || status.is_some(), show_name: new_sender, status });
+        let readers: Vec<(String, String)> = reads
+            .iter()
+            .filter(|r| messages[ix..ix + span].iter().any(|m| m.id == r.message_id))
+            .map(|r| (r.jid.clone(), r.name.clone()))
+            .collect();
+        // In a group the heads say who read it; "Read" alone would only mean someone did.
+        let status = (mine || (end.from_me && end.status == DeliveryStatus::Failed))
+            .then(|| status_label(end))
+            .filter(|_| readers.is_empty() || end.status == DeliveryStatus::Failed);
+        let last = last || status.is_some() || !readers.is_empty();
+        rows.push(Row::Message { ix, span, first, last, show_name: new_sender, status, readers });
         ix += span;
     }
     if typing {

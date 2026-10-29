@@ -1124,11 +1124,22 @@ impl Session {
                     _ => return,
                 };
                 let result = shared.store(|s| Ok((s.canonical(&chat)?, s.upgrade_status(&chat, &r.message_ids, status)?)));
-                if let Some((chat_jid, message_ids)) = result
+                if let Some((chat_jid, message_ids)) = &result
                     && !message_ids.is_empty()
                 {
+                    let (chat_jid, message_ids) = (chat_jid.clone(), message_ids.clone());
                     shared.emit(Event::StatusChanged { chat_jid, message_ids, status });
                     shared.mark_chats_dirty();
+                }
+                // In a group, who read it: their picture moves down to it.
+                if r.source.is_group && !r.source.is_from_me && status == DeliveryStatus::Read {
+                    self.resolve_lid(&r.source.sender).await;
+                    let sender = r.source.sender.to_non_ad_string();
+                    if shared.store(|s| s.record_group_read(&chat, &sender, &r.message_ids)) == Some(true)
+                        && let Some((chat_jid, _)) = result
+                    {
+                        emit_group_reads(shared, &chat_jid);
+                    }
                 }
             }
             E::ChatPresence(p) => {
@@ -1618,6 +1629,9 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 let reached_start = !has_more;
                 let exhausted = shared.history_exhausted(&chat_jid);
                 shared.emit(Event::Messages { chat_jid: chat_jid.clone(), messages, has_more: has_more || !exhausted });
+                if is_group_jid(&chat_jid) && before.is_none() {
+                    emit_group_reads(shared, &chat_jid);
+                }
                 // Scrolling up past what's stored locally: ask the phone for older messages.
                 if before.is_some() && reached_start && !exhausted && let Some(session) = session {
                     request_older_history(shared, session, &chat_jid);
@@ -1657,6 +1671,11 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
             }
         }
         Command::DownloadMedia { chat_jid, message_id } => download_media(shared, session, &chat_jid, &message_id),
+        Command::ListMedia { chat_jid, limit } => {
+            if let Some(items) = shared.store(|s| s.load_media(&chat_jid, limit)) {
+                shared.emit(Event::ChatMedia { chat_jid, items });
+            }
+        }
         Command::FetchAvatar { jid } => {
             let Some(canonical) = shared.store(|s| s.canonical(&jid)) else { return };
             let (fresh, cached_path) = shared.cached_avatar(&canonical);
@@ -1845,6 +1864,12 @@ impl Shared {
             self.emit(Event::Messages { chat_jid: chat.to_owned(), messages, has_more: has_more || !exhausted });
         }
         self.emit(Event::HistoryLoading { chat_jid: chat.to_owned(), loading: false, exhausted });
+    }
+}
+
+fn emit_group_reads(shared: &Arc<Shared>, chat_jid: &str) {
+    if let Some(reads) = shared.store(|s| s.group_reads(chat_jid)) {
+        shared.emit(Event::GroupReads { chat_jid: chat_jid.to_owned(), reads });
     }
 }
 
@@ -2515,6 +2540,64 @@ fn download_media(shared: &Arc<Shared>, session: Option<&Arc<Session>>, chat_jid
     session.track(task);
 }
 
+/// Reports a download's progress to the UI, a few times a second at most.
+struct Progress {
+    shared: Arc<Shared>,
+    chat_jid: String,
+    message_id: String,
+    total: u64,
+    last: Option<(std::time::Instant, f32)>,
+}
+
+impl Progress {
+    fn new(shared: Arc<Shared>, raw: &RawMessage, total: u64) -> Self {
+        Self { shared, chat_jid: raw.chat_jid.clone(), message_id: raw.id.clone(), total, last: None }
+    }
+
+    fn at(&mut self, written: u64) {
+        let fraction = (written as f64 / self.total as f64).clamp(0., 1.) as f32;
+        let due = self.last.is_none_or(|(when, shown)| {
+            (fraction - shown).abs() >= 0.01 && when.elapsed() >= Duration::from_millis(120)
+        });
+        if due {
+            self.last = Some((std::time::Instant::now(), fraction));
+            let (chat_jid, message_id) = (self.chat_jid.clone(), self.message_id.clone());
+            self.shared.emit(Event::DownloadProgress { chat_jid, message_id, fraction });
+        }
+    }
+}
+
+/// The download's file, counting what's been written (a retry rewinds it).
+struct ProgressWriter {
+    file: std::fs::File,
+    progress: Progress,
+}
+
+impl std::io::Write for ProgressWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::Write::write(&mut self.file, buf)?;
+        let at = std::io::Seek::stream_position(&mut self.file)?;
+        self.progress.at(at);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
+    }
+}
+
+impl std::io::Seek for ProgressWriter {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.file, pos)
+    }
+}
+
+impl whatsapp_rust::download::DownloadWriter for ProgressWriter {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+}
+
 /// Drops a download from the in-flight set however its task ends.
 struct DownloadGuard {
     shared: Arc<Shared>,
@@ -2786,7 +2869,7 @@ impl Session {
     /// removed on failure or cancellation.
     async fn download_to_file(&self, raw: &RawMessage, media: &mut StoredMedia, dest: &Path) -> Result<()> {
         let mut tmp = TempFile::new(temp_path(dest));
-        match self.stream_to(media, tmp.path()).await {
+        match self.stream_to(raw, media, tmp.path()).await {
             // 403 too: history-synced media carries signed links that expire; the CDN
             // rejects them with 403 and only a re-upload from the phone brings them back.
             Err(e) if matches!(e.http_status(), Some(403 | 404 | 410)) => {
@@ -2794,7 +2877,7 @@ impl Session {
                 self.refresh_media(raw, media).await?;
                 // A fresh file: the failed attempt's writer may not be done with its own.
                 tmp = TempFile::new(temp_path(dest));
-                self.stream_to(media, tmp.path()).await?;
+                self.stream_to(raw, media, tmp.path()).await?;
             }
             other => other?,
         }
@@ -2803,9 +2886,15 @@ impl Session {
         Ok(())
     }
 
-    async fn stream_to(&self, media: &StoredMedia, part: &Path) -> Result<()> {
+    async fn stream_to(&self, raw: &RawMessage, media: &StoredMedia, part: &Path) -> Result<()> {
         let file = private_file(part)?;
-        let file = self.client.download_to_writer(media.downloadable(), file).await?;
+        let file = match media.file_length().filter(|n| *n > 0) {
+            Some(total) => {
+                let progress = Progress::new(self.shared.clone(), raw, total);
+                self.client.download_to_writer(media.downloadable(), ProgressWriter { file, progress }).await?.file
+            }
+            None => self.client.download_to_writer(media.downloadable(), file).await?,
+        };
         file.sync_all()?;
         Ok(())
     }

@@ -122,6 +122,7 @@ pub struct VideoMedia {
     pub gif: bool,
     /// Round "video note".
     pub round: bool,
+    pub size_bytes: Option<u64>,
     pub state: MediaState,
 }
 
@@ -298,6 +299,16 @@ pub struct Reaction {
     pub timestamp: Timestamp,
 }
 
+/// How far a group member has read: the newest of my messages they've read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupRead {
+    pub jid: String,
+    pub name: String,
+    pub message_id: String,
+    /// The message's timestamp.
+    pub timestamp: Timestamp,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionState {
     /// Starting up / reconnecting.
@@ -340,6 +351,14 @@ pub enum Event {
     /// into it; `from` no longer exists. Re-key UI state (selection, loaded transcript).
     ChatMerged { from: String, to: String },
     StatusChanged { chat_jid: String, message_ids: Vec<String>, status: DeliveryStatus },
+    /// How far a media download has got, 0..1 (only when the file's size is known).
+    /// The finished download arrives as a `MessageUpserted` with the path set.
+    DownloadProgress { chat_jid: String, message_id: String, fraction: f32 },
+    /// Answer to [`Command::ListMedia`]: the chat's photos and videos, newest first.
+    ChatMedia { chat_jid: String, items: Vec<ChatMessage> },
+    /// Where each member of group `chat_jid` has read up to (all of them, by name). Sent
+    /// after a group's [`Event::Messages`] page and whenever a read receipt moves someone.
+    GroupReads { chat_jid: String, reads: Vec<GroupRead> },
     /// Someone is typing in `chat_jid`.
     Typing { chat_jid: String, sender_name: Option<String>, typing: bool, sender_jid: Option<String> },
     /// Answer to [`Command::ListStickers`] (and pushed again when it changes).
@@ -402,6 +421,9 @@ pub enum Command {
     /// re-emits the target message via `MessageUpserted` with updated `reactions`
     /// immediately (optimistic), and again if the send fails.
     React { chat_jid: String, message_id: String, emoji: Option<String> },
+    /// The chat's photos and videos for the info panel (at most `limit`, newest first);
+    /// answered by `ChatMedia`.
+    ListMedia { chat_jid: String, limit: u32 },
     /// Fetch (or refresh, if stale) a profile picture; answered by `AvatarUpdated`.
     FetchAvatar { jid: String },
     MarkRead { chat_jid: String },
