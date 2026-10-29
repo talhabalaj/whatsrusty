@@ -19,7 +19,7 @@ use crate::extract::{
 };
 use crate::stickers::StickerSync;
 use crate::types::{
-    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, GroupRead, LocationInfo, MediaState, Mention, MessageBody,
+    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, GroupRead, LocationInfo, MediaState, Mention, MessageBody, MessageReceipt,
     MessagePreview, PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
@@ -205,6 +205,19 @@ const MIGRATIONS: &[&str] = &[
         message_id TEXT NOT NULL,
         ts         INTEGER NOT NULL,
         PRIMARY KEY (chat_jid, reader_jid)
+    );
+    "#,
+    // 11: when each recipient got, read and played each of my messages.
+    r#"
+    CREATE TABLE receipts (
+        chat_jid     TEXT NOT NULL,
+        message_id   TEXT NOT NULL,
+        -- Canonical: the other person in a chat with one, each member in a group.
+        member_jid   TEXT NOT NULL,
+        delivered_ts INTEGER,
+        read_ts      INTEGER,
+        played_ts    INTEGER,
+        PRIMARY KEY (chat_jid, message_id, member_jid)
     );
     "#,
 ];
@@ -933,7 +946,7 @@ impl Store {
                 "DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM aliases;
                  DELETE FROM avatars; DELETE FROM pending_edits; DELETE FROM pending_receipts;
                  DELETE FROM reactions; DELETE FROM favorite_stickers; DELETE FROM removed_recent_stickers;
-                 DELETE FROM group_reads;",
+                 DELETE FROM group_reads; DELETE FROM receipts;",
             )?;
         Ok(())
     }
@@ -1117,6 +1130,19 @@ impl Store {
             params![lid, pn],
         )?;
         c.execute("DELETE FROM group_reads WHERE reader_jid = ?1", [lid])?;
+        // Receipts in the LID chat or from the LID member: the earliest time of each wins.
+        c.execute(
+            "INSERT INTO receipts (chat_jid, message_id, member_jid, delivered_ts, read_ts, played_ts)
+             SELECT CASE WHEN chat_jid = ?1 THEN ?2 ELSE chat_jid END, message_id,
+                    CASE WHEN member_jid = ?1 THEN ?2 ELSE member_jid END, delivered_ts, read_ts, played_ts
+             FROM receipts WHERE chat_jid = ?1 OR member_jid = ?1 AND true
+             ON CONFLICT (chat_jid, message_id, member_jid) DO UPDATE SET
+                delivered_ts = COALESCE(MIN(delivered_ts, excluded.delivered_ts), delivered_ts, excluded.delivered_ts),
+                read_ts = COALESCE(MIN(read_ts, excluded.read_ts), read_ts, excluded.read_ts),
+                played_ts = COALESCE(MIN(played_ts, excluded.played_ts), played_ts, excluded.played_ts)",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM receipts WHERE chat_jid = ?1 OR member_jid = ?1", [lid])?;
         c.execute(
             "DELETE FROM reactions WHERE chat_jid = ?1
                 AND target_id IN (SELECT id FROM messages WHERE chat_jid = ?1 AND revoked = 1)",
@@ -1910,6 +1936,61 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// `member` got (`Delivered`) or read (`Read`; `played` for a voice note) my messages
+    /// `ids` at `at`. Only the first time of each counts; reading implies it arrived.
+    /// Returns the ids that changed.
+    pub fn record_receipt(
+        &self,
+        chat_jid: &str,
+        member: &str,
+        ids: &[String],
+        status: DeliveryStatus,
+        played: bool,
+        at: Timestamp,
+    ) -> Result<Vec<String>> {
+        let (chat, member) = (self.canonical(chat_jid)?, self.canonical(member)?);
+        let read = (status == DeliveryStatus::Read).then_some(at);
+        let played = played.then_some(at);
+        let mut mine = self.conn.prepare_cached("SELECT 1 FROM messages WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1")?;
+        let mut upsert = self.conn.prepare_cached(
+            "INSERT INTO receipts (chat_jid, message_id, member_jid, delivered_ts, read_ts, played_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (chat_jid, message_id, member_jid) DO UPDATE SET
+                delivered_ts = COALESCE(delivered_ts, excluded.delivered_ts),
+                read_ts = COALESCE(read_ts, excluded.read_ts),
+                played_ts = COALESCE(played_ts, excluded.played_ts)
+             WHERE (delivered_ts IS NULL AND excluded.delivered_ts IS NOT NULL)
+                OR (read_ts IS NULL AND excluded.read_ts IS NOT NULL)
+                OR (played_ts IS NULL AND excluded.played_ts IS NOT NULL)",
+        )?;
+        let mut changed = Vec::new();
+        for id in ids {
+            if mine.exists(params![chat, id])? && upsert.execute(params![chat, id, member, at, read, played])? > 0 {
+                changed.push(id.clone());
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Who got and read my message `id`, read first (latest first), then delivered.
+    pub fn receipts(&self, chat_jid: &str, id: &str) -> Result<Vec<MessageReceipt>> {
+        let chat = self.canonical(chat_jid)?;
+        let mut receipts: Vec<MessageReceipt> = self
+            .conn
+            .prepare_cached(
+                "SELECT member_jid, delivered_ts, read_ts, played_ts FROM receipts WHERE chat_jid = ?1 AND message_id = ?2",
+            )?
+            .query_map(params![chat, id], |r| {
+                Ok(MessageReceipt { jid: r.get(0)?, name: String::new(), delivered: r.get(1)?, read: r.get(2)?, played: r.get(3)? })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for r in &mut receipts {
+            r.name = self.sender_display_name(&r.jid, None)?;
+        }
+        receipts.sort_by_key(|r| (r.read.is_none(), std::cmp::Reverse(r.read.or(r.delivered)), r.name.to_lowercase()));
+        Ok(receipts)
+    }
+
     /// How far each member of group `chat_jid` has read my messages, by name.
     pub fn group_reads(&self, chat_jid: &str) -> Result<Vec<GroupRead>> {
         let chat = self.canonical(chat_jid)?;
@@ -2647,6 +2728,32 @@ mod tests {
     }
 
     #[test]
+    fn receipts_keep_the_first_time_of_each() {
+        let s = store();
+        s.insert_message(&msg(GROUP, "1", ME, "one", 10), true).unwrap();
+        s.insert_message(&msg(GROUP, "2", ALICE, "theirs", 20), true).unwrap();
+        let ids = |v: &[&str]| v.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        let times = |s: &Store| {
+            s.receipts(GROUP, "1").unwrap().into_iter().map(|r| (r.jid, r.delivered, r.read)).collect::<Vec<_>>()
+        };
+
+        // Only my messages.
+        assert_eq!(s.record_receipt(GROUP, BOB_LID, &ids(&["1", "2"]), DeliveryStatus::Delivered, false, 100).unwrap(), ids(&["1"]));
+        assert!(s.record_receipt(GROUP, BOB_LID, &ids(&["1"]), DeliveryStatus::Delivered, false, 150).unwrap().is_empty());
+        assert_eq!(s.record_receipt(GROUP, BOB_LID, &ids(&["1"]), DeliveryStatus::Read, false, 200).unwrap(), ids(&["1"]));
+        // Read without a delivery receipt first: it arrived then too.
+        s.record_receipt(GROUP, ALICE, &ids(&["1"]), DeliveryStatus::Read, false, 300).unwrap();
+        assert_eq!(
+            times(&s),
+            [(ALICE.to_string(), Some(300), Some(300)), (BOB_LID.to_string(), Some(100), Some(200))]
+        );
+
+        // Learning the LID's number folds it in.
+        s.add_alias(BOB_LID, BOB).unwrap();
+        assert!(times(&s).contains(&(BOB.to_string(), Some(100), Some(200))));
+    }
+
+    #[test]
     fn group_reads_only_move_forward() {
         let s = store();
         s.insert_message(&msg(GROUP, "1", ME, "one", 10), true).unwrap();
@@ -3248,7 +3355,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE pending_edits DROP COLUMN stored_at; ALTER TABLE messages DROP COLUMN forwarded;
                      DROP TABLE deleted_for_me; ALTER TABLE chats DROP COLUMN marked_unread;
-                     DROP TABLE group_community; DROP TABLE group_reads;
+                     DROP TABLE group_community; DROP TABLE group_reads; DROP TABLE receipts;
                      PRAGMA user_version = 3",
                 )
                 .unwrap();

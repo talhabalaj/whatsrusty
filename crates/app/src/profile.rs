@@ -20,7 +20,7 @@ fn phone_from_jid(jid: &str) -> Option<String> {
     (server == "s.whatsapp.net" && user.chars().all(|c| c.is_ascii_digit())).then(|| format!("+{user}"))
 }
 
-fn section(title: &str, body: impl IntoElement, theme: &Theme) -> Div {
+pub fn section(title: &str, body: impl IntoElement, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()

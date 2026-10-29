@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
 use wa_backend::{
-    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, GroupRead, MessageBody,
+    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, GroupRead, MessageBody, MessageReceipt,
     SearchHit,
 };
 
@@ -145,6 +145,10 @@ pub struct Store {
     /// JID whose info panel is open, and the profiles loaded so far.
     pub profile_open: Option<String>,
     pub profiles: HashMap<String, wa_backend::Profile>,
+    /// My message (chat, id) whose Info panel is open (in place of the info panel), and
+    /// who got and read it.
+    pub message_info: Option<(String, String)>,
+    pub receipts: HashMap<(String, String), Vec<MessageReceipt>>,
     /// My stickers for the sticker panel (favorites first, then recents).
     pub stickers: Vec<wa_backend::StickerRef>,
     /// When each profile was requested, so the panel can stop saying "Loading…".
@@ -223,6 +227,8 @@ impl Store {
             video_in: None,
             profile_open: None,
             profiles: HashMap::new(),
+            message_info: None,
+            receipts: HashMap::new(),
             stickers: Vec::new(),
             profile_requested_at: HashMap::new(),
             just_sent: HashMap::new(),
@@ -385,6 +391,19 @@ impl Store {
                 self.chat_media.insert(chat_jid, tiles);
                 cx.notify();
             }
+            Event::MessageInfo { chat_jid, message_id, receipts } => {
+                self.receipts.insert((chat_jid, message_id), receipts);
+                cx.notify();
+            }
+            Event::ReceiptsChanged { chat_jid, message_ids } => {
+                if let Some((chat, id)) = &self.message_info
+                    && *chat == chat_jid
+                    && message_ids.contains(id)
+                {
+                    let (chat_jid, message_id) = (chat.clone(), id.clone());
+                    self.send(Command::MessageInfo { chat_jid, message_id });
+                }
+            }
             Event::GroupReads { chat_jid, reads } => {
                 self.group_reads.insert(chat_jid.clone(), reads);
                 cx.emit(StoreEvent::TranscriptChanged { chat_jid, change: Change::Updated });
@@ -451,6 +470,7 @@ impl Store {
         }
         if self.selected.as_deref() != Some(jid.as_str()) {
             self.drop_reply_of_selected();
+            self.message_info = None;
             // An open info panel follows the conversation, like Messages' details pane.
             if self.profile_open.is_some() && self.profile_open == self.selected {
                 self.request_profile(&jid, cx);
@@ -631,6 +651,8 @@ impl Store {
         self.close_video(cx);
         self.profile_open = None;
         self.profiles.clear();
+        self.message_info = None;
+        self.receipts.clear();
         self.stickers.clear();
         self.just_sent.clear();
         self.drafts.clear();
@@ -746,6 +768,7 @@ impl Store {
 
     /// Show the info panel for a chat or person (toggles if it's already open).
     pub fn toggle_profile(&mut self, jid: String, cx: &mut Context<Self>) {
+        self.message_info = None;
         if self.profile_open.as_deref() == Some(jid.as_str()) {
             self.profile_open = None;
         } else {
@@ -785,6 +808,24 @@ impl Store {
 
     pub fn close_profile(&mut self, cx: &mut Context<Self>) {
         if self.profile_open.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Show who got and read my message `id` (in place of the info panel).
+    pub fn open_message_info(&mut self, chat_jid: String, id: String, cx: &mut Context<Self>) {
+        self.profile_open = None;
+        if chat_jid.ends_with("@g.us") && !self.profiles.contains_key(&chat_jid) {
+            // Its members, for who it hasn't reached yet.
+            self.request_profile(&chat_jid, cx);
+        }
+        self.send(Command::MessageInfo { chat_jid: chat_jid.clone(), message_id: id.clone() });
+        self.message_info = Some((chat_jid, id));
+        cx.notify();
+    }
+
+    pub fn close_message_info(&mut self, cx: &mut Context<Self>) {
+        if self.message_info.take().is_some() {
             cx.notify();
         }
     }

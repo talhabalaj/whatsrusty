@@ -1131,10 +1131,25 @@ impl Session {
                     shared.emit(Event::StatusChanged { chat_jid, message_ids, status });
                     shared.mark_chats_dirty();
                 }
-                // In a group, who read it: their picture moves down to it.
-                if r.source.is_group && !r.source.is_from_me && status == DeliveryStatus::Read {
+                if r.source.is_from_me {
+                    return;
+                }
+                // Who got or read it, and when, for its Info.
+                if r.source.is_group {
                     self.resolve_lid(&r.source.sender).await;
-                    let sender = r.source.sender.to_non_ad_string();
+                }
+                let member = if r.source.is_group { r.source.sender.to_non_ad_string() } else { chat.clone() };
+                let played = matches!(r.r#type, ReceiptType::Played);
+                let at = r.timestamp.timestamp();
+                if let Some(ids) = shared.store(|s| s.record_receipt(&chat, &member, &r.message_ids, status, played, at))
+                    && !ids.is_empty()
+                    && let Some((chat_jid, _)) = &result
+                {
+                    shared.emit(Event::ReceiptsChanged { chat_jid: chat_jid.clone(), message_ids: ids });
+                }
+                // In a group, who read it: their picture moves down to it.
+                if r.source.is_group && status == DeliveryStatus::Read {
+                    let sender = member;
                     if shared.store(|s| s.record_group_read(&chat, &sender, &r.message_ids)) == Some(true)
                         && let Some((chat_jid, _)) = result
                     {
@@ -1671,6 +1686,11 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
             }
         }
         Command::DownloadMedia { chat_jid, message_id } => download_media(shared, session, &chat_jid, &message_id),
+        Command::MessageInfo { chat_jid, message_id } => {
+            if let Some(receipts) = shared.store(|s| s.receipts(&chat_jid, &message_id)) {
+                shared.emit(Event::MessageInfo { chat_jid, message_id, receipts });
+            }
+        }
         Command::ListMedia { chat_jid, limit } => {
             if let Some(items) = shared.store(|s| s.load_media(&chat_jid, limit)) {
                 shared.emit(Event::ChatMedia { chat_jid, items });
