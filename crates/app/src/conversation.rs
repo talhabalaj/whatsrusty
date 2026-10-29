@@ -635,6 +635,8 @@ impl Conversation {
     fn on_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.picker_for.is_some() {
             self.close_menu(cx);
+        } else if self.binding.fixed().is_none() && self.store.read(cx).message_info.is_some() {
+            self.store.update(cx, |s, cx| s.close_message_info(cx));
         } else if self.binding.fixed().is_none() && self.store.read(cx).profile_open.is_some() {
             self.store.update(cx, |s, cx| s.close_profile(cx));
         } else {
@@ -1440,6 +1442,17 @@ impl Conversation {
                 act(|this, target, window, cx| Composer::start_edit(&this.composer, target, window, cx), m),
             ));
         }
+        if m.from_me && !m.deleted && self.binding.fixed().is_none() {
+            items.push(Item::action(
+                "Info",
+                act(
+                    |this, target, _, cx| {
+                        this.store.update(cx, |s, cx| s.open_message_info(target.chat_jid.clone(), target.id.clone(), cx))
+                    },
+                    m,
+                ),
+            ));
+        }
         // A queued send would still go out after its row is gone: no Delete while sending.
         let sending = m.from_me && m.status == DeliveryStatus::Pending;
         if !sending {
@@ -1717,7 +1730,13 @@ fn reaction_pill(reactions: &[wa_backend::Reaction], from_me: bool, theme: &Them
 }
 
 /// Text (or a caption) to copy: what the bubble shows in words.
-fn copy_text(m: &ChatMessage) -> Option<String> {
+/// What's open beside the conversation.
+enum SidePanel {
+    Profile(String),
+    MessageInfo(String, String),
+}
+
+pub fn copy_text(m: &ChatMessage) -> Option<String> {
     if m.deleted {
         return None;
     }
@@ -2239,7 +2258,13 @@ impl Render for Conversation {
         let store = self.store.read(cx);
         let mini = self.binding.fixed().is_some();
         // A mini window has no room for the info panel.
-        let profile_open = if mini { None } else { store.profile_open.clone() };
+        let side_panel = if mini {
+            None
+        } else if let Some((chat, id)) = store.message_info.clone() {
+            Some(SidePanel::MessageInfo(chat, id))
+        } else {
+            store.profile_open.clone().map(SidePanel::Profile)
+        };
         let history = store.history_of(&chat.jid);
         let loading_older = history.page_pending || history.fetching_remote;
         let replying = store.replying_to(&chat.jid).is_some();
@@ -2383,8 +2408,13 @@ impl Render for Conversation {
             .relative()
             .flex()
             .child(pane)
-            .when_some(profile_open, |d, jid| {
-                let panel = crate::profile::panel(&jid, &self.store, glass_on, &theme, cx);
+            .when_some(side_panel, |d, open| {
+                let panel = match open {
+                    SidePanel::Profile(jid) => crate::profile::panel(&jid, &self.store, glass_on, &theme, cx).into_any_element(),
+                    SidePanel::MessageInfo(chat, id) => {
+                        crate::message_info::panel(&chat, &id, &self.store, glass_on, &theme, cx).into_any_element()
+                    }
+                };
                 if overlay_panel {
                     let sheet = div().absolute().top_0().bottom_0().right_0().occlude().shadow_lg().child(panel);
                     d.child(above_glass(glass_on, "profile-sheet", sheet))

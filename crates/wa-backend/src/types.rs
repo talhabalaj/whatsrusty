@@ -309,6 +309,17 @@ pub struct GroupRead {
     pub timestamp: Timestamp,
 }
 
+/// When one recipient of my message got it, read it, and (a voice note) played it.
+/// In a chat with one person, that person; in a group, each member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageReceipt {
+    pub jid: String,
+    pub name: String,
+    pub delivered: Option<Timestamp>,
+    pub read: Option<Timestamp>,
+    pub played: Option<Timestamp>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionState {
     /// Starting up / reconnecting.
@@ -359,6 +370,10 @@ pub enum Event {
     /// Where each member of group `chat_jid` has read up to (all of them, by name). Sent
     /// after a group's [`Event::Messages`] page and whenever a read receipt moves someone.
     GroupReads { chat_jid: String, reads: Vec<GroupRead> },
+    /// Answer to [`Command::MessageInfo`]: who got and read my message, and when.
+    MessageInfo { chat_jid: String, message_id: String, receipts: Vec<MessageReceipt> },
+    /// New receipts arrived for these messages of mine (ask `MessageInfo` again for them).
+    ReceiptsChanged { chat_jid: String, message_ids: Vec<String> },
     /// Someone is typing in `chat_jid`.
     Typing { chat_jid: String, sender_name: Option<String>, typing: bool, sender_jid: Option<String> },
     /// Answer to [`Command::ListStickers`] (and pushed again when it changes).
@@ -424,6 +439,8 @@ pub enum Command {
     /// The chat's photos and videos for the info panel (at most `limit`, newest first);
     /// answered by `ChatMedia`.
     ListMedia { chat_jid: String, limit: u32 },
+    /// Who got and read my message, and when; answered by `MessageInfo`.
+    MessageInfo { chat_jid: String, message_id: String },
     /// Fetch (or refresh, if stale) a profile picture; answered by `AvatarUpdated`.
     FetchAvatar { jid: String },
     MarkRead { chat_jid: String },

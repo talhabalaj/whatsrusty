@@ -17,6 +17,7 @@ mod links;
 mod login_item;
 mod media_cache;
 mod mentions;
+mod message_info;
 mod mini;
 mod new_chat;
 mod mock;
@@ -585,6 +586,17 @@ fn main() {
                     cx.background_executor().timer(std::time::Duration::from_millis(1000)).await;
                     cx.update(|cx| mini::pop_out(&store, jid.to_string(), cx));
                 }
+            })
+            .detach();
+        }
+        // "chat jid/message id": open that message's Info.
+        if let Ok(target) = std::env::var("WA_DEBUG_MESSAGE_INFO")
+            && let Some((chat, id)) = target.split_once('/')
+        {
+            let (store, chat, id) = (debug_store.clone(), chat.to_string(), id.to_string());
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(1200)).await;
+                store.update(cx, |s, cx| s.open_message_info(chat, id, cx));
             })
             .detach();
         }

@@ -701,6 +701,31 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 }
                 let _ = ev.send(Event::MessageUpserted(m.clone()));
             }
+            Command::MessageInfo { chat_jid, message_id } => {
+                let Some(m) = fake.messages.iter().find(|m| m.chat_jid == chat_jid && m.id == message_id) else { continue };
+                let t = m.timestamp;
+                let receipt = |name: &str, delivered: Option<i64>, read: Option<i64>| wa_backend::MessageReceipt {
+                    jid: member_jid(name),
+                    name: name.into(),
+                    delivered: delivered.map(|d| t + d),
+                    read: read.map(|r| t + r),
+                    played: None,
+                };
+                let receipts = if chat_jid.ends_with("@g.us") {
+                    // Omar and Ali read it; it reached Sara, who hasn't opened it.
+                    vec![receipt("Omar", Some(4), Some(95)), receipt("Ali Raza", Some(6), Some(40)), receipt("Sara Ali", Some(30), None)]
+                } else {
+                    let chat = fake.chats.iter().find(|c| c.jid == chat_jid).map_or("", |c| c.name.as_str());
+                    let mut r = receipt(chat, Some(3), Some(120));
+                    r.jid = chat_jid.clone();
+                    match m.status {
+                        DeliveryStatus::Read => vec![r],
+                        DeliveryStatus::Delivered => vec![wa_backend::MessageReceipt { read: None, ..r }],
+                        _ => Vec::new(),
+                    }
+                };
+                let _ = ev.send(Event::MessageInfo { chat_jid, message_id, receipts });
+            }
             Command::ListMedia { chat_jid, limit } => {
                 let items = fake
                     .messages
