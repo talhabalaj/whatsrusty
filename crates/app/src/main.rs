@@ -3,6 +3,7 @@ mod avatar;
 mod composer;
 mod conversation;
 mod dock;
+mod download;
 mod emoji_complete;
 mod find_bar;
 mod forward_picker;

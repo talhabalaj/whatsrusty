@@ -4,11 +4,12 @@
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use wa_backend::{ChatSummary, Profile};
+use wa_backend::{ChatSummary, MessageBody, Profile};
 
 use crate::avatar::avatar;
+use crate::download::Fetch;
 use crate::icons::{Glyph, glyph};
-use crate::state::Store;
+use crate::state::{MediaTile, Store};
 use crate::theme::Theme;
 
 pub const PANEL_WIDTH: f32 = 300.;
@@ -29,6 +30,76 @@ fn section(title: &str, body: impl IntoElement, theme: &Theme) -> Div {
         .bg(theme.search_bg)
         .child(div().text_size(px(11.)).text_color(theme.text_secondary).child(title.to_string()))
         .child(body)
+}
+
+/// Media grid columns, and the gap between tiles.
+const MEDIA_COLUMNS: usize = 3;
+const MEDIA_GAP: f32 = 4.;
+
+/// The chat's photos and videos, newest first: a grid of square tiles opening in the
+/// photo viewer / video player (or downloading, the ones not on this Mac yet).
+fn media_grid(tiles: &[MediaTile], store: &Entity<Store>, theme: &Theme, cx: &App) -> Div {
+    // The panel's padding, then the section's.
+    let side = (PANEL_WIDTH - 32. - 24. - MEDIA_GAP * (MEDIA_COLUMNS - 1) as f32) / MEDIA_COLUMNS as f32;
+    let s = store.read(cx);
+    let tile = |t: &MediaTile| {
+        let m = &t.message;
+        let (path, state, video) = match &m.body {
+            MessageBody::Image(i) => (i.path.clone(), i.state, None),
+            MessageBody::Video(v) => (v.path.clone(), v.state, Some(v)),
+            _ => return div().into_any_element(),
+        };
+        let fetch = Fetch::of(path.is_some(), state, s.download_progress(&m.chat_jid, &m.id));
+        let picture = match (&path, &t.thumb, video) {
+            (Some(p), _, None) => Some(img(p.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element()),
+            (_, Some(thumb), _) => Some(img(thumb.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element()),
+            _ => None,
+        };
+        let (store, chat, id) = (store.clone(), m.chat_jid.clone(), m.id.clone());
+        let (width, height) = video.map_or((None, None), |v| (v.width, v.height));
+        let is_video = video.is_some();
+        div()
+            .id(SharedString::from(format!("media-{}", m.id)))
+            .relative()
+            .flex_none()
+            .size(px(side))
+            .rounded(px(6.))
+            .overflow_hidden()
+            .bg(theme.separator)
+            .cursor_pointer()
+            .children(picture)
+            .when_some(video.filter(|_| fetch.ready()), |d, v| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom(px(4.))
+                        .left(px(5.))
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(white())
+                        .child(glyph(Glyph::Play, 9., white()))
+                        .when(!v.gif, |d| d.child(format!("{}:{:02}", v.duration_secs / 60, v.duration_secs % 60))),
+                )
+            })
+            .when_some(crate::download::badge(fetch, 28.), |d, badge| {
+                d.child(div().absolute().inset_0().bg(black().opacity(0.28)).flex().items_center().justify_center().child(badge))
+            })
+            .on_click(move |_, _, cx| match path.clone() {
+                Some(path) if is_video => store.update(cx, |s, cx| {
+                    s.open_video_in(crate::state::OpenVideo { path, width, height }, None, cx)
+                }),
+                Some(path) => store.update(cx, |s, cx| s.open_lightbox_in(path, Some(id.clone()), None, cx)),
+                None if !matches!(fetch, Fetch::Downloading(_)) => store.update(cx, |s, _| s.request_media(&chat, &id)),
+                None => {}
+            })
+            .into_any_element()
+    };
+    div().flex().flex_col().gap(px(MEDIA_GAP)).pt(px(4.)).children(
+        tiles.chunks(MEDIA_COLUMNS).map(|row| div().flex().gap(px(MEDIA_GAP)).children(row.iter().map(tile))),
+    )
 }
 
 pub fn panel(jid: &str, store: &Entity<Store>, glass_on: bool, theme: &Theme, cx: &App) -> impl IntoElement {
@@ -131,6 +202,12 @@ pub fn panel(jid: &str, store: &Entity<Store>, glass_on: bool, theme: &Theme, cx
                     d.when_some(description, |d, desc| {
                         d.child(section("Description", div().text_size(px(13.)).text_color(theme.text).child(desc), theme))
                     })
+                })
+                .when_some(s.chat_media(jid).filter(|t| !t.is_empty()), |d, tiles| {
+                    d.child(section("Photos & Videos", media_grid(tiles, store, theme, cx), theme))
+                })
+                .when(is_group, |d| {
+                    d
                     .child(section(
                         &profile.map_or("Participants".to_string(), |p| format!("{} participants", p.participants.len())),
                         div().flex().flex_col().map(|list| match profile {

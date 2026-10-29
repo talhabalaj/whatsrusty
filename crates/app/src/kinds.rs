@@ -10,6 +10,7 @@ use wa_backend::{
 };
 
 use crate::avatar::avatar;
+use crate::download::Fetch;
 use crate::icons::{Glyph, glyph};
 use crate::state::Store;
 use crate::theme::Theme;
@@ -61,12 +62,15 @@ pub fn video(
         crate::conversation::image_box(v.width, v.height)
     };
     let radius = if v.round { 100. } else { BUBBLE_RADIUS };
-    let status = match (v.path.is_some(), v.state) {
-        (false, MediaState::Downloading) => Some("Downloading…".to_string()),
-        (false, MediaState::Failed) => Some("Couldn't download".to_string()),
-        _ => None,
+    let fetch = Fetch::of(v.path.is_some(), v.state, store.read(cx).download_progress(&m.chat_jid, &m.id));
+    let status = (fetch == Fetch::Failed).then(|| "Couldn't download".to_string());
+    // Not downloaded: how big it is, so you know before fetching it.
+    let size = v.size_bytes.filter(|_| !fetch.ready()).map(human_size);
+    let badge = match (v.gif, size) {
+        (true, _) => "GIF".to_string(),
+        (false, Some(size)) => format!("{} · {size}", duration(v.duration_secs)),
+        (false, None) => duration(v.duration_secs),
     };
-    let badge = if v.gif { "GIF".to_string() } else { duration(v.duration_secs) };
     div()
         .id(SharedString::from(format!("video-{}", m.id)))
         .relative()
@@ -77,18 +81,24 @@ pub fn video(
         .bg(theme.bubble_in)
         .cursor_pointer()
         .when_some(thumb, |d, t| d.child(img(t).size_full().rounded(px(radius)).object_fit(ObjectFit::Cover)))
-        .child(
-            div().absolute().inset_0().flex().items_center().justify_center().child(
-                div()
-                    .size(px(46.))
-                    .rounded_full()
-                    .bg(black().opacity(0.45))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(glyph(Glyph::Play, 20., white())),
+        .map(|d| match crate::download::badge(fetch, 46.) {
+            // Not here yet: dimmed, with a down arrow instead of play.
+            Some(badge) => d.child(
+                div().absolute().inset_0().rounded(px(radius)).bg(black().opacity(0.28)).flex().items_center().justify_center().child(badge),
             ),
-        )
+            None => d.child(
+                div().absolute().inset_0().flex().items_center().justify_center().child(
+                    div()
+                        .size(px(46.))
+                        .rounded_full()
+                        .bg(black().opacity(0.45))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(glyph(Glyph::Play, 20., white())),
+                ),
+            ),
+        })
         .child(div().absolute().bottom(px(8.)).right(px(if v.round { 70. } else { 8. })).child(pill(status.unwrap_or(badge))))
         .on_click({
             let (store, chat, id, path) = (store.clone(), m.chat_jid.clone(), m.id.clone(), v.path.clone());
@@ -98,7 +108,8 @@ pub fn video(
                     let video = crate::state::OpenVideo { path: p.clone(), width, height };
                     s.open_video_in(video, mini.clone(), cx)
                 }),
-                None => store.update(cx, |s, _| s.request_media(&chat, &id)),
+                None if !matches!(fetch, Fetch::Downloading(_)) => store.update(cx, |s, _| s.request_media(&chat, &id)),
+                None => {}
             }
         })
 }
@@ -109,7 +120,9 @@ pub fn document(
     d: &DocumentMedia,
     from_me: bool,
     theme: &Theme,
+    cx: &App,
 ) -> Stateful<Div> {
+    let fetch = Fetch::of(d.path.is_some(), d.state, store.read(cx).download_progress(&m.chat_jid, &m.id));
     let ext = std::path::Path::new(&d.file_name)
         .extension()
         .and_then(|e| e.to_str())
@@ -122,10 +135,11 @@ pub fn document(
     if let Some(pages) = d.page_count.filter(|p| *p > 0) {
         meta.push(format!("{pages} page{}", if pages == 1 { "" } else { "s" }));
     }
-    let meta = match (d.path.is_some(), d.state) {
-        (false, MediaState::Downloading) => "Downloading…".to_string(),
-        (false, MediaState::Failed) => "Couldn't download. Click to retry".to_string(),
-        _ => meta.join(" · "),
+    let meta = match fetch {
+        Fetch::Downloading(Some(p)) => format!("Downloading… {}%", (p * 100.).round() as u32),
+        Fetch::Downloading(None) => "Downloading…".to_string(),
+        Fetch::Failed => "Couldn't download. Click to retry".to_string(),
+        Fetch::Missing | Fetch::Ready => meta.join(" · "),
     };
     let (fg, sub, tile) = if from_me {
         (theme.bubble_out_text, theme.bubble_out_text.opacity(0.75), white().opacity(0.2))
@@ -141,6 +155,7 @@ pub fn document(
         .cursor_pointer()
         .child(
             div()
+                .relative()
                 .flex_none()
                 .w(px(36.))
                 .h(px(44.))
@@ -152,7 +167,11 @@ pub fn document(
                 .text_size(px(9.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(fg)
-                .child(ext.chars().take(4).collect::<String>()),
+                .child(ext.chars().take(4).collect::<String>())
+                // Not on this Mac yet: a down arrow over the file (ringed while it comes).
+                .when_some(crate::download::badge(fetch, 26.), |d, badge| {
+                    d.child(div().absolute().inset_0().flex().items_center().justify_center().child(badge))
+                }),
         )
         .child(
             div()
@@ -180,6 +199,7 @@ pub fn sticker(store: &Entity<Store>, m: &ChatMessage, s: &StickerMedia, theme: 
     ensure_download(store, m, s.path.is_some(), s.state, cx);
     let size = 140.;
     let failed = s.path.is_none() && s.state == MediaState::Failed;
+    let progress = store.read(cx).download_progress(&m.chat_jid, &m.id);
     div()
         .id(SharedString::from(format!("sticker-{}", m.id)))
         .size(px(size))
@@ -202,7 +222,11 @@ pub fn sticker(store: &Entity<Store>, m: &ChatMessage, s: &StickerMedia, theme: 
                 .text_size(px(11.))
                 .text_color(theme.text_secondary)
                 .text_center()
-                .child(if failed { "Sticker unavailable\nClick to retry" } else { "…" }),
+                .map(|d| match failed {
+                    true => d.child("Sticker unavailable\nClick to retry"),
+                    // Coming: the ring, filling as it downloads.
+                    false => d.child(div().relative().size(px(26.)).child(crate::download::ring(progress, 2.5, theme.text_secondary))),
+                }),
         ),
     })
 }
