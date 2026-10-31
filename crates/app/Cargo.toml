@@ -25,8 +25,8 @@ qrcode = { version = "0.14", default-features = false }
 dirs = "6"
 env_logger = "0.11"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSGeometry", "NSNotification", "NSOperation", "block2", "NSBundle", "NSError"] }
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2", "NSApplication", "NSDockTile", "NSAppearance", "NSEvent", "NSMenu", "NSMenuItem"] }
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSGeometry", "NSNotification", "NSOperation", "block2", "NSBundle", "NSError", "NSDistributedNotificationCenter"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSView", "NSResponder", "NSGraphics", "NSScreen", "block2", "NSApplication", "NSDockTile", "NSAppearance", "NSEvent", "NSMenu", "NSMenuItem", "NSWorkspace"] }
 objc2-av-kit = { version = "0.3", default-features = false, features = ["std", "AVPlayerView", "objc2-app-kit", "objc2-av-foundation"] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationSettings"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVAsset", "AVCaptureDevice", "AVMediaFormat", "block2"] }

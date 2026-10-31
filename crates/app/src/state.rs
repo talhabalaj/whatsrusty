@@ -164,9 +164,13 @@ pub struct Store {
     stay_deselected: bool,
     /// Unsent text and attachments per chat.
     pub drafts: HashMap<String, Draft>,
-    /// A window of ours is in front, as last told to the backend: WhatsApp keeps the
-    /// phone's notifications quiet while we're online, so we are only then.
+    /// A window of ours is in front. WhatsApp keeps the phone's notifications quiet while
+    /// we're online, so we are only then, and not while the Mac sleeps or is locked.
     app_active: bool,
+    /// The Mac is asleep, its screens are off or the session is locked (see `power`).
+    away: bool,
+    /// What the backend was last told (`Command::SetActive`).
+    presence_sent: bool,
     /// Going inactive waits a moment (moving between our own windows passes through it).
     _inactive_after: Option<gpui_kit::Task<()>>,
     pub main_window: Option<AnyWindowHandle>,
@@ -238,6 +242,8 @@ impl Store {
             stay_deselected: false,
             drafts: HashMap::new(),
             app_active: false,
+            away: false,
+            presence_sent: false,
             _inactive_after: None,
             main_window: None,
             popped: HashMap::new(),
@@ -1073,10 +1079,8 @@ impl Store {
     pub fn window_activation_changed(&mut self, active: bool, cx: &mut Context<Self>) {
         if active {
             self._inactive_after = None;
-            if !self.app_active {
-                self.app_active = true;
-                self.send(Command::SetActive { active: true });
-            }
+            self.app_active = true;
+            self.sync_presence();
             return;
         }
         if !self.app_active {
@@ -1087,10 +1091,29 @@ impl Store {
             let _ = this.update(cx, |s, cx| {
                 if s.app_active && cx.active_window().is_none() {
                     s.app_active = false;
-                    s.send(Command::SetActive { active: false });
+                    s.sync_presence();
                 }
             });
         }));
+    }
+
+    /// The Mac went to sleep, locked or sat untouched (`true`), or the user is back. Going
+    /// away is also sent straight to the backend by `power`, before the Mac sleeps.
+    pub fn set_away(&mut self, away: bool) {
+        self.away = away;
+        self.sync_presence();
+    }
+
+    fn sync_presence(&mut self) {
+        let want = self.app_active && !self.away;
+        if want != self.presence_sent {
+            self.presence_sent = want;
+            self.send(Command::SetActive { active: want, done: None });
+        }
+    }
+
+    pub fn commands(&self) -> flume::Sender<Command> {
+        self.backend.commands.clone()
     }
 
     pub fn set_typing_in(&self, chat_jid: &str, typing: bool) {

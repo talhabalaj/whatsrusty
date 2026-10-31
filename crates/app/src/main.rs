@@ -23,6 +23,7 @@ mod new_chat;
 mod mock;
 mod native_menu;
 mod pairing;
+mod power;
 mod profile;
 mod recorder;
 mod sidebar;
@@ -544,6 +545,7 @@ fn main() {
 
         let store = Store::create(backend.clone(), cx);
         dock::track(&store, cx);
+        power::track(&store, cx);
         // A notification: Reply sends what was typed, Mark as Read reads the chat, and
         // clicking it opens the conversation.
         let notified_store = store.clone();

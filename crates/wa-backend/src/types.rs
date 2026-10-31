@@ -446,8 +446,9 @@ pub enum Command {
     MarkRead { chat_jid: String },
     SetTyping { chat_jid: String, typing: bool },
     /// Whether the app is in front. WhatsApp keeps the phone's notifications quiet while
-    /// a linked device is online, so it's only online then, like WhatsApp Web.
-    SetActive { active: bool },
+    /// a linked device is online, so it's only online then, like WhatsApp Web. `done`
+    /// hears once WhatsApp has been told (or there's no connection to tell).
+    SetActive { active: bool, done: Option<flume::Sender<()>> },
     Logout,
     Shutdown,
     /// Delete a message. `for_everyone` revokes one of my own messages (WhatsApp allows
