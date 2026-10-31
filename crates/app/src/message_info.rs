@@ -13,7 +13,7 @@ use crate::state::Store;
 use crate::theme::Theme;
 
 /// What the message says, or what it is.
-fn preview(m: &ChatMessage) -> String {
+pub fn preview(m: &ChatMessage) -> String {
     if let Some(text) = crate::conversation::copy_text(m) {
         return text;
     }

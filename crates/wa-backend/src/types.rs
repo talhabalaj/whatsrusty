@@ -171,8 +171,20 @@ pub struct ContactCard {
 pub struct PollInfo {
     pub question: String,
     pub options: Vec<String>,
-    /// Multiple answers allowed. (Vote tallies are end-to-end encrypted; not shown yet.)
+    /// Multiple answers allowed.
     pub multiple: bool,
+    /// Everyone's current vote (one per voter; someone who took theirs back isn't here).
+    pub votes: Vec<PollVote>,
+}
+
+/// One person's current choice in a poll.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PollVote {
+    pub voter_jid: String,
+    pub name: String,
+    pub from_me: bool,
+    /// Indices into [`PollInfo::options`].
+    pub options: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,6 +238,8 @@ pub struct ChatMessage {
     pub deleted: bool,
     /// People @mentioned in the text / caption (`@<digits>` tokens), resolved to names.
     pub mentions: Vec<Mention>,
+    /// Starred (on any of my devices).
+    pub starred: bool,
 }
 
 /// An `@<digits>` token in a message's text and who it stands for.
@@ -320,6 +334,14 @@ pub struct MessageReceipt {
     pub played: Option<Timestamp>,
 }
 
+/// The gallery's lists besides photos and videos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FileKind {
+    Docs,
+    /// Messages with a link in their text or caption.
+    Links,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionState {
     /// Starting up / reconnecting.
@@ -365,6 +387,14 @@ pub enum Event {
     /// How far a media download has got, 0..1 (only when the file's size is known).
     /// The finished download arrives as a `MessageUpserted` with the path set.
     DownloadProgress { chat_jid: String, message_id: String, fraction: f32 },
+    /// My starred messages, across chats, the latest starred first. Answers
+    /// [`Command::ListStarred`], and is sent again whenever a star changes.
+    Starred { messages: Vec<ChatMessage> },
+    /// Answer to [`Command::SearchAll`]: messages in any chat with `query` in their text,
+    /// newest first.
+    SearchAllResults { query: String, messages: Vec<ChatMessage> },
+    /// Answer to [`Command::ListFiles`]: the chat's documents or links, newest first.
+    ChatFiles { chat_jid: String, kind: FileKind, items: Vec<ChatMessage> },
     /// Answer to [`Command::ListMedia`]: the chat's photos and videos, newest first.
     ChatMedia { chat_jid: String, items: Vec<ChatMessage> },
     /// Where each member of group `chat_jid` has read up to (all of them, by name). Sent
@@ -372,6 +402,9 @@ pub enum Event {
     GroupReads { chat_jid: String, reads: Vec<GroupRead> },
     /// Answer to [`Command::MessageInfo`]: who got and read my message, and when.
     MessageInfo { chat_jid: String, message_id: String, receipts: Vec<MessageReceipt> },
+    /// The chat's pinned messages, the latest pinned first (at most 3). Sent with a chat's
+    /// first page of messages and whenever a pin changes.
+    Pins { chat_jid: String, messages: Vec<ChatMessage> },
     /// New receipts arrived for these messages of mine (ask `MessageInfo` again for them).
     ReceiptsChanged { chat_jid: String, message_ids: Vec<String> },
     /// Someone is typing in `chat_jid`.
@@ -439,6 +472,22 @@ pub enum Command {
     /// The chat's photos and videos for the info panel (at most `limit`, newest first);
     /// answered by `ChatMedia`.
     ListMedia { chat_jid: String, limit: u32 },
+    /// Pin a message for everyone in the chat for `duration_secs` (WhatsApp offers 24
+    /// hours, 7 days and 30 days), or unpin it (`None`). Answered by `Pins`.
+    PinMessage { chat_jid: String, message_id: String, duration_secs: Option<u32> },
+    /// The chat's documents or links for the gallery (at most `limit`, newest first);
+    /// answered by `ChatFiles`.
+    ListFiles { chat_jid: String, kind: FileKind, limit: u32 },
+    /// Star or unstar a message (synced to my other devices). Answered by `MessageUpserted`
+    /// and `Starred`.
+    StarMessage { chat_jid: String, message_id: String, starred: bool },
+    /// My starred messages; answered by `Starred`.
+    ListStarred,
+    /// Messages in any chat with `query` in their text; answered by `SearchAllResults`.
+    SearchAll { query: String },
+    /// Vote in a poll: `options` are the chosen option names (none: take my vote back).
+    /// Shown at once (`MessageUpserted`), then sent.
+    VotePoll { chat_jid: String, message_id: String, options: Vec<String> },
     /// Who got and read my message, and when; answered by `MessageInfo`.
     MessageInfo { chat_jid: String, message_id: String },
     /// Fetch (or refresh, if stale) a profile picture; answered by `AvatarUpdated`.

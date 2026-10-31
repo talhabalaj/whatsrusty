@@ -196,6 +196,78 @@ pub fn classify(msg: &wa::Message) -> Extracted {
     }
 }
 
+/// The secret a poll's votes are encrypted with (its `messageContextInfo.messageSecret`).
+pub fn poll_secret_of(msg: &wa::Message) -> Option<Vec<u8>> {
+    let base = unwrap_message(msg);
+    [base, msg]
+        .into_iter()
+        .find_map(|m| m.message_context_info.as_option().and_then(|c| c.message_secret.clone()))
+        .filter(|s| !s.is_empty())
+}
+
+/// An encrypted vote in an earlier poll of the same chat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncPollVote {
+    pub poll_id: String,
+    pub enc_payload: Vec<u8>,
+    pub enc_iv: Vec<u8>,
+    pub sender_ts_ms: Option<i64>,
+}
+
+/// The vote `msg` carries, if it's one (`pollUpdateMessage`).
+pub fn poll_vote_of(msg: &wa::Message) -> Option<EncPollVote> {
+    let u = unwrap_message(msg).poll_update_message.as_option()?;
+    let poll_id = u.poll_creation_message_key.as_option().and_then(|k| k.id.clone()).filter(|id| !id.is_empty())?;
+    let vote = u.vote.as_option()?;
+    Some(EncPollVote {
+        poll_id,
+        enc_payload: vote.enc_payload.clone()?,
+        enc_iv: vote.enc_iv.clone()?,
+        sender_ts_ms: u.sender_timestamp_ms.filter(|t| *t > 0),
+    })
+}
+
+/// The option names among `options` whose SHA-256 is in `hashes` (how votes name them).
+pub fn poll_options_by_hash(options: &[String], hashes: &[Vec<u8>]) -> Vec<String> {
+    use whatsapp_rust::wacore::poll::compute_option_hash;
+    options.iter().filter(|o| hashes.iter().any(|h| h.as_slice() == compute_option_hash(o))).cloned().collect()
+}
+
+/// A pin or unpin of an earlier message of the same chat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinChange {
+    pub target_id: String,
+    /// How long it stays pinned (`None`: an unpin).
+    pub duration_secs: Option<u32>,
+    /// When the sender pinned it, by their clock.
+    pub sender_ts_ms: Option<i64>,
+}
+
+/// How long a pin lasts when the message doesn't say (WhatsApp's default, 7 days).
+pub const DEFAULT_PIN_SECS: u32 = 7 * 86_400;
+
+/// The pin or unpin `msg` carries, if it is one (`pinInChatMessage`; the duration is in its
+/// `messageContextInfo`).
+pub fn pin_of(msg: &wa::Message) -> Option<PinChange> {
+    use wa::message::pin_in_chat_message::Type as PinType;
+    let base = unwrap_message(msg);
+    let p = base.pin_in_chat_message.as_option()?;
+    let target_id = p.key.as_option().and_then(|k| k.id.clone()).filter(|id| !id.is_empty())?;
+    let duration = || {
+        [base, msg]
+            .into_iter()
+            .find_map(|m| m.message_context_info.as_option().and_then(|c| c.message_add_on_duration_in_secs))
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_PIN_SECS)
+    };
+    let duration_secs = match p.r#type {
+        Some(PinType::PIN_FOR_ALL) => Some(duration()),
+        Some(PinType::UNPIN_FOR_ALL) => None,
+        _ => return None,
+    };
+    Some(PinChange { target_id, duration_secs, sender_ts_ms: p.sender_timestamp_ms.filter(|t| *t > 0) })
+}
+
 /// Displayable body of a message, or `None` for messages that carry nothing to show
 /// (reactions, poll votes, key distribution, album headers, ...).
 pub fn body_of(msg: &wa::Message) -> Option<MessageBody> {
@@ -380,6 +452,7 @@ fn poll_of(m: &wa::Message) -> Option<PollInfo> {
         options: poll.options.iter().filter_map(|o| nonempty(&o.option_name)).collect(),
         // WhatsApp sends 1 for single choice and 0 for "any number" (see Baileys).
         multiple: poll.selectable_options_count.unwrap_or(0) != 1,
+        votes: Vec::new(),
     })
 }
 
@@ -1531,6 +1604,7 @@ mod tests {
                 question: "Lunch?".into(),
                 options: vec!["Pizza".into(), "Sushi".into()],
                 multiple,
+                votes: Vec::new(),
             }))
         };
         let v1 = wa::Message { poll_creation_message: MessageField::some(poll(Some(0))), ..Default::default() };
@@ -1794,6 +1868,31 @@ mod tests {
         };
         assert_eq!(system(&pin(PinType::PIN_FOR_ALL)), "📌 Pinned a message");
         assert_eq!(classify(&pin(PinType::UNPIN_FOR_ALL)), Extracted::Skip);
+        // No target: not a pin we can apply.
+        assert_eq!(pin_of(&pin(PinType::PIN_FOR_ALL)), None);
+    }
+
+    #[test]
+    fn pins_name_their_message_and_duration() {
+        use wa::message::pin_in_chat_message::Type as PinType;
+        let pin = |t, secs: Option<u32>| wa::Message {
+            pin_in_chat_message: MessageField::some(wa::message::PinInChatMessage {
+                key: MessageField::some(wa::MessageKey { id: Some("P1".into()), ..Default::default() }),
+                r#type: Some(t),
+                sender_timestamp_ms: Some(1_700_000_000_000),
+            }),
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_add_on_duration_in_secs: secs,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let change = |duration_secs| {
+            Some(PinChange { target_id: "P1".into(), duration_secs, sender_ts_ms: Some(1_700_000_000_000) })
+        };
+        assert_eq!(pin_of(&pin(PinType::PIN_FOR_ALL, Some(86_400))), change(Some(86_400)));
+        assert_eq!(pin_of(&pin(PinType::PIN_FOR_ALL, None)), change(Some(DEFAULT_PIN_SECS)));
+        assert_eq!(pin_of(&pin(PinType::UNPIN_FOR_ALL, Some(0))), change(None));
     }
 
     #[test]

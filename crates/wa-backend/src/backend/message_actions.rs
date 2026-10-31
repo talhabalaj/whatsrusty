@@ -352,6 +352,241 @@ impl Session {
     }
 }
 
+/// Tell the UI the chat's pinned messages as they are now.
+pub(super) fn emit_pins(shared: &Arc<Shared>, chat_jid: &str) {
+    let found = shared.store(|s| Ok((s.canonical(chat_jid)?, s.pinned_messages(chat_jid, now_secs())?)));
+    if let Some((chat_jid, messages)) = found {
+        shared.emit(Event::Pins { chat_jid, messages });
+    }
+}
+
+/// `Command::PinMessage`: show the pin (or unpin) right away, then send it; a failed send
+/// puts the previous state back.
+pub(super) fn pin_message(
+    shared: &Arc<Shared>,
+    session: Option<&Arc<Session>>,
+    chat_jid: &str,
+    id: &str,
+    duration_secs: Option<u32>,
+) {
+    let what = if duration_secs.is_some() { "pin" } else { "unpin" };
+    let Some(session) = session else {
+        shared.emit(Event::Error(format!("Couldn't {what} the message: not connected.")));
+        return;
+    };
+    let Some(Some(raw)) = shared.store(|s| s.raw_message(chat_jid, id)) else { return };
+    if raw.revoked {
+        return;
+    }
+    let now = now_secs();
+    let Some(previous) = shared.store(|s| {
+        let previous = s.pin_state(&raw.chat_jid, &raw.id)?;
+        s.set_pin(&raw.chat_jid, &raw.id, duration_secs.map(|d| now + i64::from(d)), now)?;
+        Ok(previous)
+    }) else {
+        return;
+    };
+    emit_pins(shared, &raw.chat_jid);
+    let task_session = session.clone();
+    session.track(tokio::spawn(async move {
+        let shared = task_session.shared.clone();
+        if let Err(e) = task_session.send_pin(&raw, duration_secs).await {
+            log::warn!("{what} of {}: {e:#}", raw.id);
+            shared.store(|s| s.restore_pin(&raw.chat_jid, &raw.id, previous));
+            emit_pins(&shared, &raw.chat_jid);
+            shared.emit(Event::Error(format!("Couldn't {what} the message: {e:#}")));
+        }
+    }));
+}
+
+impl Session {
+    async fn send_pin(&self, raw: &RawMessage, duration_secs: Option<u32>) -> Result<()> {
+        use whatsapp_rust::PinDuration;
+        let chat = parse_jid(&raw.wire_chat).with_context(|| format!("invalid chat JID {}", raw.wire_chat))?;
+        let key = self.complete_key(&chat, reaction_key(raw)).await?;
+        let duration = match duration_secs {
+            Some(d) if d <= 86_400 => Some(PinDuration::Hours24),
+            Some(d) if d <= 7 * 86_400 => Some(PinDuration::Days7),
+            Some(_) => Some(PinDuration::Days30),
+            None => None,
+        };
+        let send = async {
+            match duration {
+                Some(d) => self.client.pin_message(chat, key, d).await,
+                None => self.client.unpin_message(chat, key).await,
+            }
+        };
+        match tokio::time::timeout(SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("{e}")),
+            Err(_) => bail!("timed out"),
+        }
+    }
+}
+
+/// `Command::VotePoll`: show my vote right away, then send it; a failed send puts my
+/// previous vote back.
+pub(super) fn vote_poll(shared: &Arc<Shared>, session: Option<&Arc<Session>>, chat_jid: &str, id: &str, options: Vec<String>) {
+    let Some(session) = session else {
+        shared.emit(Event::Error("Couldn't vote: not connected.".to_owned()));
+        return;
+    };
+    let Some(Some((raw, secret))) = shared.store(|s| {
+        let Some(raw) = s.raw_message(chat_jid, id)? else { return Ok(None) };
+        Ok(s.poll_secret(&raw.chat_jid, &raw.id)?.map(|secret| (raw, secret)))
+    }) else {
+        shared.emit(Event::Error("Couldn't vote: this poll's key isn't on this Mac. Vote on your phone.".to_owned()));
+        return;
+    };
+    let MessageBody::Poll(poll) = &raw.body else { return };
+    if raw.revoked {
+        return;
+    }
+    let options: Vec<String> = poll.options.iter().filter(|o| options.contains(o)).cloned().collect();
+    let Some(me) = shared.own().pn.clone().or_else(|| shared.own().lid.clone()) else { return };
+    let Some(previous) = shared.store(|s| {
+        let previous = s.my_poll_vote(&raw.chat_jid, &raw.id)?;
+        s.record_poll_vote(&raw.chat_jid, &raw.id, &me, true, &options, now_ms())?;
+        Ok(previous)
+    }) else {
+        return;
+    };
+    shared.emit_message(&raw.chat_jid, &raw.id);
+    let task_session = session.clone();
+    session.track(tokio::spawn(async move {
+        let shared = task_session.shared.clone();
+        if let Err(e) = task_session.send_poll_vote(&raw, &secret, &options).await {
+            log::warn!("vote in {}: {e:#}", raw.id);
+            let previous = previous.map(|(_, options, ts)| (options, ts));
+            shared.store(|s| s.restore_my_poll_vote(&raw.chat_jid, &raw.id, &me, previous));
+            shared.emit_message(&raw.chat_jid, &raw.id);
+            shared.emit(Event::Error(format!("Couldn't vote: {e:#}")));
+        }
+    }));
+}
+
+impl Session {
+    /// Who created poll `raw`, as its votes are keyed: the author as they appeared on
+    /// the wire (my JID under the group's addressing mode for my own polls).
+    async fn poll_creator(&self, raw: &RawMessage) -> Result<Jid> {
+        let chat = parse_jid(&raw.wire_chat).with_context(|| format!("invalid chat JID {}", raw.wire_chat))?;
+        if is_group_jid(&raw.chat_jid) {
+            let key = self.complete_key(&chat, reaction_key(raw)).await?;
+            return key.participant.as_deref().and_then(parse_jid).context("poll author unknown");
+        }
+        if raw.from_me {
+            return self.client.pn().map(|j| j.to_non_ad()).context("not logged in");
+        }
+        Ok(chat.to_non_ad())
+    }
+
+    async fn send_poll_vote(&self, raw: &RawMessage, secret: &[u8], options: &[String]) -> Result<()> {
+        let chat = parse_jid(&raw.wire_chat).with_context(|| format!("invalid chat JID {}", raw.wire_chat))?;
+        let creator = self.poll_creator(raw).await?;
+        let polls = self.client.polls();
+        let send = polls.vote(chat, &raw.id, &creator, secret, options);
+        match tokio::time::timeout(SEND_TIMEOUT, send).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("{e}")),
+            Err(_) => bail!("timed out"),
+        }
+    }
+
+    /// Someone's vote (`voter`; me on another device when `from_me`) in a poll of `chat`:
+    /// decrypt it with the poll's secret and count it.
+    pub(super) async fn receive_poll_vote(
+        &self,
+        chat: &str,
+        voter: &Jid,
+        from_me: bool,
+        vote: &crate::extract::EncPollVote,
+        ts_ms: i64,
+    ) -> Result<()> {
+        let found = self.shared.store(|s| {
+            let Some(raw) = s.raw_message(chat, &vote.poll_id)? else { return Ok(None) };
+            Ok(s.poll_secret(&raw.chat_jid, &raw.id)?.map(|secret| (raw, secret)))
+        });
+        let (raw, secret) = found.flatten().context("poll or its key not stored")?;
+        let MessageBody::Poll(poll) = &raw.body else { bail!("not a poll") };
+        let creator = self.poll_creator(&raw).await?;
+        let ciphertext =
+            whatsapp_rust::wacore::poll::PollVoteCiphertext { enc_payload: &vote.enc_payload, enc_iv: &vote.enc_iv };
+        let hashes = self
+            .client
+            .polls()
+            .decrypt_vote(ciphertext, &secret, &raw.id, &creator, voter)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        let options = poll_options_by_hash(&poll.options, &hashes);
+        let voter = voter.to_non_ad_string();
+        if self.shared.store(|s| s.record_poll_vote(&raw.chat_jid, &raw.id, &voter, from_me, &options, ts_ms)) == Some(true) {
+            self.shared.emit_message(&raw.chat_jid, &raw.id);
+        }
+        Ok(())
+    }
+}
+
+/// Starred messages the UI is told about at most.
+const STARRED_LIMIT: u32 = 500;
+
+/// Tell the UI my starred messages as they are now.
+pub(super) fn emit_starred(shared: &Arc<Shared>) {
+    if let Some(messages) = shared.store(|s| s.starred_messages(STARRED_LIMIT)) {
+        shared.emit(Event::Starred { messages });
+    }
+}
+
+/// `Command::StarMessage`: show it right away, then sync it to my other devices; a
+/// failed sync puts it back.
+pub(super) fn star_message(shared: &Arc<Shared>, session: Option<&Arc<Session>>, chat_jid: &str, id: &str, starred: bool) {
+    let what = if starred { "star" } else { "unstar" };
+    let Some(session) = session else {
+        shared.emit(Event::Error(format!("Couldn't {what} the message: not connected.")));
+        return;
+    };
+    let Some(Some(raw)) = shared.store(|s| s.raw_message(chat_jid, id)) else { return };
+    let now = now_secs();
+    if shared.store(|s| s.set_star(&raw.chat_jid, &raw.id, starred, now)) != Some(true) {
+        return;
+    }
+    shared.emit_message(&raw.chat_jid, &raw.id);
+    emit_starred(shared);
+    let task_session = session.clone();
+    session.track(tokio::spawn(async move {
+        let shared = task_session.shared.clone();
+        if let Err(e) = task_session.sync_star(&raw, starred).await {
+            log::warn!("{what} of {}: {e:#}", raw.id);
+            shared.store(|s| s.set_star(&raw.chat_jid, &raw.id, !starred, now));
+            shared.emit_message(&raw.chat_jid, &raw.id);
+            emit_starred(&shared);
+            shared.emit(Event::Error(format!("Couldn't {what} the message: {e:#}")));
+        }
+    }));
+}
+
+impl Session {
+    /// Sync a star to my other devices (app state `star`).
+    async fn sync_star(&self, raw: &RawMessage, starred: bool) -> Result<()> {
+        let chat = parse_jid(&raw.wire_chat).with_context(|| format!("invalid chat JID {}", raw.wire_chat))?;
+        let participant = (is_group_jid(&raw.chat_jid) && !raw.from_me)
+            .then(|| raw.wire_sender.as_deref().map(non_ad).and_then(|w| parse_jid(&w)))
+            .flatten();
+        let actions = self.client.chat_actions();
+        let sync = async {
+            if starred {
+                actions.star_message(&chat, participant.as_ref(), &raw.id, raw.from_me).await
+            } else {
+                actions.unstar_message(&chat, participant.as_ref(), &raw.id, raw.from_me).await
+            }
+        };
+        match tokio::time::timeout(SEND_TIMEOUT, sync).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("{e}")),
+            Err(_) => bail!("timed out"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -170,7 +170,21 @@ pub fn panel(jid: &str, store: &Entity<Store>, glass_on: bool, theme: &Theme, cx
                         .items_center()
                         .gap(px(6.))
                         .pb(px(4.))
-                        .child(avatar(&name, photo, 96., theme))
+                        .child({
+                            // The full-size photo opens full-window.
+                            let full = profile.and_then(|p| p.photo.clone());
+                            let (photo_store, photo_name) = (store.clone(), name.clone());
+                            div()
+                                .id("profile-photo")
+                                .rounded_full()
+                                .when(full.is_some(), |d| d.cursor_pointer())
+                                .child(avatar(&name, photo, 96., theme))
+                                .on_click(move |_, _, cx| {
+                                    if let Some(path) = full.clone() {
+                                        photo_store.update(cx, |s, cx| s.open_profile_photo(path, photo_name.clone(), cx));
+                                    }
+                                })
+                        })
                         .child(
                             div()
                                 .pt(px(6.))
@@ -203,8 +217,36 @@ pub fn panel(jid: &str, store: &Entity<Store>, glass_on: bool, theme: &Theme, cx
                         d.child(section("Description", div().text_size(px(13.)).text_color(theme.text).child(desc), theme))
                     })
                 })
-                .when_some(s.chat_media(jid).filter(|t| !t.is_empty()), |d, tiles| {
-                    d.child(section("Photos & Videos", media_grid(tiles, store, theme, cx), theme))
+                .child({
+                    let (gallery_store, gallery_jid) = (store.clone(), jid.to_string());
+                    let tiles = s.chat_media(jid).filter(|t| !t.is_empty());
+                    section(
+                        "Media, Docs and Links",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .when_some(tiles, |d, tiles| d.child(media_grid(&tiles[..tiles.len().min(9)], store, theme, cx)))
+                            .child(
+                                div()
+                                    .id("profile-see-all")
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .py(px(2.))
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .text_color(theme.accent)
+                                    .child("See All")
+                                    .child(glyph(Glyph::ChevronRight, 11., theme.text_secondary))
+                                    .on_click(move |_, _, cx| {
+                                        gallery_store.update(cx, |s, cx| {
+                                            s.open_gallery(gallery_jid.clone(), crate::state::GalleryTab::Media, cx)
+                                        })
+                                    }),
+                            ),
+                        theme,
+                    )
                 })
                 .when(is_group, |d| {
                     d

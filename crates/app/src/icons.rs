@@ -29,6 +29,17 @@ const FILM: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24
 const POP_OUT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10.5 4.5 H7 A3 3 0 0 0 4 7.5 V17 A3 3 0 0 0 7 20 H16.5 A3 3 0 0 0 19.5 17 V13.5" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round"/><path d="M14 4 H20 V10 M19.6 4.4 L11.5 12.5" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 const EXPAND: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14 4.5 H19.5 V10 M19.2 4.8 L13.5 10.5 M10 19.5 H4.5 V14 M4.8 19.2 L10.5 13.5" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
 
+const PIN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 3.8 H15 M10.2 3.8 V9.2 L6.8 13.6 H17.2 L13.8 9.2 V3.8 M12 13.6 V20.4" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const GRID: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.6" fill="none" stroke="black" stroke-width="1.9"/><rect x="13" y="4" width="7" height="7" rx="1.6" fill="none" stroke="black" stroke-width="1.9"/><rect x="4" y="13" width="7" height="7" rx="1.6" fill="none" stroke="black" stroke-width="1.9"/><rect x="13" y="13" width="7" height="7" rx="1.6" fill="none" stroke="black" stroke-width="1.9"/></svg>"#;
+const DOCUMENT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13.5 3.5 H7.5 A2 2 0 0 0 5.5 5.5 V18.5 A2 2 0 0 0 7.5 20.5 H16.5 A2 2 0 0 0 18.5 18.5 V8.5 Z M13.5 3.5 V8.5 H18.5 M8.8 13 H15.2 M8.8 16.5 H13" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+const LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10.2 13.8 A4 4 0 0 0 15.9 13.8 L18.7 11 A4 4 0 0 0 13 5.3 L11.6 6.7 M13.8 10.2 A4 4 0 0 0 8.1 10.2 L5.3 13 A4 4 0 0 0 11 18.7 L12.4 17.3" fill="none" stroke="black" stroke-width="2" stroke-linecap="round"/></svg>"#;
+const MORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="1.9" fill="black"/><circle cx="12" cy="12" r="1.9" fill="black"/><circle cx="18.5" cy="12" r="1.9" fill="black"/></svg>"#;
+const DOWNLOAD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 4 V15 M7 10.5 L12 15.5 L17 10.5 M5 19.5 H19" fill="none" stroke="black" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+const CHECK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M5 12.5 L10 17.5 L19 7" fill="none" stroke="black" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>"#;
+
+const STAR: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 3.6 L14.5 9 L20.3 9.6 L15.9 13.5 L17.2 19.3 L12 16.3 L6.8 19.3 L8.1 13.5 L3.7 9.6 L9.5 9 Z" fill="none" stroke="black" stroke-width="1.8" stroke-linejoin="round"/></svg>"#;
+
 #[derive(Clone, Copy)]
 pub enum Glyph {
     ArrowUp,
@@ -54,6 +65,14 @@ pub enum Glyph {
     Film,
     PopOut,
     Expand,
+    Pin,
+    Grid,
+    Document,
+    Link,
+    More,
+    Download,
+    Check,
+    Star,
 }
 
 pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
@@ -81,6 +100,14 @@ pub fn glyph(g: Glyph, size: f32, color: Hsla) -> Icon {
         Glyph::Film => FILM,
         Glyph::PopOut => POP_OUT,
         Glyph::Expand => EXPAND,
+        Glyph::Pin => PIN,
+        Glyph::Grid => GRID,
+        Glyph::Document => DOCUMENT,
+        Glyph::Link => LINK,
+        Glyph::More => MORE,
+        Glyph::Download => DOWNLOAD,
+        Glyph::Check => CHECK,
+        Glyph::Star => STAR,
     };
     Icon::default().data(svg.as_bytes()).size(px(size)).text_color(color)
 }

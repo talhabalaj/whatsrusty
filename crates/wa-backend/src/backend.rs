@@ -26,7 +26,7 @@ use whatsapp_rust::{ErrorChainExt as _, Jid, SendOptions, UploadOptions};
 
 use crate::extract::{
     DELETED_LABEL, Extracted, MediaKind, QuotedRef, StoredMedia, classify, document_name, expiration_of, fallback_name,
-    hd_parent_of, is_forwarded, is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
+    hd_parent_of, is_forwarded, pin_of, poll_options_by_hash, poll_secret_of, poll_vote_of, is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
 };
 use crate::media::{
     TempFile, avatar_file, create_private_dir_all, create_private_file, documents_dir, ext_for_mime, media_file,
@@ -34,7 +34,9 @@ use crate::media::{
     temp_path, write_atomic,
 };
 use crate::media_retry;
-use message_actions::{ForwardJob, delete_message, deleted_elsewhere, forward_message};
+use message_actions::{
+    ForwardJob, delete_message, deleted_elsewhere, emit_pins, emit_starred, forward_message, pin_message, star_message, vote_poll,
+};
 use crate::profile;
 use crate::stickers::{self, Candidate, FetchError};
 use crate::store::{ChatMeta, LocalProfile, NewMessage, NewQuote, NewReaction, OldestRef, OwnReaction, RawMessage, Store};
@@ -1245,6 +1247,14 @@ impl Session {
                 shared.mark_chats_dirty();
             }
             E::DeleteMessageForMeUpdate(d) => deleted_elsewhere(shared, d),
+            E::StarUpdate(u) => {
+                let chat = u.chat_jid.to_non_ad_string();
+                let starred = u.action.starred == Some(true);
+                if shared.store(|s| s.set_star(&chat, &u.message_id, starred, u.timestamp.timestamp())) == Some(true) {
+                    shared.emit_message(&chat, &u.message_id);
+                    emit_starred(shared);
+                }
+            }
             E::PinUpdate(p) => {
                 let pinned_at = if p.action.pinned == Some(true) { p.timestamp.timestamp().max(1) } else { 0 };
                 shared.store(|s| s.set_pinned(&p.jid.to_non_ad_string(), pinned_at));
@@ -1333,6 +1343,21 @@ impl Session {
 
         let mut notify = None;
         let timestamp = info.timestamp.timestamp();
+        if let Some(vote) = poll_vote_of(&m.message) {
+            let voter = src.sender.to_non_ad();
+            let ts_ms = vote.sender_ts_ms.unwrap_or(timestamp * 1000);
+            if let Err(e) = self.receive_poll_vote(&chat, &voter, src.is_from_me, &vote, ts_ms).await {
+                log::info!("poll vote on {} not counted: {e:#}", vote.poll_id);
+            }
+            return;
+        }
+        if let Some(pin) = pin_of(&m.message) {
+            let at = pin.sender_ts_ms.map_or(timestamp, |t| t / 1000);
+            let until = pin.duration_secs.map(|d| at + i64::from(d));
+            if shared.store(|s| s.set_pin(&chat, &pin.target_id, until, at)) == Some(true) {
+                emit_pins(shared, &chat);
+            }
+        }
         let updated = match classify(&m.message) {
             Extracted::Body(body) => {
                 let expires_at = expiration_of(&m.message).map(|e| timestamp + i64::from(e));
@@ -1356,8 +1381,12 @@ impl Session {
                     expires_at,
                 };
                 let forwarded = is_forwarded(&m.message);
+                let poll_secret = matches!(msg.body, MessageBody::Poll(_)).then(|| poll_secret_of(&m.message)).flatten();
                 shared.store(|s| {
                     let inserted = s.insert_message(&msg, true)?;
+                    if let Some(secret) = &poll_secret {
+                        s.set_poll_secret(&msg.chat_jid, &msg.id, secret)?;
+                    }
                     if inserted && forwarded {
                         s.set_forwarded(&msg.chat_jid, &msg.id)?;
                     }
@@ -1608,9 +1637,24 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
                 }
                 continue;
             };
+            if let Some(pin) = pin_of(msg) {
+                let at = pin.sender_ts_ms.map_or(ts, |t| t / 1000);
+                s.set_pin(&chat, &pin.target_id, pin.duration_secs.map(|d| at + i64::from(d)), at)?;
+            }
             match classify(msg) {
                 Extracted::Body(body) => {
                     let id = &hd_parent_of(msg).unwrap_or_else(|| id.clone());
+                    // A poll: its secret, and the votes it had when the history was made.
+                    if let MessageBody::Poll(poll) = &body {
+                        if let Some(secret) = poll_secret_of(msg).or_else(|| wmi.message_secret.clone()) {
+                            s.set_poll_secret(&chat, id, &secret)?;
+                        }
+                        for u in &wmi.poll_updates {
+                            if let Some((voter, from_me, options, ts_ms)) = history_poll_vote(u, &chat, &poll.options, own_jid) {
+                                s.record_poll_vote(&chat, id, &voter, from_me, &options, ts_ms)?;
+                            }
+                        }
+                    }
                     let expires_at = history_expiry(wmi, msg, ts);
                     if expires_at.is_some_and(|t| t <= now) {
                         continue;
@@ -1669,6 +1713,27 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
 
 /// A `WebMessageInfo.reactions` entry on message `target_id`. Its key is the reaction's
 /// own: `fromMe` = mine, `participant` = who reacted in a group (1:1: the other person).
+/// A `WebMessageInfo.pollUpdates` entry (already decrypted): who voted, whether it's me,
+/// the options they chose, and when.
+fn history_poll_vote(
+    u: &wa::PollUpdate,
+    chat: &str,
+    options: &[String],
+    own_jid: Option<&str>,
+) -> Option<(String, bool, Vec<String>, i64)> {
+    let key = u.poll_update_message_key.as_option()?;
+    let from_me = key.from_me == Some(true);
+    let voter = if from_me {
+        own_jid?.to_owned()
+    } else if is_group_jid(chat) {
+        non_ad(key.participant.as_deref().filter(|p| !p.is_empty())?)
+    } else {
+        chat.to_owned()
+    };
+    let chosen = poll_options_by_hash(options, &u.vote.as_option()?.selected_options);
+    Some((voter, from_me, chosen, u.sender_timestamp_ms.unwrap_or(0)))
+}
+
 fn history_reaction(r: &wa::Reaction, chat: &str, target_id: &str, own_jid: Option<&str>) -> Option<NewReaction> {
     let key = r.key.as_option()?;
     let from_me = key.from_me == Some(true);
@@ -1715,6 +1780,9 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 if is_group_jid(&chat_jid) && before.is_none() {
                     emit_group_reads(shared, &chat_jid);
                 }
+                if before.is_none() {
+                    emit_pins(shared, &chat_jid);
+                }
                 // Scrolling up past what's stored locally: ask the phone for older messages.
                 if before.is_some() && reached_start && !exhausted && let Some(session) = session {
                     request_older_history(shared, session, &chat_jid);
@@ -1757,6 +1825,11 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
         Command::MessageInfo { chat_jid, message_id } => {
             if let Some(receipts) = shared.store(|s| s.receipts(&chat_jid, &message_id)) {
                 shared.emit(Event::MessageInfo { chat_jid, message_id, receipts });
+            }
+        }
+        Command::ListFiles { chat_jid, kind, limit } => {
+            if let Some(items) = shared.store(|s| s.load_files(&chat_jid, kind, limit)) {
+                shared.emit(Event::ChatFiles { chat_jid, kind, items });
             }
         }
         Command::ListMedia { chat_jid, limit } => {
@@ -1833,6 +1906,17 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
             send_sticker(shared, session, chat_jid, sticker_id, client_id, reply_to).await
         }
         Command::FetchProfile { jid } => fetch_profile(shared, session, jid),
+        Command::StarMessage { chat_jid, message_id, starred } => star_message(shared, session, &chat_jid, &message_id, starred),
+        Command::ListStarred => emit_starred(shared),
+        Command::SearchAll { query } => {
+            if let Some(messages) = shared.store(|s| s.search_all(&query)) {
+                shared.emit(Event::SearchAllResults { query, messages });
+            }
+        }
+        Command::VotePoll { chat_jid, message_id, options } => vote_poll(shared, session, &chat_jid, &message_id, options),
+        Command::PinMessage { chat_jid, message_id, duration_secs } => {
+            pin_message(shared, session, &chat_jid, &message_id, duration_secs)
+        }
         Command::DeleteMessage { chat_jid, message_id, for_everyone } => {
             delete_message(shared, session, &chat_jid, &message_id, for_everyone)
         }
@@ -2769,8 +2853,26 @@ impl Session {
 
     async fn send_job(&self, job: SendJob) -> Result<()> {
         match job {
-            SendJob::Text { chat_jid, id, text, reply_to, mentions, .. } => {
+            SendJob::Text { chat_jid, id, text, reply_to, mut mentions, .. } => {
                 let mut context = reply_to.as_deref().and_then(|r| reply_context(&self.shared, &chat_jid, r));
+                // `@all` in a group: flagged as a mention of everyone (WA's `nonJidMentions`),
+                // with every member listed too, so clients without it notify them as well.
+                if is_group_jid(&chat_jid) && crate::store::mentions_everyone(&text) {
+                    context.get_or_insert_with(Default::default).non_jid_mentions = Some(1);
+                    if let Some(group) = parse_jid(&chat_jid) {
+                        match self.client.groups().query_info(&group).await {
+                            Ok(info) => {
+                                let own = self.shared.own();
+                                for member in info.participants.iter().map(Jid::to_non_ad_string) {
+                                    if !own.is_me(&member) && !mentions.contains(&member) {
+                                        mentions.push(member);
+                                    }
+                                }
+                            }
+                            Err(e) => log::warn!("@all in {chat_jid}: members unknown ({e}); sending the flag only"),
+                        }
+                    }
+                }
                 if !mentions.is_empty() {
                     context.get_or_insert_with(Default::default).mentioned_jid = mentions;
                 }
@@ -2833,11 +2935,21 @@ impl Session {
     /// and `senderTimestampMs`; the library encrypts it for community announcement groups).
     async fn send_reaction(&self, r: &ReactJob) -> Result<()> {
         let chat = parse_jid(&r.wire_chat).with_context(|| format!("invalid chat JID {}", r.wire_chat))?;
-        let mut key = r.key.clone();
-        if key.participant.is_none() && is_group_jid(&r.wire_chat) {
+        let key = self.complete_key(&chat, r.key.clone()).await?;
+        let send = self.client.send_reaction(chat, key, &r.emoji);
+        match tokio::time::timeout(SEND_TIMEOUT, send).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("{e}")),
+            Err(_) => bail!("timed out"),
+        }
+    }
+
+    /// A key from [`reaction_key`], with my author JID filled in for my own group messages.
+    async fn complete_key(&self, chat: &Jid, mut key: wa::MessageKey) -> Result<wa::MessageKey> {
+        if key.participant.is_none() && is_group_jid(&chat.to_string()) {
             // My own group message: I'm its author under the group's addressing mode.
             use whatsapp_rust::wacore::types::message::AddressingMode;
-            let routing = self.client.groups().query_info(&chat).await.map_err(|e| anyhow!("{e}"))?;
+            let routing = self.client.groups().query_info(chat).await.map_err(|e| anyhow!("{e}"))?;
             let own = self.client.persistence_manager().get_device_snapshot();
             let me = match routing.addressing_mode {
                 AddressingMode::Lid => own.lid.as_ref().or(own.pn.as_ref()),
@@ -2845,12 +2957,7 @@ impl Session {
             };
             key.participant = Some(me.context("not logged in")?.to_non_ad_string());
         }
-        let send = self.client.send_reaction(chat, key, &r.emoji);
-        match tokio::time::timeout(SEND_TIMEOUT, send).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(anyhow!("{e}")),
-            Err(_) => bail!("timed out"),
-        }
+        Ok(key)
     }
 
     /// Send an edit (`protocolMessage` MESSAGE_EDIT with the original's key and the new

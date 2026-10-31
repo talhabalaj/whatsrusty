@@ -33,6 +33,12 @@ pub fn suggest(participants: &[Participant], query: &str, limit: usize) -> Vec<P
         .collect()
 }
 
+/// Whether the `@query` being typed could be "@all" (everyone in the group).
+pub fn suggests_everyone(query: &str) -> bool {
+    let q = query.to_lowercase();
+    "all".starts_with(&q) || (!q.is_empty() && "everyone".starts_with(&q))
+}
+
 /// Replace the trailing `@query` with `@Name `.
 pub fn apply(text: &str, name: &str) -> String {
     let base = match trailing_query(text) {
@@ -80,6 +86,18 @@ pub fn display(text: &str, mentions: &[Mention]) -> (String, Vec<Range<usize>>) 
         let digits = tail[1..].find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len() - 1);
         let token = &tail[1..1 + digits];
         let word_before = out.chars().next_back().is_some_and(char::is_alphanumeric);
+        // "@all", when the message mentions everyone.
+        let all = !word_before
+            && tail[1..].starts_with("all")
+            && !tail[4..].starts_with(|c: char| c.is_alphanumeric())
+            && mentions.iter().any(|m| m.user == "all");
+        if all {
+            let start = out.len();
+            out.push_str("@all");
+            ranges.push(start..out.len());
+            rest = &tail[4..];
+            continue;
+        }
         match mentions.iter().find(|m| m.user == token).filter(|_| !word_before && !token.is_empty()) {
             Some(m) => {
                 let start = out.len();
@@ -144,6 +162,13 @@ mod tests {
         let (shown, ranges) = display(&wire, &resolved);
         assert_eq!(shown, "@Sara Ali and @Sara, @Sara!");
         assert_eq!(ranges.iter().map(|r| &shown[r.clone()]).collect::<Vec<_>>(), ["@Sara Ali", "@Sara", "@Sara"]);
+        // "@all" when the message mentions everyone; not inside a word.
+        let all = [Mention { user: "all".into(), jid: "1@g.us".into(), name: "all".into() }];
+        let (shown, ranges) = display("@all come, @allison", &all);
+        assert_eq!(shown, "@all come, @allison");
+        assert_eq!(ranges.iter().map(|r| &shown[r.clone()]).collect::<Vec<_>>(), ["@all"]);
+        assert!(suggests_everyone("") && suggests_everyone("Al") && suggests_everyone("every"));
+        assert!(!suggests_everyone("sa"));
         // Unknown numbers and e-mail addresses stay as they are.
         assert_eq!(display("a@15551110012 @123", &resolved), ("a@15551110012 @123".to_string(), Vec::new()));
     }

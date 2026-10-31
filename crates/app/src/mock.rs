@@ -25,6 +25,8 @@ struct Fake {
     messages: Vec<ChatMessage>,
     /// Older messages of the long chat that only "the phone" has, newest last.
     phone_only: Vec<ChatMessage>,
+    /// Pinned message ids per chat, the latest pinned first.
+    pins: std::collections::HashMap<String, Vec<String>>,
 }
 
 const LONG_CHAT: &str = "15551110009@s.whatsapp.net";
@@ -73,7 +75,14 @@ fn msg(chat: &str, id: usize, from_me: bool, sender: Option<&str>, text: &str, t
         edited: false,
         forwarded: false,
         deleted: false,
-        mentions: mock_mentions(text),
+        mentions: {
+            let mut m = mock_mentions(text);
+            if chat.ends_with("@g.us") && text.contains("@all") {
+                m.push(Mention { user: "all".into(), jid: chat.into(), name: "all".into() });
+            }
+            m
+        },
+        starred: false,
     }
 }
 
@@ -104,6 +113,7 @@ fn seed() -> Fake {
             ("Don't forget sunscreen this time 😅", false, Some("Omar"), -d - 2 * h),
             ("That was ONE time", false, Some("Sara"), -d - 2 * h + 60),
             ("@15551110011 you're bringing the map, right? cc @15550000000", false, Some("Sara"), -d - 2 * h + 120),
+            ("@all start moved to 7 AM, see you there", false, Some("Omar"), -d - 2 * h + 180),
         ]),
         ("15551110003@s.whatsapp.net", "Bilal", false, false, &[
             ("Did you push the fix?", false, None, -2 * d),
@@ -253,6 +263,11 @@ fn seed() -> Fake {
         question: "Dinner on Friday?".into(),
         options: vec!["Pizza".into(), "BBQ".into(), "Chinese".into()],
         multiple: false,
+        votes: vec![
+            wa_backend::PollVote { voter_jid: "a@s.whatsapp.net".into(), name: "Ayesha".into(), from_me: false, options: vec![0] },
+            wa_backend::PollVote { voter_jid: "b@s.whatsapp.net".into(), name: "Bilal".into(), from_me: false, options: vec![1] },
+            wa_backend::PollVote { voter_jid: "c@s.whatsapp.net".into(), name: "Hamza".into(), from_me: false, options: vec![0] },
+        ],
     }));
     k(6, false, MessageBody::Video(VideoMedia {
         path: None,
@@ -396,7 +411,7 @@ fn seed() -> Fake {
         }
     }
     sort_chats(&mut chats);
-    Fake { chats, messages, phone_only }
+    Fake { chats, messages, phone_only, pins: Default::default() }
 }
 
 impl Fake {
@@ -730,6 +745,73 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                     }
                 };
                 let _ = ev.send(Event::MessageInfo { chat_jid, message_id, receipts });
+            }
+            Command::ListFiles { chat_jid, kind, limit } => {
+                let items = fake
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| m.chat_jid == chat_jid && !m.deleted)
+                    .filter(|m| match kind {
+                        wa_backend::FileKind::Docs => matches!(m.body, MessageBody::Document(_)),
+                        wa_backend::FileKind::Links => {
+                            matches!(&m.body, MessageBody::Text(t) if t.contains("http://") || t.contains("https://") || t.contains("www."))
+                        }
+                    })
+                    .take(limit as usize)
+                    .cloned()
+                    .collect();
+                let _ = ev.send(Event::ChatFiles { chat_jid, kind, items });
+            }
+            Command::StarMessage { chat_jid, message_id, starred } => {
+                if let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id) {
+                    m.starred = starred;
+                    let _ = ev.send(Event::MessageUpserted(m.clone()));
+                }
+                let messages = fake.messages.iter().rev().filter(|m| m.starred).cloned().collect();
+                let _ = ev.send(Event::Starred { messages });
+            }
+            Command::ListStarred => {
+                let messages = fake.messages.iter().rev().filter(|m| m.starred).cloned().collect();
+                let _ = ev.send(Event::Starred { messages });
+            }
+            Command::SearchAll { query } => {
+                let needle = query.to_lowercase();
+                let messages = fake
+                    .messages
+                    .iter()
+                    .rev()
+                    .filter(|m| !m.deleted && matches!(&m.body, MessageBody::Text(t) if t.to_lowercase().contains(&needle)))
+                    .take(100)
+                    .cloned()
+                    .collect();
+                let _ = ev.send(Event::SearchAllResults { query, messages });
+            }
+            Command::VotePoll { chat_jid, message_id, options } => {
+                if let Some(m) = fake.messages.iter_mut().find(|m| m.chat_jid == chat_jid && m.id == message_id)
+                    && let MessageBody::Poll(p) = &mut m.body
+                {
+                    p.votes.retain(|v| !v.from_me);
+                    let picked: Vec<usize> = p.options.iter().enumerate().filter(|(_, o)| options.contains(o)).map(|(i, _)| i).collect();
+                    if !picked.is_empty() {
+                        p.votes.push(wa_backend::PollVote { voter_jid: ME.into(), name: "You".into(), from_me: true, options: picked });
+                    }
+                    let _ = ev.send(Event::MessageUpserted(m.clone()));
+                }
+            }
+            Command::PinMessage { chat_jid, message_id, duration_secs } => {
+                eprintln!("mock: pin {message_id} {duration_secs:?}");
+                let pins = fake.pins.entry(chat_jid.clone()).or_default();
+                pins.retain(|id| *id != message_id);
+                if duration_secs.is_some() {
+                    pins.insert(0, message_id);
+                    pins.truncate(3);
+                }
+                let messages = pins
+                    .iter()
+                    .filter_map(|id| fake.messages.iter().find(|m| m.chat_jid == chat_jid && m.id == *id).cloned())
+                    .collect();
+                let _ = ev.send(Event::Pins { chat_jid, messages });
             }
             Command::ListMedia { chat_jid, limit } => {
                 let items = fake

@@ -21,7 +21,7 @@ use crate::forward_picker::{ForwardEvent, ForwardPicker};
 use crate::format::{short_time, transcript_time};
 use crate::chrome::{frosted, surface};
 use crate::icons::{Glyph, glyph};
-use crate::state::{Change, Store, StoreEvent};
+use crate::state::{Change, MessageAction, Store, StoreEvent};
 use crate::theme::Theme;
 
 /// Messages within this window from the same sender share a bubble group.
@@ -37,6 +37,8 @@ pub const MINI_HEADER_HEIGHT: f32 = 40.;
 /// Gap between the last message and the floating composer's field, beyond the
 /// composer's 10pt top padding.
 const COMPOSER_GAP: f32 = 6.;
+/// The pinned-message bar under the header.
+const PIN_BAR_HEIGHT: f32 = 44.;
 const IMAGE_MAX_W: f32 = 260.;
 /// Narrower than this, the info panel covers the conversation rather than sitting beside it.
 const MIN_CHAT_WIDTH: f32 = 380.;
@@ -131,6 +133,8 @@ pub struct Conversation {
     /// Message flashing after a jump (id, animation generation).
     highlight: Option<(String, usize)>,
     highlight_gen: usize,
+    /// Which of the chat's pins the pinned bar shows (clicking it moves on to the next).
+    pin_ix: usize,
     /// Scrolled up from the end (kept by the list's scroll handler).
     away: Rc<Cell<bool>>,
     /// Messages that arrived while scrolled up (the scroll-to-bottom badge).
@@ -173,7 +177,7 @@ impl Conversation {
             // The composer grew or shrank: the transcript's bottom inset follows.
             cx.subscribe(&composer, |_, _, _: &ComposerResized, cx| cx.notify()),
             cx.observe(&store, |this, _, cx| this.sync_header(cx)),
-            cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| match ev {
+            cx.subscribe_in(&store, window, |this, _, ev: &StoreEvent, window, cx| match ev {
                 StoreEvent::TranscriptChanged { chat_jid, change } => {
                     if this.binding.chat(this.store.read(cx)).as_deref() == Some(chat_jid.as_str()) {
                         this.rebuild(*change, cx);
@@ -197,6 +201,10 @@ impl Conversation {
                 }
                 // The composer follows drafts itself (its resizes arrive as ComposerResized).
                 StoreEvent::DraftChanged { .. } => {}
+                StoreEvent::MessageAction { action, mini } if mini.as_deref() == this.binding.fixed() => {
+                    this.do_action((**action).clone(), window, cx)
+                }
+                StoreEvent::MessageAction { .. } => {}
             }),
         ];
         let list = ListState::new(0, ListAlignment::Bottom, px(800.));
@@ -227,6 +235,7 @@ impl Conversation {
             pending_jump: None,
             highlight: None,
             highlight_gen: 0,
+            pin_ix: 0,
             away,
             unseen: 0,
             reported_away: false,
@@ -289,6 +298,7 @@ impl Conversation {
             self.highlight = None;
             self.picker_for = None;
             self.find = None;
+            self.pin_ix = 0;
         }
         for m in &self.messages {
             let thumb = match &m.body {
@@ -446,6 +456,140 @@ impl Conversation {
                 });
             }
         });
+    }
+
+    /// The bar under the header showing a pinned message: the pins as segments on the
+    /// left (the shown one bright), who sent it and what it says. A click jumps to it and
+    /// moves on to the next pin; right-click (or ⋯) to unpin.
+    fn pin_bar(&self, pins: &[ChatMessage], glass_on: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let ix = self.pin_ix % pins.len();
+        let shown = pins[ix].clone();
+        let who = if shown.from_me {
+            "You".to_string()
+        } else if self.is_group {
+            shown.sender_name.clone().unwrap_or_else(|| "Pinned message".into())
+        } else {
+            "Pinned message".into()
+        };
+        let preview = crate::message_info::preview(&shown).replace('\n', " ");
+        let count = pins.len();
+        let segments = div().flex_none().h(px(30.)).w(px(3.)).flex().flex_col().gap(px(2.)).children((0..count).map(|i| {
+            div().flex_1().w_full().rounded_full().bg(if i == ix { theme.accent } else { theme.text_secondary.opacity(0.3) })
+        }));
+        let menu = {
+            let (view, pins) = (cx.entity().downgrade(), pins.to_vec());
+            move |at: Point<Pixels>, window: &mut Window, cx: &mut App| {
+                let shown = pins[ix].clone();
+                let mut items = vec![
+                    {
+                        let (view, m) = (view.clone(), shown.clone());
+                        Item::action("Show in Chat", move |_, cx| {
+                            let _ = view.update(cx, |this, cx| this.jump_to(m.id.clone(), Some(m.timestamp), true, cx));
+                        })
+                    },
+                    {
+                        let (view, m) = (view.clone(), shown.clone());
+                        Item::action("Unpin", move |_, cx| {
+                            let _ = view.update(cx, |this, cx| this.store.update(cx, |s, _| s.pin_message(&m, None)));
+                        })
+                    },
+                ];
+                if pins.len() > 1 {
+                    items.push(Item::Separator);
+                    items.push(Item::submenu(
+                        "Unpin…",
+                        pins.iter()
+                            .map(|m| {
+                                let (view, m) = (view.clone(), m.clone());
+                                let title: String = crate::message_info::preview(&m).replace('\n', " ").chars().take(40).collect();
+                                Item::action(title, move |_, cx| {
+                                    let _ = view.update(cx, |this, cx| this.store.update(cx, |s, _| s.pin_message(&m, None)));
+                                })
+                            })
+                            .collect(),
+                    ));
+                }
+                crate::native_menu::show(items, at, window, cx);
+            }
+        };
+        let more_menu = menu.clone();
+        let bar = div()
+            .id("pin-bar")
+            .h(px(PIN_BAR_HEIGHT))
+            .w_full()
+            .px(px(14.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .relative()
+            // A floating glass capsule under the header's; without glass, a frosted strip.
+            .map(|d| {
+                if glass_on {
+                    d.rounded(px(PIN_BAR_HEIGHT / 2.)).pl(px(18.))
+                } else {
+                    d.child(crate::chrome::frosted(theme.bar_tint)).border_b_1().border_color(theme.separator)
+                }
+            })
+            .cursor_pointer()
+            .child(segments)
+            .child(glyph(Glyph::Pin, 14., theme.text_secondary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_size(px(11.5)).line_height(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.accent).truncate().child(who))
+                    .child(div().text_size(px(12.5)).line_height(px(16.)).text_color(theme.text).truncate().child(preview)),
+            )
+            // A photo or video: its thumbnail, like WhatsApp's.
+            .children(self.thumbs.get(&shown.id).cloned().map(|thumb| {
+                div().flex_none().size(px(30.)).rounded(px(4.)).overflow_hidden().child(
+                    img(thumb).size_full().object_fit(ObjectFit::Cover),
+                )
+            }))
+            .child(
+                div()
+                    .id("pin-bar-more")
+                    .flex_none()
+                    .size(px(26.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(theme.search_bg))
+                    .child(glyph(Glyph::More, 14., theme.text_secondary))
+                    .on_click(move |ev, window, cx| {
+                        cx.stop_propagation();
+                        more_menu(ev.position(), window, cx)
+                    }),
+            )
+            .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                cx.stop_propagation();
+                menu(ev.position, window, cx)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.jump_to(shown.id.clone(), Some(shown.timestamp), true, cx);
+                this.pin_ix = (ix + 1) % count;
+                cx.notify();
+            }));
+        if glass_on {
+            glass::glass("pin-bar", PIN_BAR_HEIGHT / 2., bar).into_any_element()
+        } else {
+            bar.into_any_element()
+        }
+    }
+
+    /// An action asked for from the gallery or the photo viewer.
+    fn do_action(&mut self, action: MessageAction, window: &mut Window, cx: &mut Context<Self>) {
+        // The store just switched chats: catch up first, or the switch would cancel a jump.
+        if self.binding.chat(self.store.read(cx)) != self.chat_jid {
+            self.rebuild(Change::Appended, cx);
+        }
+        match action {
+            MessageAction::Reveal(m) => self.jump_to(m.id, Some(m.timestamp), true, cx),
+            MessageAction::Forward(m) => self.open_forward(m, window, cx),
+        }
     }
 
     fn flash(&mut self, id: String, cx: &mut Context<Self>) {
@@ -691,7 +835,7 @@ impl Conversation {
                                 }
                             }
                             "WA_DEBUG_PICKER" => this.picker_for = Some(value.clone()),
-                            // "<id>|everyone", "<id>|me", "<id>|retry", "<id>|fwd:<chat>"
+                            // "<id>|everyone", "<id>|me", "<id>|retry", "<id>|fwd:<chat>", "<id>|vote:<option>+<option>"
                             "WA_DEBUG_ACT" => {
                                 for act in value.split(',') {
                                     let Some((id, what)) = act.split_once('|') else { continue };
@@ -699,9 +843,13 @@ impl Conversation {
                                     match what {
                                         "everyone" | "me" => this.store.read(cx).delete_message(&m, what == "everyone"),
                                         "retry" => this.store.update(cx, |s, cx| s.retry_send(&m, cx)),
+                                        "star" => this.store.update(cx, |s, _| s.star_message(&m, true)),
                                         _ => {
                                             if let Some(to) = what.strip_prefix("fwd:") {
                                                 this.store.update(cx, |s, cx| s.forward(&m, to.to_string(), cx));
+                                            } else if let Some(options) = what.strip_prefix("vote:") {
+                                                let options = options.split('+').filter(|o| !o.is_empty()).map(String::from).collect();
+                                                this.store.update(cx, |s, _| s.vote_poll(&m, options));
                                             }
                                         }
                                     }
@@ -861,6 +1009,12 @@ impl Conversation {
             cx.stop_propagation();
             crate::mini::pop_out(&pop_store, pop_jid.clone(), cx);
         });
+        let (gallery_store, gallery_jid) = (store.clone(), jid.clone());
+        let open_gallery = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            cx.stop_propagation();
+            gallery_store.update(cx, |s, cx| s.open_gallery(gallery_jid.clone(), crate::state::GalleryTab::Media, cx));
+        };
+        let gallery = icon_button("open-gallery", Glyph::Grid, "Media, Docs and Links").right(px(48.)).on_click(open_gallery.clone());
         if glass_on {
             // A glass circle like the sidebar's New Message button.
             let pop_out = div()
@@ -877,6 +1031,17 @@ impl Conversation {
                     crate::mini::pop_out(&glass_pop_store, glass_pop_jid.clone(), cx);
                 });
             let pop_out = glass::circle_button("chat-pop-out", 32., theme.search_bg, pop_out);
+            let gallery = div()
+                .id("open-gallery")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .my_auto()
+                .right(px(52.))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Media, Docs and Links").build(window, cx))
+                .child(glyph(Glyph::Grid, 14., theme.text))
+                .on_click(open_gallery);
+            let gallery = glass::circle_button("chat-gallery", 32., theme.search_bg, gallery);
             let identity = div()
                 .id("chat-header")
                 .cursor_pointer()
@@ -899,12 +1064,13 @@ impl Conversation {
                 // Floating over the transcript: clicks stop here (scrolling goes through).
                 .block_mouse_except_scroll()
                 .h(px(HEADER_HEIGHT))
-                // Clear of the pop-out button on both sides, so the name stays centered.
-                .px(px(56.))
+                // Clear of the gallery and pop-out buttons on both sides, so the name stays centered.
+                .px(px(96.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .child(glass::glass("chat-header", 19., identity))
+                .child(gallery)
                 .child(pop_out)
                 .into_any_element();
         }
@@ -914,6 +1080,7 @@ impl Conversation {
             .justify_center()
             .child(avatar(&chat.name, photo, 28., theme))
             .child(names)
+            .child(gallery)
             .child(pop_out)
             .into_any_element()
     }
@@ -970,6 +1137,9 @@ impl Conversation {
         }
         let thumb = self.thumbs.get(&m.id).cloned();
         let found = self.find_highlight(&m.id);
+        // Under the bubble: "★ Starred", "Edited", or both.
+        let starred = album.iter().any(|m| m.starred);
+        let note = [starred.then_some("★ Starred"), m.edited.then_some("Edited")].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         let content: AnyElement = match &m.body {
             _ if album.len() > 1 => self.album_content(album, theme, cx),
             _ if m.deleted => bubble(
@@ -988,7 +1158,7 @@ impl Conversation {
             MessageBody::Sticker(s) => crate::kinds::sticker(&self.store, m, s, theme, cx).into_any_element(),
             MessageBody::Location(l) => crate::kinds::location(m, l, thumb, theme, from_me).into_any_element(),
             MessageBody::Contacts(c) => bubble(crate::kinds::contacts(c, from_me, theme), from_me, last, theme).into_any_element(),
-            MessageBody::Poll(p) => bubble(crate::kinds::poll(p, from_me, theme), from_me, last, theme).into_any_element(),
+            MessageBody::Poll(p) => bubble(crate::kinds::poll(&self.store, m, p, from_me, theme), from_me, last, theme).into_any_element(),
             MessageBody::Rich(r) => bubble(crate::kinds::rich(r, from_me, theme), from_me, last, theme).into_any_element(),
             MessageBody::System { .. } => unreachable!("handled above"),
             MessageBody::ViewOnce(k) => bubble(
@@ -1181,15 +1351,15 @@ impl Conversation {
                         d.child(div().flex_none().pb(px(4.)).flex().gap(px(2.)).child(react_button).child(reply_button))
                     }),
             )
-            // With a status line below, "Edited" joins it ("Edited · Read 8:36 PM").
-            .when(m.edited && status.is_none(), |d| {
+            // "★ Starred · Edited"; with a status line below, it joins that ("Edited · Read 8:36 PM").
+            .when(!note.is_empty() && status.is_none(), |d| {
                 d.child(
                     div()
                         .pt(px(2.))
                         .px(px(if gutter { 50. } else { 6. }))
                         .text_size(px(11.))
                         .text_color(theme.text_secondary)
-                        .child("Edited"),
+                        .child(note.clone()),
                 )
             })
             .when_some(status, |d, (label, failed)| {
@@ -1202,7 +1372,7 @@ impl Conversation {
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if *failed { theme.failed } else { theme.text_secondary })
-                        .child(if m.edited { format!("Edited · {label}") } else { label.clone() })
+                        .child(if note.is_empty() { label.clone() } else { format!("{note} · {label}") })
                         .when(*failed, |d| {
                             d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
                                 let target = retry_target.clone();
@@ -1435,8 +1605,61 @@ impl Conversation {
                 ),
             ));
         }
+        if !m.deleted {
+            let files = crate::media_actions::file_items(m);
+            if !files.is_empty() {
+                if !items.is_empty() {
+                    items.push(Item::Separator);
+                }
+                items.extend(files);
+                items.push(Item::Separator);
+            }
+        }
         if Store::can_forward(m) {
             items.push(Item::action("Forward…", act(|this, target, window, cx| this.open_forward(target, window, cx), m)));
+        }
+        if !m.deleted {
+            let starred = m.starred;
+            items.push(Item::action(
+                if starred { "Unstar" } else { "Star" },
+                act(
+                    if starred {
+                        |this: &mut Self, target: ChatMessage, _: &mut Window, cx: &mut Context<Self>| {
+                            this.store.update(cx, |s, _| s.star_message(&target, false))
+                        }
+                    } else {
+                        |this: &mut Self, target: ChatMessage, _: &mut Window, cx: &mut Context<Self>| {
+                            this.store.update(cx, |s, _| s.star_message(&target, true))
+                        }
+                    },
+                    m,
+                ),
+            ));
+        }
+        if Store::can_pin(m) {
+            let pinned = self.store.read(cx).is_pinned(m);
+            if pinned {
+                items.push(Item::action("Unpin", act(|this, target, _, cx| this.store.update(cx, |s, _| s.pin_message(&target, None)), m)));
+            } else {
+                let view = cx.entity().downgrade();
+                let pin_for = |secs: u32| {
+                    let (view, target) = (view.clone(), m.clone());
+                    move |_: &mut Window, cx: &mut App| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.close_menu(cx);
+                            this.store.update(cx, |s, _| s.pin_message(&target, Some(secs)));
+                        });
+                    }
+                };
+                items.push(Item::submenu(
+                    "Pin",
+                    vec![
+                        Item::action("For 24 Hours", pin_for(86_400)),
+                        Item::action("For 7 Days", pin_for(604_800)),
+                        Item::action("For 30 Days", pin_for(2_592_000)),
+                    ],
+                ));
+            }
         }
         if Store::can_edit(m) {
             items.push(Item::action(
@@ -2060,7 +2283,7 @@ pub fn above_glass(glass_on: bool, id: &'static str, el: impl IntoElement) -> An
 
 /// Messages' soft scroll edge under the glass bars: the transcript fades into the window
 /// background towards the top (or bottom) edge, so the glass reads over calm content.
-fn edge_fade(top: bool, height: f32, theme: &Theme) -> impl IntoElement {
+pub fn edge_fade(top: bool, height: f32, theme: &Theme) -> impl IntoElement {
     let (solid, clear) = (theme.window_bg.opacity(0.92), theme.window_bg.opacity(0.));
     let fade = if top {
         linear_gradient(180., linear_color_stop(solid, 0.), linear_color_stop(clear, 1.))
@@ -2287,7 +2510,23 @@ impl Render for Conversation {
         let (store_handle, chat_jid) = (self.store.clone(), chat.jid.clone());
         let find_bar = self.find.as_ref().map(|f| f.bar.clone());
         let header_height = if mini { MINI_HEADER_HEIGHT } else { HEADER_HEIGHT };
-        let top = header_height + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
+        let pins: Vec<ChatMessage> = self
+            .store
+            .read(cx)
+            .pins
+            .get(&chat.jid)
+            .into_iter()
+            .flatten()
+            // As the transcript has it now, if it's loaded (edits).
+            .map(|p| self.messages.iter().find(|m| m.id == p.id).unwrap_or(p).clone())
+            .filter(|p| !p.deleted)
+            .collect();
+        let find_height = if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
+        let glass_on = glass::enabled(window);
+        let pin_bar = (!pins.is_empty()).then(|| self.pin_bar(&pins, glass_on, &theme, cx));
+        // On glass the bar floats with a little room around it.
+        let pin_height = if glass_on { PIN_BAR_HEIGHT + 8. } else { PIN_BAR_HEIGHT };
+        let top = header_height + find_height + if pin_bar.is_some() { pin_height } else { 0. };
         let bottom = self.composer.read(cx).height() + COMPOSER_GAP;
         let away = self.away.get();
         if !away {
@@ -2301,7 +2540,6 @@ impl Render for Conversation {
             let (store, jid) = (self.store.clone(), jid.to_string());
             cx.defer(move |cx| store.update(cx, |s, cx| s.set_mini_at_latest(&jid, !away, cx)));
         }
-        let glass_on = glass::enabled(window);
         let header = self.header(&chat, typing_label, header_photo, glass_on, &theme);
         let forward = self.forward.as_ref().map(|(p, _)| p.clone());
 
@@ -2348,10 +2586,22 @@ impl Render for Conversation {
                     ),
                 )
             })
-            .when(glass_on, |d| d.child(edge_fade(true, header_height + 12., &theme)))
+            .when(glass_on, |d| d.child(edge_fade(true, top + 12., &theme)))
             .child(header)
             .when_some(find_bar, |d, bar| {
                 d.child(div().absolute().top(px(header_height)).left_0().right_0().block_mouse_except_scroll().child(bar))
+            })
+            .when_some(pin_bar, |d, bar| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(header_height + find_height))
+                        .left_0()
+                        .right_0()
+                        .when(glass_on, |d| d.px(px(12.)))
+                        .block_mouse_except_scroll()
+                        .child(bar),
+                )
             })
             .when_some(self.notice.clone(), |d, text| {
                 d.child(
