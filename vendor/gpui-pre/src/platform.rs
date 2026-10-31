@@ -689,6 +689,10 @@ pub struct SystemNotificationAction {
     pub id: SharedString,
     /// The button's user-visible label.
     pub label: SharedString,
+    /// whatsapp-gpui patch: `Some(placeholder)` makes this a text-entry action
+    /// (macOS's inline reply field); what was typed comes back in
+    /// [`SystemNotificationResponse::text`].
+    pub text_input: Option<SharedString>,
 }
 
 /// The user's activation of a [`SystemNotification`].
@@ -699,6 +703,9 @@ pub struct SystemNotificationResponse {
     /// The pressed action button's [`SystemNotificationAction::id`], or
     /// `None` when the user activated the notification body itself.
     pub action_id: Option<SharedString>,
+    /// whatsapp-gpui patch: the text entered for a text-entry action
+    /// ([`SystemNotificationAction::text_input`]), `None` otherwise.
+    pub text: Option<SharedString>,
 }
 
 /// Thermal state of the system

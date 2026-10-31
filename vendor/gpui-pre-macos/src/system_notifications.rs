@@ -24,8 +24,8 @@ use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationAction,
     UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions,
     UNNotificationDefaultActionIdentifier, UNNotificationPresentationOptions,
-    UNNotificationRequest, UNNotificationResponse, UNUserNotificationCenter,
-    UNUserNotificationCenterDelegate,
+    UNNotificationRequest, UNNotificationResponse, UNTextInputNotificationAction,
+    UNTextInputNotificationResponse, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
 
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
@@ -205,12 +205,22 @@ impl NotificationCenter {
             SharedString::from(format!("gpui-system-notification-{}", categories.len()));
         let platform_actions: Vec<Retained<UNNotificationAction>> = actions
             .iter()
-            .map(|action| {
-                UNNotificationAction::actionWithIdentifier_title_options(
+            .map(|action| match &action.text_input {
+                // whatsapp-gpui patch: text-entry actions (an inline reply field).
+                Some(placeholder) => Retained::into_super(
+                    UNTextInputNotificationAction::actionWithIdentifier_title_options_textInputButtonTitle_textInputPlaceholder(
+                        &NSString::from_str(&action.id),
+                        &NSString::from_str(&action.label),
+                        UNNotificationActionOptions::empty(),
+                        &NSString::from_str(&action.label),
+                        &NSString::from_str(placeholder),
+                    ),
+                ),
+                None => UNNotificationAction::actionWithIdentifier_title_options(
                     &NSString::from_str(&action.id),
                     &NSString::from_str(&action.label),
                     UNNotificationActionOptions::empty(),
-                )
+                ),
             })
             .collect();
         let category =
@@ -279,6 +289,10 @@ define_class!(
                 .unbounded_send(SystemNotificationResponse {
                     tag: SharedString::from(tag),
                     action_id,
+                    // whatsapp-gpui patch: what was typed into a text-entry action.
+                    text: response
+                        .downcast_ref::<UNTextInputNotificationResponse>()
+                        .map(|r| SharedString::from(r.userText().to_string())),
                 })
                 .ok();
             completion_handler.call(());

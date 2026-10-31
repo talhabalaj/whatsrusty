@@ -1637,6 +1637,7 @@ mod tests {
         cx.simulate_system_notification_response(SystemNotificationResponse {
             tag: "com.example.app/own-tag".into(),
             action_id: None,
+            text: None,
         });
         cx.run_until_parked();
         assert!(cx.dismissed_system_notifications().is_empty());
@@ -1734,6 +1735,7 @@ mod tests {
         cx.simulate_system_notification_response(SystemNotificationResponse {
             tag: NotificationId::Id(TypeId::of::<FooKind>()).system_tag(),
             action_id: None,
+            text: None,
         });
         cx.run_until_parked();
 

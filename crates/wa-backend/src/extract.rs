@@ -124,6 +124,37 @@ pub fn expiration_of(msg: &wa::Message) -> Option<u32> {
     context_info(unwrap_message(msg)).and_then(|ci| ci.expiration).filter(|e| *e > 0)
 }
 
+/// The id of the message an HD copy belongs to. Phones send a photo / video twice: in
+/// standard quality, then (seconds later) an HD upload linked to it. WhatsApp shows the
+/// pair as one message, so the HD copy is stored under its parent's id.
+pub fn hd_parent_of(msg: &wa::Message) -> Option<String> {
+    use whatsapp_rust::waproto::whatsapp::message_association::AssociationType as Association;
+    let mut m = msg;
+    for _ in 0..MAX_UNWRAP_DEPTH {
+        let association = m.message_context_info.as_option().and_then(|c| c.message_association.as_option());
+        if let Some(a) = association
+            && matches!(
+                a.association_type,
+                Some(Association::HD_IMAGE_DUAL_UPLOAD | Association::HD_VIDEO_DUAL_UPLOAD | Association::HEVC_VIDEO_DUAL_UPLOAD)
+            )
+        {
+            return a.parent_message_key.as_option().and_then(|k| k.id.clone()).filter(|id| !id.is_empty());
+        }
+        // The association sits on the outer message or on one of the wrapped ones.
+        let inner = m
+            .device_sent_message
+            .as_option()
+            .and_then(|d| d.message.as_option())
+            .or_else(|| m.associated_child_message.as_option().and_then(|w| w.message.as_option()))
+            .or_else(|| m.ephemeral_message.as_option().and_then(|w| w.message.as_option()));
+        match inner {
+            Some(inner) => m = inner,
+            None => break,
+        }
+    }
+    None
+}
+
 pub fn classify(msg: &wa::Message) -> Extracted {
     let base = unwrap_message(msg);
 
@@ -1763,6 +1794,44 @@ mod tests {
         };
         assert_eq!(system(&pin(PinType::PIN_FOR_ALL)), "📌 Pinned a message");
         assert_eq!(classify(&pin(PinType::UNPIN_FOR_ALL)), Extracted::Skip);
+    }
+
+    #[test]
+    fn hd_copy_points_at_its_original() {
+        use whatsapp_rust::waproto::whatsapp::message_association::AssociationType as Association;
+        let associated = |kind| wa::MessageContextInfo {
+            message_association: MessageField::some(wa::MessageAssociation {
+                association_type: Some(kind),
+                parent_message_key: MessageField::some(wa::MessageKey { id: Some("SD".into()), ..Default::default() }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let photo = || MessageField::some(wa::message::ImageMessage::default());
+        // On the message itself, as phones send it to linked devices…
+        let hd = wa::Message {
+            image_message: photo(),
+            message_context_info: MessageField::some(associated(Association::HD_IMAGE_DUAL_UPLOAD)),
+            ..Default::default()
+        };
+        assert_eq!(hd_parent_of(&hd).as_deref(), Some("SD"));
+        // …or inside the wrappers.
+        let wrapped = wa::Message {
+            device_sent_message: MessageField::some(wa::message::DeviceSentMessage {
+                message: MessageField::some(wa::Message { associated_child_message: wrap(hd), ..Default::default() }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(hd_parent_of(&wrapped).as_deref(), Some("SD"));
+        // Album photos are messages of their own.
+        let album_photo = wa::Message {
+            image_message: photo(),
+            message_context_info: MessageField::some(associated(Association::MEDIA_ALBUM)),
+            ..Default::default()
+        };
+        assert_eq!(hd_parent_of(&album_photo), None);
+        assert_eq!(hd_parent_of(&wa::Message { image_message: photo(), ..Default::default() }), None);
     }
 
     #[test]

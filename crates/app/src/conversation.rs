@@ -13,7 +13,7 @@ use wa_backend::{ChatMessage, DeliveryStatus, GroupRead, ImageMedia, MediaState,
 
 use crate::audio::AudioPlayer;
 use crate::avatar::avatar;
-use crate::composer::Composer;
+use crate::composer::{Composer, ComposerResized};
 use crate::native_menu::Item;
 use crate::glass;
 use crate::find_bar::{FIND_BAR_HEIGHT, FindBar, FindEvent, match_ranges};
@@ -34,8 +34,9 @@ use crate::kinds::BUBBLE_RADIUS;
 const HEADER_HEIGHT: f32 = 52.;
 /// The mini window's header, its traffic lights inside it.
 pub const MINI_HEADER_HEIGHT: f32 = 40.;
-/// Space reserved under the transcript for the floating composer.
-const COMPOSER_CLEARANCE: f32 = 78.;
+/// Gap between the last message and the floating composer's field, beyond the
+/// composer's 10pt top padding.
+const COMPOSER_GAP: f32 = 6.;
 const IMAGE_MAX_W: f32 = 260.;
 /// Narrower than this, the info panel covers the conversation rather than sitting beside it.
 const MIN_CHAT_WIDTH: f32 = 380.;
@@ -169,17 +170,13 @@ impl Conversation {
     pub fn new(store: Entity<Store>, binding: ChatBinding, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| Composer::new(store.clone(), binding.clone(), window, cx));
         let subs = vec![
+            // The composer grew or shrank: the transcript's bottom inset follows.
+            cx.subscribe(&composer, |_, _, _: &ComposerResized, cx| cx.notify()),
             cx.observe(&store, |this, _, cx| this.sync_header(cx)),
             cx.subscribe(&store, |this, _, ev: &StoreEvent, cx| match ev {
                 StoreEvent::TranscriptChanged { chat_jid, change } => {
                     if this.binding.chat(this.store.read(cx)).as_deref() == Some(chat_jid.as_str()) {
                         this.rebuild(*change, cx);
-                    }
-                }
-                // The composer's attachment tray changes the transcript's bottom inset.
-                StoreEvent::DraftChanged { chat_jid } => {
-                    if this.chat_jid.as_deref() == Some(chat_jid.as_str()) {
-                        cx.notify();
                     }
                 }
                 StoreEvent::ChatMerged { from, to } => {
@@ -198,6 +195,8 @@ impl Conversation {
                     this.list.reset(0);
                     cx.notify();
                 }
+                // The composer follows drafts itself (its resizes arrive as ComposerResized).
+                StoreEvent::DraftChanged { .. } => {}
             }),
         ];
         let list = ListState::new(0, ListAlignment::Bottom, px(800.));
@@ -763,6 +762,8 @@ impl Conversation {
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
                 .child(glyph(icon, 15., theme.text_secondary))
         };
+        // Fixed line heights: an emoji in the name (Apple Color Emoji's taller line) would
+        // otherwise push "typing…" out of the 30pt / 38pt glass capsule.
         let names = div()
             .min_w_0()
             .flex()
@@ -770,13 +771,14 @@ impl Conversation {
             .child(
                 div()
                     .text_size(px(13.))
+                    .line_height(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .truncate()
                     .child(chat.name.clone()),
             )
             .when_some(typing_label, |d, label| {
-                d.child(div().text_size(px(11.)).text_color(theme.text_secondary).truncate().child(label))
+                d.child(div().text_size(px(11.)).line_height(px(13.)).text_color(theme.text_secondary).truncate().child(label))
             });
         let bar = div()
             .id("chat-header")
@@ -2081,47 +2083,56 @@ fn modal_backdrop(id: &'static str, dismiss: impl Fn(&MouseDownEvent, &mut Windo
         .on_mouse_down(MouseButton::Left, dismiss)
 }
 
-/// Round "jump to the latest" button over the transcript's bottom-right, with a count
-/// of messages that arrived while scrolled up.
-fn scroll_button(unseen: usize, bottom: f32, theme: &Theme, cx: &mut Context<Conversation>) -> impl IntoElement {
+/// "Jump to the latest", centered over the transcript just above the composer: a glass
+/// circle with an arrow, which widens into a "3 new messages" pill when messages arrived
+/// while scrolled up. Rises into place when it appears.
+fn scroll_button(unseen: usize, bottom: f32, glass_on: bool, theme: &Theme, cx: &mut Context<Conversation>) -> impl IntoElement {
+    const SIZE: f32 = 36.;
+    let label = match unseen {
+        0 => None,
+        1 => Some("1 new message".to_string()),
+        n if n > 99 => Some("99+ new messages".to_string()),
+        n => Some(format!("{n} new messages")),
+    };
+    let arrow = if label.is_some() { theme.accent } else { theme.text };
+    let hover = theme.search_bg;
+    let content = div()
+        .id("scroll-to-bottom")
+        // Clicks stop here; the strip around the pill still reaches the transcript.
+        .block_mouse_except_scroll()
+        .h(px(SIZE))
+        .when(label.is_none(), |d| d.w(px(SIZE)))
+        .when(label.is_some(), |d| d.pl(px(12.)).pr(px(15.)))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(glyph(Glyph::ArrowDown, 15., arrow))
+        .when_some(label, |d, label| {
+            d.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text).child(label))
+        })
+        .on_click(cx.listener(|this, _, _, cx| this.scroll_to_bottom(cx)));
+    let pill = if glass_on {
+        glass::glass("scroll-to-bottom", SIZE / 2., content).into_any_element()
+    } else {
+        surface(content, theme).shadow_md().into_any_element()
+    };
     div()
         .absolute()
-        .block_mouse_except_scroll()
-        .right(px(18.))
-        .bottom(px(bottom + 10.))
-        .child(
-            surface(div().id("scroll-to-bottom"), theme)
-                .relative()
-                .size(px(34.))
-                .rounded_full()
-                .shadow_md()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.search_bg))
-                .child(glyph(Glyph::ArrowDown, 15., theme.text_secondary))
-                .when(unseen > 0, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .top(px(-7.))
-                            .right(px(-5.))
-                            .min_w(px(18.))
-                            .h(px(18.))
-                            .px(px(5.))
-                            .rounded_full()
-                            .bg(theme.accent)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.5))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(white())
-                            .child(if unseen > 99 { "99+".to_string() } else { unseen.to_string() }),
-                    )
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.scroll_to_bottom(cx))),
+        .left_0()
+        .right_0()
+        .bottom(px(bottom + 12.))
+        .flex()
+        .justify_center()
+        .child(pill)
+        .with_animation(
+            "scroll-to-bottom-in",
+            Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
+            // Absolutely positioned, so moving it shifts nothing else.
+            move |d, t| d.bottom(px(bottom + 4. + 8. * t)).opacity(t),
         )
 }
 
@@ -2267,9 +2278,6 @@ impl Render for Conversation {
         };
         let history = store.history_of(&chat.jid);
         let loading_older = history.page_pending || history.fetching_remote;
-        let replying = store.replying_to(&chat.jid).is_some();
-        // The composer's attachment tray (one row of 64pt tiles plus padding).
-        let attaching = store.drafts.get(&chat.jid).is_some_and(|d| !d.attachments.is_empty());
         let header_photo = store.avatar_cached(&chat.jid);
         if header_photo.is_none() {
             let (s, jid) = (self.store.clone(), chat.jid.clone());
@@ -2280,7 +2288,7 @@ impl Render for Conversation {
         let find_bar = self.find.as_ref().map(|f| f.bar.clone());
         let header_height = if mini { MINI_HEADER_HEIGHT } else { HEADER_HEIGHT };
         let top = header_height + if find_bar.is_some() { FIND_BAR_HEIGHT } else { 0. };
-        let bottom = COMPOSER_CLEARANCE + if replying { 44. } else { 0. } + if attaching { 76. } else { 0. };
+        let bottom = self.composer.read(cx).height() + COMPOSER_GAP;
         let away = self.away.get();
         if !away {
             self.unseen = 0;
@@ -2356,7 +2364,7 @@ impl Render for Conversation {
                     ),
                 )
             })
-            .when(away, |d| d.child(scroll_button(unseen, bottom, &theme, cx)))
+            .when(away, |d| d.child(scroll_button(unseen, bottom, glass_on, &theme, cx)))
             .when(glass_on, |d| d.child(edge_fade(false, bottom, &theme)))
             // Floating over the transcript: clicks on it stop there (scrolling goes through).
             .child(div().absolute().bottom_0().left_0().right_0().block_mouse_except_scroll().child(self.composer.clone()))

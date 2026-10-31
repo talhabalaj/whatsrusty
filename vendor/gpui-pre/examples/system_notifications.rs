@@ -50,10 +50,12 @@ impl Render for SystemNotificationExample {
                                     SystemNotificationAction {
                                         id: "open".into(),
                                         label: "Open".into(),
+                                        text_input: None,
                                     },
                                     SystemNotificationAction {
                                         id: "snooze".into(),
                                         label: "Snooze".into(),
+                                        text_input: None,
                                     },
                                 ],
                             });
@@ -112,7 +114,7 @@ fn run_example() {
         cx.on_system_notification_response({
             let view = view.clone();
             move |response, cx| {
-                let SystemNotificationResponse { tag, action_id } = response;
+                let SystemNotificationResponse { tag, action_id, .. } = response;
                 view.update(cx, |this, cx| {
                     this.status = match action_id {
                         Some(action_id) => {

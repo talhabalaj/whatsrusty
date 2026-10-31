@@ -544,12 +544,22 @@ fn main() {
 
         let store = Store::create(backend.clone(), cx);
         dock::track(&store, cx);
-        // Clicking a notification opens that conversation.
+        // A notification: Reply sends what was typed, Mark as Read reads the chat, and
+        // clicking it opens the conversation.
         let notified_store = store.clone();
         cx.on_system_notification_response(move |response, cx| {
-            let jid = response.tag.to_string();
-            notified_store.update(cx, |s, cx| s.select(jid, cx));
-            open_main_window(notified_store.clone(), cx);
+            let jid = state::notification_chat(&response.tag).to_string();
+            match response.action_id.as_deref() {
+                Some(state::NOTIFY_REPLY) => {
+                    let text = response.text.clone().unwrap_or_default();
+                    notified_store.update(cx, |s, cx| s.send_notification_reply(jid, &text, cx));
+                }
+                Some(state::NOTIFY_READ) => notified_store.read(cx).mark_read(&jid),
+                _ => {
+                    notified_store.update(cx, |s, cx| s.select(jid, cx));
+                    open_main_window(notified_store.clone(), cx);
+                }
+            }
         });
         cx.set_global(MainStore(store.clone()));
         let quit_store = store.clone();

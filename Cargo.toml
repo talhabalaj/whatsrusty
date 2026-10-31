@@ -28,6 +28,8 @@ gpui-base = { path = "vendor/gpui-base" }
 #   NSGlassEffectViews. See docs/liquid-glass.md.
 # - AccessKit attached to the first-responder GPUI view so the focused text field is the
 #   system's AXFocusedUIElement (vendor/gpui-pre-macos/src/window.rs).
+# - Text-entry notification actions (inline Reply): `SystemNotificationAction::text_input`
+#   and `SystemNotificationResponse::text` (vendor/gpui-pre-macos/src/system_notifications.rs).
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }

@@ -34,6 +34,9 @@ const LEVEL_PITCH: f32 = 5.;
 /// there before its bar slides in, and the meter scrolls at an even speed.
 const LEVEL_LAG: Duration = Duration::from_millis(150);
 
+/// The composer's height changed (more lines, a reply / edit bar, attachments).
+pub struct ComposerResized;
+
 pub struct Composer {
     store: Entity<Store>,
     binding: ChatBinding,
@@ -66,6 +69,8 @@ pub struct Composer {
     move_focus: bool,
     /// Skip the Change event caused by our own text replacement.
     replacing: bool,
+    /// How tall the composer was last laid out (the transcript scrolls clear of it).
+    height: f32,
     _subs: Vec<Subscription>,
 }
 
@@ -228,6 +233,7 @@ impl Composer {
             recording_focus: cx.focus_handle(),
             move_focus: false,
             replacing: false,
+            height: COMPOSER_HEIGHT + 20.,
             _subs: subs,
         }
     }
@@ -824,7 +830,11 @@ impl Composer {
             |(i, path)| {
                 let remove = path.clone();
                 let tile = if is_image(path) {
-                    div().size(px(THUMB)).child(img(path.clone()).size_full().rounded(px(10.)).object_fit(ObjectFit::Cover))
+                    // A fixed size, not `size_full`: a tall photo's intrinsic aspect ratio
+                    // would otherwise stretch the tile down over the text row.
+                    div().size(px(THUMB)).flex_none().child(
+                        img(path.clone()).size(px(THUMB)).aspect_ratio(1.).rounded(px(10.)).object_fit(ObjectFit::Cover),
+                    )
                 } else {
                     file_card(path, theme)
                 };
@@ -1112,6 +1122,14 @@ fn field_bar(id: &'static str, icon: Glyph, title: String, detail: Div, theme: &
     (bar, close)
 }
 
+impl EventEmitter<ComposerResized> for Composer {}
+
+impl Composer {
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+}
+
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_window(window);
@@ -1126,6 +1144,7 @@ impl Render for Composer {
         }
         let replying = self.chat.as_ref().and_then(|c| self.store.read(cx).replying_to(c).cloned());
         let weak = cx.entity().downgrade();
+        let measure = weak.clone();
 
         let suggestions_open = !self.suggestions.is_empty();
         let mentions_open = !self.mention_list.is_empty();
@@ -1199,6 +1218,23 @@ impl Render for Composer {
         div()
             .relative()
             .w_full()
+            // Measures the composer as laid out, for the transcript's bottom inset.
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let height = f32::from(bounds.size.height);
+                        let _ = measure.update(cx, |this, cx| {
+                            if (this.height - height).abs() > 0.5 {
+                                this.height = height;
+                                cx.emit(ComposerResized);
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .when(!glass_on, |d| {
                 d.child(crate::chrome::frosted(theme.bar_tint)).border_t_1().border_color(theme.separator)
             })
