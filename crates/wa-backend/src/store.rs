@@ -19,12 +19,15 @@ use crate::extract::{
 };
 use crate::stickers::StickerSync;
 use crate::types::{
-    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, GroupRead, LocationInfo, MediaState, Mention, MessageBody, MessageReceipt,
+    ChatMessage, ChatSummary, CommunityRef, ContactCard, DeliveryStatus, FileKind, GroupRead, LocationInfo, MediaState, Mention, MessageBody, MessageReceipt,
     MessagePreview, PollInfo, QuotedMessage, Reaction, RichText, Timestamp, ViewOnceKind,
 };
 
 mod chat_list;
 mod message_actions;
+mod pins;
+mod polls;
+mod stars;
 
 pub use chat_list::{ChatFlags, LastMessageKey};
 
@@ -218,6 +221,54 @@ const MIGRATIONS: &[&str] = &[
         read_ts      INTEGER,
         played_ts    INTEGER,
         PRIMARY KEY (chat_jid, message_id, member_jid)
+    );
+    "#,
+    // 12: a group's receipts without a member were kept as the group itself reading.
+    r#"
+    DELETE FROM receipts WHERE member_jid = chat_jid;
+    DELETE FROM group_reads WHERE reader_jid = chat_jid;
+    "#,
+    // 13: pinned messages. A row stays after an unpin (`pinned = 0`) so an older pin
+    // replayed by history sync doesn't come back.
+    r#"
+    CREATE TABLE pins (
+        chat_jid   TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        pinned     INTEGER NOT NULL,
+        -- When it was pinned or unpinned (the sender's time).
+        ts         INTEGER NOT NULL,
+        expires_ts INTEGER NOT NULL,
+        PRIMARY KEY (chat_jid, message_id)
+    );
+    "#,
+    // 14: polls: each poll's secret (votes are encrypted with it), and everyone's
+    // current vote (option names joined by U+001F; empty once taken back), the latest winning.
+    r#"
+    CREATE TABLE poll_secrets (
+        chat_jid   TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        secret     BLOB NOT NULL,
+        PRIMARY KEY (chat_jid, message_id)
+    );
+    CREATE TABLE poll_votes (
+        chat_jid   TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        voter_jid  TEXT NOT NULL,
+        from_me    INTEGER NOT NULL,
+        options    TEXT NOT NULL,
+        ts_ms      INTEGER NOT NULL,
+        PRIMARY KEY (chat_jid, message_id, voter_jid)
+    );
+    "#,
+    // 15: starred messages. A row stays after an unstar (`starred = 0`) so an older star
+    // replayed by app state sync doesn't come back.
+    r#"
+    CREATE TABLE stars (
+        chat_jid   TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        starred    INTEGER NOT NULL,
+        ts         INTEGER NOT NULL,
+        PRIMARY KEY (chat_jid, message_id)
     );
     "#,
 ];
@@ -422,6 +473,15 @@ pub fn mention_tokens(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Whether `text` mentions everyone in the group: `@all` on its own.
+pub fn mentions_everyone(text: &str) -> bool {
+    text.match_indices("@all").any(|(i, m)| {
+        let before_ok = text[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = !text[i + m.len()..].starts_with(|c: char| c.is_alphanumeric());
+        before_ok && after_ok
+    })
+}
+
 /// The text of a body that can carry mentions (text, captions).
 fn mention_text(body: &MessageBody) -> Option<&str> {
     match body {
@@ -597,6 +657,7 @@ fn decode_poll(b: &[u8]) -> Option<PollInfo> {
         question: p.name.unwrap_or_default(),
         options: p.options.into_iter().map(|o| o.option_name.unwrap_or_default()).collect(),
         multiple: p.selectable_options_count != Some(1),
+        votes: Vec::new(),
     })
 }
 
@@ -946,7 +1007,8 @@ impl Store {
                 "DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM aliases;
                  DELETE FROM avatars; DELETE FROM pending_edits; DELETE FROM pending_receipts;
                  DELETE FROM reactions; DELETE FROM favorite_stickers; DELETE FROM removed_recent_stickers;
-                 DELETE FROM group_reads; DELETE FROM receipts;",
+                 DELETE FROM group_reads; DELETE FROM receipts; DELETE FROM pins;
+                 DELETE FROM poll_secrets; DELETE FROM poll_votes; DELETE FROM stars;",
             )?;
         Ok(())
     }
@@ -1143,6 +1205,42 @@ impl Store {
             params![lid, pn],
         )?;
         c.execute("DELETE FROM receipts WHERE chat_jid = ?1 OR member_jid = ?1", [lid])?;
+        // Pins in the LID chat: the latest action wins.
+        c.execute(
+            "INSERT INTO pins (chat_jid, message_id, pinned, ts, expires_ts)
+             SELECT ?2, message_id, pinned, ts, expires_ts FROM pins WHERE chat_jid = ?1 AND true
+             ON CONFLICT (chat_jid, message_id) DO UPDATE SET
+                pinned = excluded.pinned, ts = excluded.ts, expires_ts = excluded.expires_ts
+             WHERE excluded.ts > ts",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM pins WHERE chat_jid = ?1", [lid])?;
+        // Polls in the LID chat, votes by the LID voter: the latest vote wins.
+        c.execute(
+            "INSERT OR IGNORE INTO poll_secrets (chat_jid, message_id, secret)
+             SELECT ?2, message_id, secret FROM poll_secrets WHERE chat_jid = ?1",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [lid])?;
+        c.execute(
+            "INSERT INTO poll_votes (chat_jid, message_id, voter_jid, from_me, options, ts_ms)
+             SELECT CASE WHEN chat_jid = ?1 THEN ?2 ELSE chat_jid END, message_id,
+                    CASE WHEN voter_jid = ?1 THEN ?2 ELSE voter_jid END, from_me, options, ts_ms
+             FROM poll_votes WHERE chat_jid = ?1 OR voter_jid = ?1 AND true
+             ON CONFLICT (chat_jid, message_id, voter_jid) DO UPDATE SET
+                options = excluded.options, ts_ms = excluded.ts_ms, from_me = excluded.from_me
+             WHERE excluded.ts_ms > ts_ms",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM poll_votes WHERE chat_jid = ?1 OR voter_jid = ?1", [lid])?;
+        c.execute(
+            "INSERT INTO stars (chat_jid, message_id, starred, ts)
+             SELECT ?2, message_id, starred, ts FROM stars WHERE chat_jid = ?1 AND true
+             ON CONFLICT (chat_jid, message_id) DO UPDATE SET starred = excluded.starred, ts = excluded.ts
+             WHERE excluded.ts > ts",
+            params![lid, pn],
+        )?;
+        c.execute("DELETE FROM stars WHERE chat_jid = ?1", [lid])?;
         c.execute(
             "DELETE FROM reactions WHERE chat_jid = ?1
                 AND target_id IN (SELECT id FROM messages WHERE chat_jid = ?1 AND revoked = 1)",
@@ -1624,10 +1722,12 @@ impl Store {
             return Ok(Vec::new());
         };
         let mut reactions = self.reactions(chat, ReactionScope::Between(min, max))?;
+        let starred = self.starred_ids(chat)?;
         rows.into_iter()
             .map(|r| {
                 let reactions = reactions.remove(&r.id).unwrap_or_default();
-                self.to_chat_message_with(r, reactions)
+                let is_starred = starred.contains(&r.id);
+                self.to_chat_message_with(r, reactions, is_starred)
             })
             .collect()
     }
@@ -1915,6 +2015,10 @@ impl Store {
     /// the newest of them, if that's further. Returns whether it moved.
     pub fn record_group_read(&self, chat_jid: &str, reader: &str, ids: &[String]) -> Result<bool> {
         let (chat, reader) = (self.canonical(chat_jid)?, self.canonical(reader)?);
+        // A group's receipt that doesn't say which member.
+        if reader == chat {
+            return Ok(false);
+        }
         let mut newest: Option<(i64, String)> = None;
         let mut stmt =
             self.conn.prepare_cached("SELECT ts FROM messages WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1")?;
@@ -1949,6 +2053,10 @@ impl Store {
         at: Timestamp,
     ) -> Result<Vec<String>> {
         let (chat, member) = (self.canonical(chat_jid)?, self.canonical(member)?);
+        // A group's receipt that doesn't say which member.
+        if member == chat {
+            return Ok(Vec::new());
+        }
         let read = (status == DeliveryStatus::Read).then_some(at);
         let played = played.then_some(at);
         let mut mine = self.conn.prepare_cached("SELECT 1 FROM messages WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1")?;
@@ -2211,10 +2319,16 @@ impl Store {
 
     fn to_chat_message(&self, r: MessageRow) -> Result<ChatMessage> {
         let reactions = self.reactions(&r.chat_jid, ReactionScope::Message(&r.id))?.remove(&r.id).unwrap_or_default();
-        self.to_chat_message_with(r, reactions)
+        let starred = self.is_starred(&r.chat_jid, &r.id)?;
+        self.to_chat_message_with(r, reactions, starred)
     }
 
-    fn to_chat_message_with(&self, r: MessageRow, reactions: Vec<Reaction>) -> Result<ChatMessage> {
+    fn to_chat_message_with(&self, mut r: MessageRow, reactions: Vec<Reaction>, starred: bool) -> Result<ChatMessage> {
+        if let MessageBody::Poll(p) = &mut r.body
+            && !r.revoked
+        {
+            p.votes = self.poll_votes(&r.chat_jid, &r.id, &p.options)?;
+        }
         let sender_name =
             if r.from_me { None } else { Some(self.sender_display_name(&r.sender_jid, r.push_name.as_deref())?) };
         let quoted = match r.quoted {
@@ -2222,10 +2336,14 @@ impl Store {
             None => None,
         };
         let edited = r.edit_ts.is_some() && !r.revoked;
-        let mentions = match mention_text(&r.body) {
+        let mut mentions = match mention_text(&r.body) {
             Some(text) if !r.revoked => self.resolve_mentions(text)?,
             _ => Vec::new(),
         };
+        // `@all` in a group: everyone (shown like a name).
+        if is_group_jid(&r.chat_jid) && !r.revoked && mention_text(&r.body).is_some_and(mentions_everyone) {
+            mentions.push(Mention { user: "all".into(), jid: r.chat_jid.clone(), name: "all".into() });
+        }
         Ok(ChatMessage {
             id: r.id,
             chat_jid: r.chat_jid,
@@ -2241,6 +2359,7 @@ impl Store {
             forwarded: r.forwarded,
             deleted: r.revoked,
             mentions,
+            starred: starred && !r.revoked,
         })
     }
 
@@ -2446,12 +2565,28 @@ impl Store {
 
     /// The chat's photos and videos (not deleted), newest first.
     pub fn load_media(&self, chat_jid: &str, limit: u32) -> Result<Vec<ChatMessage>> {
+        self.load_where(chat_jid, &format!("kind IN ({KIND_IMAGE}, {KIND_VIDEO})"), limit)
+    }
+
+    /// A chat's documents, or its messages with a link in them, newest first.
+    pub fn load_files(&self, chat_jid: &str, kind: FileKind, limit: u32) -> Result<Vec<ChatMessage>> {
+        let filter = match kind {
+            FileKind::Docs => format!("kind = {KIND_DOCUMENT}"),
+            FileKind::Links => format!(
+                "kind IN ({KIND_TEXT}, {KIND_RICH}, {KIND_IMAGE}, {KIND_VIDEO})
+                 AND (text LIKE '%http://%' OR text LIKE '%https://%' OR text LIKE '%www.%')"
+            ),
+        };
+        self.load_where(chat_jid, &filter, limit)
+    }
+
+    fn load_where(&self, chat_jid: &str, filter: &str, limit: u32) -> Result<Vec<ChatMessage>> {
         let chat = self.canonical(chat_jid)?;
         let rows: Vec<MessageRow> = self
             .conn
-            .prepare_cached(&format!(
+            .prepare(&format!(
                 "SELECT {MESSAGE_COLS} FROM messages
-                 WHERE chat_jid = ?1 AND kind IN ({KIND_IMAGE}, {KIND_VIDEO}) AND revoked = 0
+                 WHERE chat_jid = ?1 AND ({filter}) AND revoked = 0
                  ORDER BY ts DESC, rowid DESC LIMIT ?2"
             ))?
             .query_map(params![chat, limit], MessageRow::from_row)?
@@ -2673,6 +2808,14 @@ mod tests {
     }
 
     #[test]
+    fn at_all_on_its_own_mentions_everyone() {
+        assert!(mentions_everyone("@all u guys are invited"));
+        assert!(mentions_everyone("hey (@all)!"));
+        assert!(!mentions_everyone("@allison"));
+        assert!(!mentions_everyone("mail@all.com"));
+    }
+
+    #[test]
     fn mention_tokens_need_digits_on_their_own() {
         let tokens: Vec<&str> = mention_tokens("@15550000001 hi @900000000002, mail a@123456 or @12 @12345x (@15550000002)").collect();
         assert_eq!(tokens, ["15550000001", "900000000002", "15550000002"]);
@@ -2748,9 +2891,104 @@ mod tests {
             [(ALICE.to_string(), Some(300), Some(300)), (BOB_LID.to_string(), Some(100), Some(200))]
         );
 
+        // A group's receipt that doesn't say which member is no one's.
+        assert!(s.record_receipt(GROUP, GROUP, &ids(&["1"]), DeliveryStatus::Read, false, 400).unwrap().is_empty());
+        assert!(!s.record_group_read(GROUP, GROUP, &ids(&["1"])).unwrap());
+        assert_eq!(times(&s).len(), 2);
+
         // Learning the LID's number folds it in.
         s.add_alias(BOB_LID, BOB).unwrap();
         assert!(times(&s).contains(&(BOB.to_string(), Some(100), Some(200))));
+    }
+
+    #[test]
+    fn poll_votes_keep_the_latest_per_voter() {
+        let s = store();
+        let mut poll = msg(GROUP, "P", ALICE, "", 10);
+        poll.body = MessageBody::Poll(PollInfo {
+            question: "Lunch?".into(),
+            options: vec!["Pizza".into(), "Sushi".into()],
+            multiple: false,
+            votes: Vec::new(),
+        });
+        s.insert_message(&poll, true).unwrap();
+        s.set_poll_secret(GROUP, "P", b"secret").unwrap();
+        assert_eq!(s.poll_secret(GROUP, "P").unwrap().as_deref(), Some(&b"secret"[..]));
+        let opts = |v: &[&str]| v.iter().map(|o| o.to_string()).collect::<Vec<_>>();
+        let tally = |s: &Store| {
+            let MessageBody::Poll(p) = s.get_message(GROUP, "P").unwrap().unwrap().body else { panic!() };
+            p.votes.into_iter().map(|v| (v.voter_jid, v.from_me, v.options)).collect::<Vec<_>>()
+        };
+
+        assert!(s.record_poll_vote(GROUP, "P", BOB, false, &opts(&["Pizza"]), 100).unwrap());
+        assert!(s.record_poll_vote(GROUP, "P", ME, true, &opts(&["Sushi"]), 110).unwrap());
+        // An older vote (replayed) doesn't replace a newer one.
+        assert!(!s.record_poll_vote(GROUP, "P", BOB, false, &opts(&["Sushi"]), 90).unwrap());
+        assert_eq!(tally(&s), [(BOB.to_string(), false, vec![0]), (ME.to_string(), true, vec![1])]);
+        // Taking a vote back: gone from the tally.
+        s.record_poll_vote(GROUP, "P", BOB, false, &[], 120).unwrap();
+        assert_eq!(tally(&s), [(ME.to_string(), true, vec![1])]);
+        // A failed vote of mine is put back.
+        let before = s.my_poll_vote(GROUP, "P").unwrap().map(|(_, o, ts)| (o, ts));
+        s.record_poll_vote(GROUP, "P", ME, true, &opts(&["Pizza"]), 130).unwrap();
+        s.restore_my_poll_vote(GROUP, "P", ME, before).unwrap();
+        assert_eq!(tally(&s), [(ME.to_string(), true, vec![1])]);
+    }
+
+    #[test]
+    fn stars_and_searching_all_chats() {
+        let s = store();
+        s.insert_message(&msg(GROUP, "1", ALICE, "Lunch at noon?", 10), true).unwrap();
+        s.insert_message(&msg(ALICE, "2", ALICE, "LUNCH tomorrow", 20), true).unwrap();
+        s.insert_message(&msg(ALICE, "3", ME, "dinner", 30), true).unwrap();
+
+        // Any chat, any case, newest first; too short a query finds nothing.
+        let ids = |v: Vec<ChatMessage>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.search_all("lunch").unwrap()), ["2", "1"]);
+        assert!(s.search_all("l").unwrap().is_empty());
+        // `%` and `_` are literal.
+        assert!(s.search_all("%_").unwrap().is_empty());
+
+        assert!(s.set_star(GROUP, "1", true, 100).unwrap());
+        assert!(s.set_star(ALICE, "3", true, 110).unwrap());
+        assert!(s.get_message(GROUP, "1").unwrap().unwrap().starred);
+        assert_eq!(ids(s.starred_messages(10).unwrap()), ["3", "1"]);
+        // An older star replayed after an unstar doesn't bring it back.
+        assert!(s.set_star(GROUP, "1", false, 120).unwrap());
+        assert!(!s.set_star(GROUP, "1", true, 105).unwrap());
+        assert_eq!(ids(s.starred_messages(10).unwrap()), ["3"]);
+        assert!(!s.load_messages(GROUP, None, 10).unwrap().0[0].starred);
+    }
+
+    #[test]
+    fn pins_keep_the_latest_action() {
+        let s = store();
+        for (id, ts) in [("1", 10), ("2", 20), ("3", 30), ("4", 40)] {
+            s.insert_message(&msg(GROUP, id, ALICE, id, ts), true).unwrap();
+        }
+        let pinned = |s: &Store, now| s.pinned_messages(GROUP, now).unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>();
+
+        assert!(s.set_pin(GROUP, "1", Some(1000), 100).unwrap());
+        assert!(s.set_pin(GROUP, "2", Some(1000), 110).unwrap());
+        // Latest pinned first.
+        assert_eq!(pinned(&s, 200), ["2", "1"]);
+        // An older pin replayed (history sync) doesn't undo a newer unpin.
+        assert!(s.set_pin(GROUP, "1", None, 120).unwrap());
+        assert!(!s.set_pin(GROUP, "1", Some(1000), 100).unwrap());
+        assert_eq!(pinned(&s, 200), ["2"]);
+        // Expired pins are gone; at most three show.
+        s.set_pin(GROUP, "3", Some(150), 130).unwrap();
+        s.set_pin(GROUP, "4", Some(1000), 140).unwrap();
+        s.set_pin(GROUP, "1", Some(1000), 150).unwrap();
+        assert_eq!(pinned(&s, 200), ["1", "4", "2"]);
+        // A failed pin of mine is put back.
+        let before = s.pin_state(GROUP, "4").unwrap();
+        s.set_pin(GROUP, "4", None, 160).unwrap();
+        s.restore_pin(GROUP, "4", before).unwrap();
+        assert_eq!(pinned(&s, 200), ["1", "4", "2"]);
+        // Deleted for everyone: not pinned any more.
+        s.revoke(GROUP, "1", crate::extract::DELETED_LABEL).unwrap();
+        assert_eq!(pinned(&s, 200), ["4", "2"]);
     }
 
     #[test]
@@ -3355,7 +3593,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE pending_edits DROP COLUMN stored_at; ALTER TABLE messages DROP COLUMN forwarded;
                      DROP TABLE deleted_for_me; ALTER TABLE chats DROP COLUMN marked_unread;
-                     DROP TABLE group_community; DROP TABLE group_reads; DROP TABLE receipts;
+                     DROP TABLE group_community; DROP TABLE group_reads; DROP TABLE receipts; DROP TABLE pins; DROP TABLE poll_secrets; DROP TABLE poll_votes; DROP TABLE stars;
                      PRAGMA user_version = 3",
                 )
                 .unwrap();
@@ -3779,13 +4017,13 @@ mod tests {
             with_body(
                 "poll1",
                 7,
-                MessageBody::Poll(PollInfo { question: "Q?".into(), options: vec!["a".into(), "b".into()], multiple: false }),
+                MessageBody::Poll(PollInfo { question: "Q?".into(), options: vec!["a".into(), "b".into()], multiple: false, votes: Vec::new() }),
                 None,
             ),
             with_body(
                 "poll2",
                 8,
-                MessageBody::Poll(PollInfo { question: "Many?".into(), options: vec![], multiple: true }),
+                MessageBody::Poll(PollInfo { question: "Many?".into(), options: vec![], multiple: true, votes: Vec::new() }),
                 None,
             ),
             with_body(

@@ -222,7 +222,7 @@ impl Render for MiniChat {
                 this.conversation.update(cx, |c, cx| c.open_find(window, cx))
             }))
             .child(self.conversation.clone())
-            .when_some(lightbox, |d, path| d.child(crate::lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
+            .when_some(lightbox, |d, path| d.child(crate::lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, crate::glass::enabled(window), cx)))
             .when_some(video, |d, video| {
                 d.child(crate::video_overlay(video, Some(self.jid.clone()), self.store.clone(), &self.lightbox_focus.0))
             })

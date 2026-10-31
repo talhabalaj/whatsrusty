@@ -435,7 +435,13 @@ impl Composer {
                     let store = self.store.read(cx);
                     store.profiles.get(&chat).map(|p| p.participants.iter().filter(|p| !p.is_me).cloned().collect()).unwrap_or_default()
                 };
-                crate::mentions::suggest(&members, q, 6)
+                let mut list = crate::mentions::suggest(&members, q, 6);
+                // "@all": everyone in the group (its entry stands for the group itself).
+                if crate::mentions::suggests_everyone(q) {
+                    list.insert(0, wa_backend::Participant { jid: chat.clone(), name: "all".into(), is_admin: false, is_me: false });
+                    list.truncate(6);
+                }
+                list
             }
             None => Vec::new(),
         };
@@ -449,7 +455,9 @@ impl Composer {
     fn accept_mention(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.mention_list.get(ix).cloned() else { return };
         let text = self.input.read(cx).value().to_string();
-        if !self.mentions.iter().any(|(n, j)| *n == p.name && *j == p.jid) {
+        // "@all" stays as it is on the wire.
+        let everyone = p.jid.ends_with("@g.us");
+        if !everyone && !self.mentions.iter().any(|(n, j)| *n == p.name && *j == p.jid) {
             self.mentions.push((p.name.clone(), p.jid.clone()));
         }
         self.mention_list.clear();
@@ -714,7 +722,13 @@ impl Composer {
         let store = self.store.read(cx);
         popup(theme).children(self.mention_list.iter().enumerate().map(|(i, p)| {
             let selected = i == self.mention_ix;
-            let phone = p.jid.strip_suffix("@s.whatsapp.net").map(|u| format!("+{u}"));
+            let everyone = p.jid.ends_with("@g.us");
+            let phone = if everyone {
+                Some("Notify everyone".to_string())
+            } else {
+                p.jid.strip_suffix("@s.whatsapp.net").map(|u| format!("+{u}"))
+            };
+            let shown = if everyone { "@all".to_string() } else { p.name.clone() };
             div()
                 .id(("mention-suggestion", i))
                 .flex()
@@ -734,7 +748,7 @@ impl Composer {
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if selected { white() } else { theme.text })
-                        .child(p.name.clone()),
+                        .child(shown),
                 )
                 .when_some(phone.filter(|ph| *ph != p.name), |d, phone| {
                     d.child(

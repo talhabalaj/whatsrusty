@@ -21,6 +21,8 @@ const ROW_HEIGHT: f32 = 68.;
 /// WhatsApp allows this many pinned chats.
 const MAX_PINNED: usize = 3;
 const ERROR_SHOWN_FOR: Duration = Duration::from_secs(6);
+/// How long typing in the search field pauses before messages are searched too.
+const SEARCH_ALL_DELAY: Duration = Duration::from_millis(250);
 /// With Liquid Glass: the New Message circle and the search capsule.
 const COMPOSE_GLASS_SIZE: f32 = 32.;
 const SEARCH_GLASS_HEIGHT: f32 = 32.;
@@ -48,8 +50,12 @@ enum Target {
     ArchivedBack,
     Pin(String),
     ArchivedEntry,
+    StarredEntry,
+    StarredBack,
     Community(String),
     Chat(String),
+    /// A starred message or a search hit: (chat, message id).
+    Message(String, String),
 }
 
 /// A row of the sidebar list.
@@ -65,6 +71,14 @@ enum Row {
     Community(String),
     /// A group shown under its expanded community.
     CommunityChat(String),
+    /// The "Starred" entry under "Archived".
+    StarredEntry,
+    /// "‹ Starred", back to the main list.
+    StarredBack,
+    /// "Messages", over the messages matching a search.
+    MessagesHeader,
+    /// A starred message, or a message matching the search: (chat, message id).
+    Message(String, String),
 }
 
 /// With glass: the soft scroll edge under the floating search field, like the
@@ -90,6 +104,10 @@ pub struct Sidebar {
     last_selected: Option<String>,
     /// Showing archived chats instead of the main list.
     archived_view: bool,
+    /// Showing starred messages instead of the main list.
+    starred_view: bool,
+    /// Searching all chats' messages waits for a pause in typing.
+    _search_all: Option<Task<()>>,
     /// Communities whose groups are shown under them.
     expanded: std::collections::HashSet<String>,
     /// Key focus for the list itself (↑/↓ move `cursor`, Enter opens).
@@ -125,6 +143,12 @@ impl Sidebar {
                 match ev {
                     InputEvent::Change => {
                         this.query = state.read(cx).value().to_lowercase();
+                        // Messages too, once typing pauses.
+                        let query = this.query.clone();
+                        this._search_all = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(SEARCH_ALL_DELAY).await;
+                            let _ = this.update(cx, |this, cx| this.store.update(cx, |s, cx| s.search_all(&query, cx)));
+                        }));
                         cx.notify();
                     }
                     // Enter: open the first match.
@@ -149,6 +173,8 @@ impl Sidebar {
             rows: Vec::new(),
             last_selected: None,
             archived_view: false,
+            starred_view: false,
+            _search_all: None,
             expanded: Default::default(),
             list_focus: cx.focus_handle(),
             cursor: None,
@@ -168,6 +194,24 @@ impl Sidebar {
         }
         if std::env::var_os("WA_DEBUG_ARCHIVED").is_some() {
             this.archived_view = true;
+        }
+        if std::env::var_os("WA_DEBUG_STARRED").is_some() {
+            this.starred_view = true;
+        }
+        // Test hook: type this into the search field.
+        if let Ok(q) = std::env::var("WA_DEBUG_SEARCH") {
+            // After startup's own selection (which clears a search). Setting the value
+            // doesn't send `Change`: search as typing would.
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.query = q.to_lowercase();
+                    this.search.update(cx, |s, cx| s.set_value(q.clone(), window, cx));
+                    this.store.update(cx, |s, cx| s.search_all(&q, cx));
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         debug_ui_script(window, cx);
         this
@@ -239,7 +283,13 @@ impl Sidebar {
 
     /// The list's rows for the current view and query.
     fn current_rows(&self, cx: &App) -> Vec<Row> {
-        let chats = &self.store.read(cx).chats;
+        let store = self.store.read(cx);
+        let chats = &store.chats;
+        if self.starred_view {
+            let mut rows = vec![Row::StarredBack];
+            rows.extend(store.starred.iter().map(|m| Row::Message(m.chat_jid.clone(), m.id.clone())));
+            return rows;
+        }
         let main_view = self.query.is_empty() && !self.archived_view;
         let mut rows = Vec::new();
         if self.archived_view {
@@ -251,9 +301,21 @@ impl Sidebar {
         if main_view && chats.iter().any(|c| c.archived) {
             rows.push(Row::ArchivedEntry);
         }
+        if main_view && !store.starred.is_empty() {
+            rows.push(Row::StarredEntry);
+        }
         let jids = self.visible_jids(cx);
         if !main_view {
             rows.extend(jids.into_iter().map(Row::Chat));
+            // Searching: the messages that match, under the chats.
+            if let Some((query, hits)) = &store.search_all
+                && !self.query.is_empty()
+                && query.to_lowercase() == self.query.trim()
+                && !hits.is_empty()
+            {
+                rows.push(Row::MessagesHeader);
+                rows.extend(hits.iter().map(|m| Row::Message(m.chat_jid.clone(), m.id.clone())));
+            }
             return rows;
         }
         // A community's groups gather under one row, where its most recent group would be.
@@ -294,13 +356,34 @@ impl Sidebar {
         let chats = self.store.read(cx).chats.clone();
         match row {
             Row::ArchivedBack => {
-                let el = self.archived_header(theme, cx).into_any_element();
+                let el = self.back_header(false, theme, cx).into_any_element();
                 self.ring(&Target::ArchivedBack, el, 10., 10., theme)
             }
             Row::Pinned => self.pinned_grid(&chats, theme, cx).unwrap_or_else(|| div().into_any_element()),
             Row::ArchivedEntry => {
                 let el = self.archived_row(&chats, theme, cx).unwrap_or_else(|| div().into_any_element());
                 self.ring(&Target::ArchivedEntry, el, 10., 10., theme)
+            }
+            Row::StarredEntry => {
+                let el = self.starred_row(theme, cx);
+                self.ring(&Target::StarredEntry, el, 10., 10., theme)
+            }
+            Row::StarredBack => {
+                let el = self.back_header(true, theme, cx).into_any_element();
+                self.ring(&Target::StarredBack, el, 10., 10., theme)
+            }
+            Row::MessagesHeader => div()
+                .px(px(24.))
+                .pt(px(12.))
+                .pb(px(4.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_secondary)
+                .child("Messages")
+                .into_any_element(),
+            Row::Message(chat, id) => {
+                let el = self.message_row(chat, id, theme, cx);
+                self.ring(&Target::Message(chat.clone(), id.clone()), el, 10., 10., theme)
             }
             Row::Community(jid) => {
                 let el = self.community_row(jid, &chats, theme, cx);
@@ -343,6 +426,10 @@ impl Sidebar {
                 Row::ArchivedEntry => out.push((Target::ArchivedEntry, ix)),
                 Row::Community(jid) => out.push((Target::Community(jid.clone()), ix)),
                 Row::Chat(jid) | Row::CommunityChat(jid) => out.push((Target::Chat(jid.clone()), ix)),
+                Row::StarredEntry => out.push((Target::StarredEntry, ix)),
+                Row::StarredBack => out.push((Target::StarredBack, ix)),
+                Row::MessagesHeader => {}
+                Row::Message(chat, id) => out.push((Target::Message(chat.clone(), id.clone()), ix)),
             }
         }
         out
@@ -393,6 +480,9 @@ impl Sidebar {
             }
             Target::ArchivedEntry => self.archived_view = true,
             Target::ArchivedBack => self.archived_view = false,
+            Target::StarredEntry => self.starred_view = true,
+            Target::StarredBack => self.starred_view = false,
+            Target::Message(chat, id) => self.open_message(&chat, &id, cx),
         }
         cx.notify();
     }
@@ -452,6 +542,10 @@ impl Sidebar {
                     self.expanded.remove(&community);
                     self.sync_rows(cx);
                     self.move_cursor(Some(Target::Community(community)), cx);
+                } else if self.starred_view {
+                    self.starred_view = false;
+                    self.sync_rows(cx);
+                    self.move_cursor(Some(Target::StarredEntry), cx);
                 } else if self.archived_view {
                     self.archived_view = false;
                     self.sync_rows(cx);
@@ -595,9 +689,11 @@ impl Sidebar {
         div().px(px(10.)).pb(px(8.)).child(field)
     }
 
-    fn archived_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// "‹ Archived" / "‹ Starred" over the archive / the starred messages: back to the
+    /// main list.
+    fn back_header(&self, starred: bool, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("archived-back")
+            .id(if starred { "starred-back" } else { "archived-back" })
             .mx(px(10.))
             .px(px(6.))
             .mb(px(4.))
@@ -609,20 +705,143 @@ impl Sidebar {
             .cursor_pointer()
             // On glass the circle shows the hover.
             .when(!self.glass_on, |d| d.hover(|s| s.bg(theme.search_bg)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.archived_view = false;
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if starred {
+                    this.starred_view = false;
+                } else {
+                    this.archived_view = false;
+                }
                 cx.notify();
             }))
             .map(|d| {
                 if self.glass_on {
                     // Back as a glass circle, like the toolbar's New Message button.
-                    let back = div().id("archived-back-glass").child(glyph(Glyph::ChevronLeft, 13., theme.text));
-                    d.gap(px(8.)).child(crate::glass::circle_button("sidebar-archived-back", 28., theme.search_bg, back))
+                    let (id, pane) = if starred {
+                        ("starred-back-glass", "sidebar-starred-back")
+                    } else {
+                        ("archived-back-glass", "sidebar-archived-back")
+                    };
+                    let back = div().id(id).child(glyph(Glyph::ChevronLeft, 13., theme.text));
+                    d.gap(px(8.)).child(crate::glass::circle_button(pane, 28., theme.search_bg, back))
                 } else {
                     d.child(glyph(Glyph::ChevronLeft, 15., theme.accent))
                 }
             })
-            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("Archived"))
+            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child(if starred { "Starred" } else { "Archived" }))
+    }
+
+    /// The "Starred" entry under "Archived", when anything is starred.
+    fn starred_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.store.read(cx).starred.len();
+        let row = div()
+            .id("starred-row")
+            .w_full()
+            .h(px(44.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .pr(px(12.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.search_bg))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.starred_view = true;
+                cx.notify();
+            }))
+            .child(div().w(px(14.)).flex_none())
+            .child(div().w(px(44.)).flex_none().flex().justify_center().child(glyph(Glyph::Star, 19., theme.text_secondary)))
+            .child(div().flex_1().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).child("Starred"))
+            .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(theme.text_secondary).child(count.to_string()))
+            .child(glyph(Glyph::ChevronRight, 11., theme.text_secondary));
+        div().px(px(10.)).pb(px(2.)).child(row).into_any_element()
+    }
+
+    /// Open a starred message / search hit: its chat, scrolled to it.
+    fn open_message(&mut self, chat: &str, id: &str, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let found = store
+            .starred
+            .iter()
+            .chain(store.search_all.iter().flat_map(|(_, hits)| hits))
+            .find(|m| m.chat_jid == chat && m.id == id)
+            .cloned();
+        if let Some(m) = found {
+            self.store.update(cx, |s, cx| s.message_action(crate::state::MessageAction::Reveal(m), None, cx));
+        }
+    }
+
+    /// A starred message or a search hit: the chat's photo and name (with the sender in
+    /// a group), when, and what it says.
+    fn message_row(&self, chat_jid: &str, id: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let source: &[wa_backend::ChatMessage] =
+            if self.starred_view { &store.starred } else { store.search_all.as_ref().map_or(&[], |(_, h)| h.as_slice()) };
+        let Some(m) = source.iter().find(|m| m.chat_jid == chat_jid && m.id == id).cloned() else {
+            return div().into_any_element();
+        };
+        let chat = store.chats.iter().find(|c| c.jid == chat_jid);
+        let chat_name = chat.map_or_else(|| chat_jid.split('@').next().unwrap_or_default().to_string(), |c| c.name.clone());
+        let is_group = chat.is_some_and(|c| c.is_group);
+        let photo = store.avatar_cached(chat_jid);
+        let who = match &m.sender_name {
+            _ if m.from_me => Some("You".to_string()),
+            Some(name) if is_group => Some(name.clone()),
+            _ => None,
+        };
+        let title = match &who {
+            Some(who) if is_group => format!("{who} · {chat_name}"),
+            _ => chat_name.clone(),
+        };
+        let mut text = crate::message_info::preview(&m).replace('\n', " ");
+        // "@<digits>" as the names they stand for, like the bubble shows them.
+        for mention in &m.mentions {
+            text = text.replace(&format!("@{}", mention.user), &format!("@{}", mention.name));
+        }
+        let text = match who {
+            Some(who) if !is_group => format!("{who}: {text}"),
+            _ => text,
+        };
+        let (open_chat, open_id) = (chat_jid.to_string(), id.to_string());
+        let (menu_store, menu_message, starred_view) = (self.store.clone(), m.clone(), self.starred_view);
+        let row = div()
+            .id(SharedString::from(format!("hit-{chat_jid}-{id}")))
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .rounded(px(8.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.search_bg))
+            .child(avatar(&chat_name, photo, 44., theme))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                            .child(div().flex_none().text_size(px(12.)).text_color(theme.text_secondary).child(sidebar_time(m.timestamp))),
+                    )
+                    .child(div().text_size(px(12.5)).text_color(theme.text_secondary).line_clamp(2).child(text)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.open_message(&open_chat, &open_id, cx)))
+            // Right-click a starred message to unstar it.
+            .when(starred_view, |d| {
+                d.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                    let (store, m) = (menu_store.clone(), menu_message.clone());
+                    let items = vec![Item::action("Unstar", move |_, cx| store.update(cx, |s, _| s.star_message(&m, false)))];
+                    crate::native_menu::show(items, ev.position, window, cx);
+                })
+            });
+        div().px(px(10.)).child(row).into_any_element()
     }
 
     /// The "Archived" entry above the chats, when anything is archived.

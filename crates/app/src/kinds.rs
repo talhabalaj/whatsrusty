@@ -303,12 +303,20 @@ pub fn contacts(cards: &[ContactCard], from_me: bool, theme: &Theme) -> Div {
     }))
 }
 
-pub fn poll(p: &PollInfo, from_me: bool, theme: &Theme) -> Div {
-    let (fg, sub, ring) = if from_me {
-        (theme.bubble_out_text, theme.bubble_out_text.opacity(0.75), white().opacity(0.7))
+/// A poll: each option with a bar for its share of the votes and how many it has; mine
+/// are ticked. Clicking an option votes (again: takes it back); clicking a count shows
+/// who chose it.
+pub fn poll(store: &Entity<Store>, m: &ChatMessage, p: &PollInfo, from_me: bool, theme: &Theme) -> Div {
+    let (fg, sub, ring, fill, track) = if from_me {
+        (theme.bubble_out_text, theme.bubble_out_text.opacity(0.75), white().opacity(0.7), white(), white().opacity(0.25))
     } else {
-        (theme.bubble_in_text, theme.text_secondary, theme.text_secondary)
+        (theme.bubble_in_text, theme.text_secondary, theme.text_secondary, theme.accent, theme.separator)
     };
+    let mine: Vec<usize> = p.votes.iter().filter(|v| v.from_me).flat_map(|v| v.options.clone()).collect();
+    let count = |i: usize| p.votes.iter().filter(|v| v.options.contains(&i)).count();
+    let most = (0..p.options.len()).map(count).max().unwrap_or(0).max(1);
+    let voters = p.votes.len();
+    let can_vote = !m.deleted;
     div()
         .w(px(CARD_W - 24.))
         .flex()
@@ -316,23 +324,90 @@ pub fn poll(p: &PollInfo, from_me: bool, theme: &Theme) -> Div {
         .gap(px(6.))
         .child(div().text_size(px(11.)).text_color(sub).child(if p.multiple { "POLL · SELECT ONE OR MORE" } else { "POLL · SELECT ONE" }))
         .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(fg).child(p.question.clone()))
-        .children(p.options.iter().map(|o| {
+        .children(p.options.iter().enumerate().map(|(i, o)| {
+            let picked = mine.contains(&i);
+            let n = count(i);
+            // Clicking: single choice picks it (or takes it back); multiple toggles it.
+            let next: Vec<String> = if p.multiple {
+                p.options
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| if *j == i { !picked } else { mine.contains(j) })
+                    .map(|(_, o)| o.clone())
+                    .collect()
+            } else if picked {
+                Vec::new()
+            } else {
+                vec![o.clone()]
+            };
+            let (vote_store, message) = (store.clone(), m.clone());
+            let names: Vec<String> = p.votes.iter().filter(|v| v.options.contains(&i)).map(|v| v.name.clone()).collect();
+            let title = o.clone();
             div()
+                .id(SharedString::from(format!("poll-{}-{i}", m.id)))
                 .flex()
-                .items_center()
-                .gap(px(8.))
-                .py(px(2.))
+                .flex_col()
+                .gap(px(4.))
+                .py(px(3.))
+                .when(can_vote, |d| d.cursor_pointer())
                 .child(
                     div()
-                        .flex_none()
-                        .size(px(15.))
-                        .border_1()
-                        .border_color(ring)
-                        .map(|d| if p.multiple { d.rounded(px(4.)) } else { d.rounded_full() }),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(16.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .map(|d| if p.multiple { d.rounded(px(4.)) } else { d.rounded_full() })
+                                .map(|d| if picked { d.bg(fill) } else { d.border_1().border_color(ring) })
+                                .when(picked, |d| d.child(glyph(Glyph::Check, 10., if from_me { theme.bubble_out } else { white() }))),
+                        )
+                        .child(div().flex_1().min_w_0().text_size(px(13.5)).text_color(fg).child(o.clone()))
+                        .when(n > 0, |d| {
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!("poll-count-{}-{i}", m.id)))
+                                    .flex_none()
+                                    .px(px(4.))
+                                    .rounded(px(4.))
+                                    .text_size(px(12.))
+                                    .text_color(sub)
+                                    .hover(|s| s.bg(track))
+                                    .child(n.to_string())
+                                    // Who chose it.
+                                    .on_click(move |ev, window, cx| {
+                                        cx.stop_propagation();
+                                        let mut items = vec![crate::native_menu::Item::action(title.clone(), |_, _| {}).enabled(false)];
+                                        items.push(crate::native_menu::Item::Separator);
+                                        items.extend(names.iter().map(|n| crate::native_menu::Item::action(n.clone(), |_, _| {}).enabled(false)));
+                                        crate::native_menu::show(items, ev.position(), window, cx);
+                                    }),
+                            )
+                        }),
                 )
-                .child(div().text_size(px(13.5)).text_color(fg).child(o.clone()))
+                .child(
+                    div()
+                        .ml(px(24.))
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(track)
+                        .child(div().h_full().rounded_full().bg(fill).w(relative(n as f32 / most as f32))),
+                )
+                .on_click(move |_, _, cx| {
+                    if can_vote {
+                        vote_store.update(cx, |s, _| s.vote_poll(&message, next.clone()));
+                    }
+                })
         }))
-        .child(div().text_size(px(11.)).text_color(sub).child("Vote on your phone"))
+        .child(div().text_size(px(11.)).text_color(sub).child(match voters {
+            0 => "No votes yet".to_string(),
+            1 => "1 vote".to_string(),
+            n => format!("{n} votes"),
+        }))
 }
 
 /// Business/bot message: optional header, body, footer, and its buttons as rows.

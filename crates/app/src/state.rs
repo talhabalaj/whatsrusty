@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification, SystemNotificationAction};
 use wa_backend::{
-    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, GroupRead, MessageBody, MessageReceipt,
-    SearchHit,
+    BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, FileKind, GroupRead, MessageBody,
+    MessageReceipt, SearchHit,
 };
 
 /// Emitted when the visible transcript changes, so the conversation view can
@@ -21,6 +21,26 @@ pub enum StoreEvent {
     DraftChanged { chat_jid: String },
     /// A LID chat became a phone-number chat: views bound to `from` move to `to`.
     ChatMerged { from: String, to: String },
+    /// Something asked for outside the conversation (the gallery, the photo viewer) that
+    /// the conversation does. `mini`: the popped-out chat whose window does it (`None`:
+    /// the main window).
+    MessageAction { action: Box<MessageAction>, mini: Option<String> },
+}
+
+#[derive(Clone)]
+pub enum MessageAction {
+    /// Scroll the conversation to the message and flash it.
+    Reveal(ChatMessage),
+    /// Open the forward picker for it.
+    Forward(ChatMessage),
+}
+
+/// The gallery's tabs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GalleryTab {
+    Media,
+    Docs,
+    Links,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +98,8 @@ const PROFILE_WAIT: Duration = Duration::from_secs(6);
 
 /// Photos and videos the info panel shows at most.
 const MEDIA_TILES: u32 = 60;
+/// Photos and videos (and documents, links) the gallery lists at most.
+const GALLERY_LIMIT: u32 = 5000;
 
 /// A photo or video in a chat's info panel, its thumbnail decoded once.
 pub struct MediaTile {
@@ -110,6 +132,18 @@ pub struct Store {
     download_progress: HashMap<(String, String), f32>,
     /// Photos and videos of a chat for the info panel, newest first (after `ListMedia`).
     chat_media: HashMap<String, Vec<MediaTile>>,
+    /// Documents and links of a chat for the gallery, newest first (after `ListFiles`).
+    pub chat_files: HashMap<(String, FileKind), Vec<ChatMessage>>,
+    /// The chat whose gallery is open (full-window, in the main window), and its tab.
+    pub gallery: Option<(String, GalleryTab)>,
+    /// Each chat's pinned messages, the latest pinned first.
+    pub pins: HashMap<String, Vec<ChatMessage>>,
+    /// My starred messages in all chats, the latest starred first.
+    pub starred: Vec<ChatMessage>,
+    /// Latest answer to searching all chats: (query, messages newest first).
+    pub search_all: Option<(String, Vec<ChatMessage>)>,
+    /// What was last asked for (older answers are dropped).
+    search_all_query: String,
     /// How far each member of a group has read my messages, per group chat.
     pub group_reads: HashMap<String, Vec<GroupRead>>,
     pub typing: HashSet<String>,
@@ -138,6 +172,8 @@ pub struct Store {
     pub lightbox_in: Option<String>,
     /// The message whose photo the lightbox shows (for stepping to its neighbours).
     lightbox_id: Option<String>,
+    /// Whose profile photo the lightbox shows, when it's one.
+    pub lightbox_title: Option<String>,
     /// Video playing over the app, and the mini window's chat it opened in (`None`: the
     /// main window).
     pub video: Option<OpenVideo>,
@@ -203,6 +239,8 @@ impl Store {
             }
         })
         .detach();
+        // For the sidebar's Starred entry (updates follow on their own).
+        let _ = backend.commands.send(Command::ListStarred);
 
         Self {
             backend,
@@ -213,6 +251,12 @@ impl Store {
             group_reads: HashMap::new(),
             download_progress: HashMap::new(),
             chat_media: HashMap::new(),
+            chat_files: HashMap::new(),
+            gallery: None,
+            pins: HashMap::new(),
+            starred: Vec::new(),
+            search_all: None,
+            search_all_query: String::new(),
             typing: HashSet::new(),
             typists: HashMap::new(),
             search_results: None,
@@ -227,6 +271,7 @@ impl Store {
             lightbox: None,
             lightbox_in: None,
             lightbox_id: None,
+            lightbox_title: None,
             video: None,
             video_in: None,
             profile_open: None,
@@ -348,6 +393,25 @@ impl Store {
                     }
                     tiles.retain(|t| !t.message.deleted);
                 }
+                // The gallery's documents and links (downloads, edits, deletes).
+                for ((chat, _), items) in self.chat_files.iter_mut() {
+                    if *chat == chat_jid && let Some(ix) = items.iter().position(|i| i.id == m.id) {
+                        if m.deleted {
+                            items.remove(ix);
+                        } else {
+                            items[ix] = m.clone();
+                        }
+                    }
+                }
+                if let Some(pins) = self.pins.get_mut(&chat_jid)
+                    && let Some(ix) = pins.iter().position(|p| p.id == m.id)
+                {
+                    if m.deleted {
+                        pins.remove(ix);
+                    } else {
+                        pins[ix] = m.clone();
+                    }
+                }
                 // Only keep transcripts the user has opened; the chat list carries previews.
                 if let Some(list) = self.messages.get_mut(&chat_jid) {
                     upsert(list, m);
@@ -391,6 +455,25 @@ impl Store {
             Event::DownloadProgress { chat_jid, message_id, fraction } => {
                 self.download_progress.insert((chat_jid, message_id), fraction);
                 cx.notify();
+            }
+            Event::ChatFiles { chat_jid, kind, items } => {
+                self.chat_files.insert((chat_jid, kind), items);
+                cx.notify();
+            }
+            Event::Starred { messages } => {
+                self.starred = messages;
+                cx.notify();
+            }
+            Event::SearchAllResults { query, messages } => {
+                if query == self.search_all_query {
+                    self.search_all = Some((query, messages));
+                    cx.notify();
+                }
+            }
+            Event::Pins { chat_jid, messages } => {
+                log::debug!("{} pinned in {chat_jid}", messages.len());
+                self.pins.insert(chat_jid.clone(), messages);
+                cx.emit(StoreEvent::TranscriptChanged { chat_jid, change: Change::Updated });
             }
             Event::ChatMedia { chat_jid, items } => {
                 let tiles = items.into_iter().map(MediaTile::new).collect();
@@ -654,6 +737,12 @@ impl Store {
         self.group_reads.clear();
         self.download_progress.clear();
         self.chat_media.clear();
+        self.chat_files.clear();
+        self.gallery = None;
+        self.pins.clear();
+        self.starred.clear();
+        self.search_all = None;
+        self.search_all_query.clear();
         self.search_results = None;
         self.avatars.clear();
         self.avatar_requested.clear();
@@ -857,6 +946,118 @@ impl Store {
         }
     }
 
+    /// Open the full-window gallery of a chat's photos, videos, documents and links.
+    pub fn open_gallery(&mut self, chat_jid: String, tab: GalleryTab, cx: &mut Context<Self>) {
+        log::info!("opening the gallery of {chat_jid} ({tab:?})");
+        self.send(Command::ListMedia { chat_jid: chat_jid.clone(), limit: GALLERY_LIMIT });
+        for kind in [FileKind::Docs, FileKind::Links] {
+            self.send(Command::ListFiles { chat_jid: chat_jid.clone(), kind, limit: GALLERY_LIMIT });
+        }
+        self.gallery = Some((chat_jid, tab));
+        cx.notify();
+    }
+
+    pub fn set_gallery_tab(&mut self, tab: GalleryTab, cx: &mut Context<Self>) {
+        if let Some((_, t)) = &mut self.gallery {
+            *t = tab;
+            cx.notify();
+        }
+    }
+
+    pub fn close_gallery(&mut self, cx: &mut Context<Self>) {
+        if self.gallery.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The documents or links of a chat for its gallery (`None` until they've loaded).
+    pub fn chat_files(&self, chat_jid: &str, kind: FileKind) -> Option<&[ChatMessage]> {
+        self.chat_files.get(&(chat_jid.to_string(), kind)).map(Vec::as_slice)
+    }
+
+    pub fn star_message(&mut self, m: &ChatMessage, starred: bool) {
+        self.send(Command::StarMessage { chat_jid: m.chat_jid.clone(), message_id: m.id.clone(), starred });
+    }
+
+    /// Search the text of every chat's messages (results arrive in `search_all`).
+    pub fn search_all(&mut self, query: &str, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        if query == self.search_all_query {
+            return;
+        }
+        self.search_all_query = query.clone();
+        if query.chars().count() < 2 {
+            self.search_all = None;
+            cx.notify();
+        } else {
+            self.send(Command::SearchAll { query });
+        }
+    }
+
+    /// Vote in a poll with these option names (none: take my vote back).
+    pub fn vote_poll(&mut self, m: &ChatMessage, options: Vec<String>) {
+        self.send(Command::VotePoll { chat_jid: m.chat_jid.clone(), message_id: m.id.clone(), options });
+    }
+
+    /// Pin a message for everyone for `duration_secs`, or unpin it (`None`).
+    pub fn pin_message(&mut self, m: &ChatMessage, duration_secs: Option<u32>) {
+        self.send(Command::PinMessage { chat_jid: m.chat_jid.clone(), message_id: m.id.clone(), duration_secs });
+    }
+
+    pub fn is_pinned(&self, m: &ChatMessage) -> bool {
+        self.pins.get(&m.chat_jid).is_some_and(|p| p.iter().any(|p| p.id == m.id))
+    }
+
+    /// Hand an action to the conversation showing the message (in the main window: after
+    /// switching to its chat, and closing the gallery and viewer over it).
+    pub fn message_action(&mut self, action: MessageAction, mini: Option<String>, cx: &mut Context<Self>) {
+        let (MessageAction::Reveal(m) | MessageAction::Forward(m)) = &action;
+        let chat = m.chat_jid.clone();
+        if mini.is_none() {
+            self.gallery = None;
+            self.select(chat, cx);
+        }
+        self.close_lightbox(cx);
+        self.close_video(cx);
+        cx.emit(StoreEvent::MessageAction { action: Box::new(action), mini });
+        cx.notify();
+    }
+
+    /// The message whose photo the viewer shows, if known.
+    pub fn lightbox_message(&self) -> Option<&ChatMessage> {
+        let id = self.lightbox_id.as_deref()?;
+        let chat = self.lightbox_chat()?;
+        self.messages
+            .get(chat)
+            .and_then(|ms| ms.iter().find(|m| m.id == id))
+            .or_else(|| self.chat_media.get(chat)?.iter().map(|t| &t.message).find(|m| m.id == id))
+    }
+
+    /// The chat of the photo the viewer shows: where its message is, else the window's.
+    fn lightbox_chat(&self) -> Option<&str> {
+        let id = self.lightbox_id.as_deref();
+        let has = |ms: &[ChatMessage]| id.is_some_and(|id| ms.iter().any(|m| m.id == id));
+        let window_chat = self.lightbox_in.as_deref().or(self.selected.as_deref());
+        if window_chat.is_some_and(|c| self.messages.get(c).is_some_and(|ms| has(ms))) {
+            return window_chat;
+        }
+        if let Some(id) = id {
+            if let Some((chat, _)) = self.chat_media.iter().find(|(_, tiles)| tiles.iter().any(|t| t.message.id == id)) {
+                return Some(chat);
+            }
+            if let Some((chat, _)) = self.messages.iter().find(|(_, ms)| has(ms)) {
+                return Some(chat);
+            }
+        }
+        window_chat
+    }
+
+    /// Where the viewer's photo is among the ones it steps through, and how many there are.
+    pub fn lightbox_position(&self) -> Option<(usize, usize)> {
+        let (_, photos) = self.lightbox_photos();
+        Some((self.lightbox_pos(&photos)?, photos.len()))
+    }
+
     pub fn open_lightbox(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.open_lightbox_in(path, None, None, cx);
     }
@@ -867,22 +1068,33 @@ impl Store {
         self.lightbox = Some(path);
         self.lightbox_id = id;
         self.lightbox_in = mini;
+        self.lightbox_title = None;
         cx.notify();
+    }
+
+    /// Someone's profile photo, full-window.
+    pub fn open_profile_photo(&mut self, path: PathBuf, name: String, cx: &mut Context<Self>) {
+        self.open_lightbox_in(path, None, None, cx);
+        self.lightbox_title = Some(name);
     }
 
     /// The open photo's chat's photos, oldest first: (message id, file once downloaded).
     fn lightbox_photos(&self) -> (Option<&str>, Vec<(&str, Option<&PathBuf>)>) {
-        let chat = self.lightbox_in.as_deref().or(self.selected.as_deref());
-        let photos = chat
-            .and_then(|c| self.messages.get(c))
-            .into_iter()
-            .flatten()
-            .filter(|m| !m.deleted)
-            .filter_map(|m| match &m.body {
-                MessageBody::Image(media) => Some((m.id.as_str(), media.path.as_ref())),
+        let chat = self.lightbox_chat();
+        fn photo(m: &ChatMessage) -> Option<(&str, Option<&PathBuf>)> {
+            match &m.body {
+                MessageBody::Image(media) if !m.deleted => Some((m.id.as_str(), media.path.as_ref())),
                 _ => None,
-            })
-            .collect();
+            }
+        }
+        // The gallery's list reaches back further than the transcript.
+        if let (Some(c), Some(id)) = (chat, self.lightbox_id.as_deref())
+            && let Some(tiles) = self.chat_media.get(c)
+            && tiles.iter().any(|t| t.message.id == id)
+        {
+            return (chat, tiles.iter().rev().filter_map(|t| photo(&t.message)).collect());
+        }
+        let photos = chat.and_then(|c| self.messages.get(c)).into_iter().flatten().filter_map(photo).collect();
         (chat, photos)
     }
 
@@ -1220,6 +1432,13 @@ impl Store {
     }
 
     /// Text and media messages can be forwarded (not deleted / view-once / other kinds).
+    /// Messages WhatsApp lets you pin: any sent one that's still there, but not system lines.
+    pub fn can_pin(m: &ChatMessage) -> bool {
+        !m.deleted
+            && !(m.from_me && matches!(m.status, DeliveryStatus::Pending | DeliveryStatus::Failed))
+            && !matches!(m.body, MessageBody::System { .. } | MessageBody::Unsupported { .. })
+    }
+
     pub fn can_forward(m: &ChatMessage) -> bool {
         !m.deleted
             && matches!(

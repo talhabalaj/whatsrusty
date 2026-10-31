@@ -8,6 +8,7 @@ mod emoji_complete;
 mod find_bar;
 mod forward_picker;
 mod format;
+mod gallery;
 mod glass;
 mod chrome;
 mod icons;
@@ -15,6 +16,7 @@ mod identity;
 mod kinds;
 mod links;
 mod login_item;
+mod media_actions;
 mod media_cache;
 mod mentions;
 mod message_info;
@@ -50,6 +52,7 @@ struct Root {
     store: Entity<Store>,
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
+    gallery: Entity<gallery::Gallery>,
     lightbox_focus: LightboxFocus,
     _subs: Vec<Subscription>,
 }
@@ -58,6 +61,7 @@ impl Root {
     fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
         let conversation = cx.new(|cx| Conversation::new(store.clone(), ChatBinding::Selected, window, cx));
+        let gallery = cx.new(|cx| gallery::Gallery::new(store.clone(), cx));
         // Menus, popovers and text fields from gpui-component follow light / dark mode too.
         gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
         let subs = vec![
@@ -76,7 +80,7 @@ impl Root {
                 }
             }),
         ];
-        Self { store, sidebar, conversation, lightbox_focus: LightboxFocus(cx.focus_handle(), false), _subs: subs }
+        Self { store, sidebar, conversation, gallery, lightbox_focus: LightboxFocus(cx.focus_handle(), false), _subs: subs }
     }
 }
 
@@ -104,7 +108,20 @@ impl Render for Root {
                 .size_full()
                 .flex()
                 .child(div().w(px(SIDEBAR_WIDTH)).flex_none().h_full().child(self.sidebar.clone()))
-                .child(div().flex_1().min_w_0().h_full().child(self.conversation.clone()))
+                // The gallery covers the conversation while it's open.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .relative()
+                        .child(self.conversation.clone())
+                        // Above the conversation's glass header and composer.
+                        .when(store.gallery.is_some(), |d| {
+                            let gallery = div().absolute().inset_0().child(self.gallery.clone());
+                            d.child(conversation::above_glass(glass::enabled(window), "gallery", gallery))
+                        }),
+                )
                 .into_any_element(),
         };
         let banner = match (&store.connection, store.sync_progress) {
@@ -116,7 +133,14 @@ impl Render for Root {
         // A photo opened from a mini window shows there instead.
         let lightbox = store.lightbox.clone().filter(|_| store.lightbox_in.is_none());
         let video = store.video.clone().filter(|_| store.video_in.is_none());
+        let gallery_open = store.gallery.is_some();
+        let was_open = self.lightbox_focus.1;
         follow_lightbox(&mut self.lightbox_focus, lightbox.is_some() || video.is_some(), &self.conversation, window, cx);
+        // Back to the gallery, if the photo was opened from it (so Esc closes it next).
+        if was_open && !self.lightbox_focus.1 && gallery_open {
+            let focus = self.gallery.read(cx).focus_handle().clone();
+            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        }
         div()
             .size_full()
             .relative()
@@ -155,7 +179,7 @@ impl Render for Root {
                 )
             })
             .when_some(lightbox, |d, path| {
-                d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, cx)))
+                d.child(conversation::above_glass(glass::enabled(window), "lightbox", lightbox_overlay(path, self.store.clone(), &self.lightbox_focus.0, glass::enabled(window), cx)))
             })
             .when_some(video, |d, video| {
                 let overlay = video_overlay(video, None, self.store.clone(), &self.lightbox_focus.0);
@@ -191,40 +215,153 @@ fn follow_lightbox<T: 'static>(
 }
 
 /// Full-window photo viewer: dimmed backdrop, image fitted to the window, click or
-/// Esc to close, ←/→ for the chat's other photos.
-fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &FocusHandle, cx: &App) -> impl IntoElement {
-    let step_button = |delta: isize| {
+/// Esc to close, ←/→ for the chat's other photos. A bar along the top says whose photo
+/// it is and when, with Forward, Save, Show in Chat and the rest (right-click too).
+fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &FocusHandle, glass_on: bool, cx: &App) -> impl IntoElement {
+    let step_button = |delta: isize| -> AnyElement {
         let store = store.clone();
         let (id, icon) = if delta < 0 { ("lightbox-prev", icons::Glyph::ChevronLeft) } else { ("lightbox-next", icons::Glyph::ChevronRight) };
         // Only the circle takes clicks (a full-height strip would sit under ✕).
-        div()
+        let button = div()
             .id(id)
             .absolute()
             .top_0()
             .bottom_0()
             .my_auto()
             .map(|d| if delta < 0 { d.left(px(12.)) } else { d.right(px(12.)) })
-            .size(px(36.))
-            .rounded_full()
-            .bg(white().opacity(0.15))
-            .hover(|s| s.bg(white().opacity(0.25)))
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
             .child(icons::glyph(icon, 16., white()))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 store.update(cx, |s, cx| s.step_lightbox(delta, cx));
-            })
+            });
+        if glass_on {
+            glass::circle_button(id, 40., white().opacity(0.12), button).into_any_element()
+        } else {
+            button
+                .size(px(36.))
+                .rounded_full()
+                .bg(white().opacity(0.15))
+                .hover(|s| s.bg(white().opacity(0.25)))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .into_any_element()
+        }
     };
-    let (prev, next) = (store.read(cx).lightbox_can_step(-1), store.read(cx).lightbox_can_step(1));
+    let s = store.read(cx);
+    let (prev, next) = (s.lightbox_can_step(-1), s.lightbox_can_step(1));
     let (prev, next) = (prev.then(|| step_button(-1)), next.then(|| step_button(1)));
+    let message = s.lightbox_message().cloned();
+    let mini = s.lightbox_in.clone();
+    let title = s.lightbox_title.clone();
+    let position = message.as_ref().and(s.lightbox_position()).filter(|(_, n)| *n > 1);
+    // What the menus offer: everything for a chat's photo, the file actions for a profile photo.
+    let menu_items = {
+        let (store, message, mini, path, title) = (store.clone(), message.clone(), mini.clone(), path.clone(), title.clone());
+        move || match &message {
+            Some(m) => media_actions::media_menu(m, &store, mini.clone()),
+            None => media_actions::path_items(&path, &format!("{}.jpg", title.as_deref().unwrap_or("Photo")), true),
+        }
+    };
     let keys = store.clone();
+    let close_store = store.clone();
     // A click is offered to everything under the pointer: closing stops it here.
     let close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
         cx.stop_propagation();
-        store.update(cx, |s, cx| s.close_lightbox(cx))
+        close_store.update(cx, |s, cx| s.close_lightbox(cx))
+    };
+    let bar_button = |id: &'static str, icon: icons::Glyph, tip: &'static str| {
+        div()
+            .id(id)
+            .flex_none()
+            .size(px(32.))
+            .rounded_full()
+            .hover(|s| s.bg(white().opacity(0.18)))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+            .child(icons::glyph(icon, 15., white()))
+    };
+    let chat_name = |jid: &str| s.chats.iter().find(|c| c.jid == jid).map(|c| c.name.clone()).unwrap_or_default();
+    let (who, when) = match (&message, &title) {
+        (Some(m), _) => (
+            match &m.sender_name {
+                _ if m.from_me => "You".to_string(),
+                Some(name) => name.clone(),
+                // In a chat with one person, that person.
+                None => chat_name(&m.chat_jid),
+            },
+            Some(format::transcript_time(m.timestamp)),
+        ),
+        (None, Some(name)) => (name.clone(), Some("Profile photo".to_string())),
+        (None, None) => (String::new(), None),
+    };
+    let mut actions = div().flex().items_center().gap(px(4.));
+    if let Some(m) = &message {
+        if state::Store::can_forward(m) {
+            let (store, m, mini) = (store.clone(), m.clone(), mini.clone());
+            actions = actions.child(bar_button("lightbox-forward", icons::Glyph::Forward, "Forward…").on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                store.update(cx, |s, cx| s.message_action(state::MessageAction::Forward(m.clone()), mini.clone(), cx))
+            }));
+        }
+        let (save_m, save_path) = (m.clone(), path.clone());
+        actions = actions.child(bar_button("lightbox-save", icons::Glyph::Download, "Save As…").on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            media_actions::save_as(&save_m, &save_path, cx)
+        }));
+        let (store, m, mini) = (store.clone(), m.clone(), mini.clone());
+        actions = actions.child(bar_button("lightbox-reveal", icons::Glyph::Reply, "Show in Chat").on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            store.update(cx, |s, cx| s.message_action(state::MessageAction::Reveal(m.clone()), mini.clone(), cx))
+        }));
+    }
+    let more_items = menu_items.clone();
+    actions = actions
+        .child(bar_button("lightbox-more", icons::Glyph::More, "More").on_click(move |ev, window, cx| {
+            cx.stop_propagation();
+            native_menu::show(more_items(), ev.position(), window, cx)
+        }))
+        .child(bar_button("lightbox-close", icons::Glyph::Close, "Close").on_click(close.clone()));
+    let info = div()
+        .min_w_0()
+        .max_w(px(360.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(div().text_size(px(13.)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(white()).truncate().child(who))
+        .children(when.map(|w| div().text_size(px(11.5)).line_height(px(14.)).text_color(white().opacity(0.7)).truncate().child(w)));
+    let position = position.map(|(i, n)| {
+        div().flex_none().px(px(6.)).text_size(px(12.)).text_color(white().opacity(0.7)).child(format!("{} of {n}", i + 1))
+    });
+    let actions = div().flex().items_center().gap(px(4.)).children(position).child(actions);
+    let bar = div()
+        .id("lightbox-bar")
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(56.))
+        // Clear of the traffic lights.
+        .pl(px(84.))
+        .pr(px(16.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        // Clicks on the bar don't close the viewer.
+        .on_click(|_, _, cx| cx.stop_propagation());
+    // With glass: whose photo, and the buttons, in floating capsules; else a dark strip.
+    // Whose photo, centered over the window; the buttons at the end.
+    let centered = |info: AnyElement| div().absolute().inset_0().flex().items_center().justify_center().child(info);
+    let bar = if glass_on {
+        bar.child(centered(glass::glass("lightbox-info", 20., info.h(px(40.)).px(px(18.)).justify_center()).into_any_element()))
+            .child(div().flex_1())
+            .child(glass::glass("lightbox-actions", 20., actions.h(px(40.)).px(px(4.))))
+    } else {
+        bar.bg(black().opacity(0.35)).child(centered(info.into_any_element())).child(div().flex_1()).child(actions)
     };
     div()
         // Its full-size photos are freed when it closes (not kept in GPUI's global cache).
@@ -244,31 +381,28 @@ fn lightbox_overlay(path: std::path::PathBuf, store: Entity<Store>, focus: &Focu
         })
         .absolute()
         .inset_0()
-        .bg(black().opacity(0.88))
-        .flex()
-        .items_center()
-        .justify_center()
-        .p(px(36.))
-        .on_click(close.clone())
-        .child(img(path).size_full().object_fit(ObjectFit::Contain))
-        .children(prev)
-        .children(next)
+        .bg(black().opacity(0.9))
+        .on_click(close)
         .child(
             div()
-                .id("lightbox-close")
+                .id("lightbox-photo")
                 .absolute()
-                .top(px(14.))
-                .right(px(16.))
-                .size(px(30.))
-                .rounded_full()
-                .bg(white().opacity(0.15))
-                .hover(|s| s.bg(white().opacity(0.25)))
+                .top(px(64.))
+                .bottom(px(24.))
+                .left(px(60.))
+                .right(px(60.))
+                // A column the photo fills: its height is bounded, so Contain fits it.
                 .flex()
-                .items_center()
-                .justify_center()
-                .child(icons::glyph(icons::Glyph::Close, 14., white()))
-                .on_click(close),
+                .flex_col()
+                .child(img(path).flex_1().min_h_0().w_full().object_fit(ObjectFit::Contain))
+                .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                    cx.stop_propagation();
+                    native_menu::show(menu_items(), ev.position, window, cx)
+                }),
         )
+        .children(prev)
+        .children(next)
+        .child(bar)
         .with_animation(
             "lightbox-in",
             Animation::new(std::time::Duration::from_millis(160)).with_easing(ease_in_out),
@@ -617,6 +751,45 @@ fn main() {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(std::time::Duration::from_millis(1200)).await;
                 store.update(cx, |s, cx| s.toggle_profile(jid, cx));
+            })
+            .detach();
+        }
+        // WA_DEBUG_GALLERY="<jid>" (or "<jid>|docs", "<jid>|links"): open that chat's gallery.
+        if let Ok(spec) = std::env::var("WA_DEBUG_GALLERY") {
+            let store = debug_store.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                let (jid, tab) = spec.split_once('|').unwrap_or((&spec, "media"));
+                let tab = match tab {
+                    "docs" => state::GalleryTab::Docs,
+                    "links" => state::GalleryTab::Links,
+                    _ => state::GalleryTab::Media,
+                };
+                store.update(cx, |s, cx| s.open_gallery(jid.to_string(), tab, cx));
+            })
+            .detach();
+        }
+        // WA_DEBUG_PIN="<chat_jid>|<message_id>,…": pin those messages (7 days).
+        // WA_DEBUG_VIEW="<chat_jid>|<message_id>": open that photo in the viewer.
+        for (var, delay) in [("WA_DEBUG_PIN", 1500), ("WA_DEBUG_VIEW", 5000)] {
+            let Ok(spec) = std::env::var(var) else { continue };
+            let store = debug_store.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(delay)).await;
+                store.update(cx, |s, cx| {
+                    for target in spec.split(',') {
+                        let Some((chat, id)) = target.split_once('|') else { continue };
+                        let Some(m) = s.messages.get(chat).and_then(|ms| ms.iter().find(|m| m.id == id)).cloned() else {
+                            log::warn!("{var}: no message {id} loaded in {chat}");
+                            continue;
+                        };
+                        if var == "WA_DEBUG_PIN" {
+                            s.pin_message(&m, Some(604_800));
+                        } else if let Some(path) = media_actions::file_of(&m).cloned() {
+                            s.open_lightbox_in(path, Some(m.id.clone()), None, cx);
+                        }
+                    }
+                });
             })
             .detach();
         }
