@@ -586,7 +586,12 @@ fn run(cmds: flume::Receiver<Command>, ev: flume::Sender<Event>) {
                 }
                 let _ = ev.send(Event::Chats(fake.chats.clone()));
             }
-            Command::SetActive { active } => eprintln!("mock: SetActive {active}"),
+            Command::SetActive { active, done } => {
+                eprintln!("mock: SetActive {active}");
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
             Command::SetTyping { .. } | Command::FetchAvatar { .. } => {}
             Command::RetrySend { chat_jid, message_id } => {
                 // Like the backend: a resend moves to the end with the current time.

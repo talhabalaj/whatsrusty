@@ -69,9 +69,13 @@ const AVATAR_INTERVAL: Duration = Duration::from_millis(300);
 const PROFILE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a download requested while (re)connecting waits for the connection.
 const DOWNLOAD_CONNECT_WAIT: Duration = Duration::from_secs(30);
-/// Incoming messages older than this don't notify: the backlog after sleep stays quiet,
-/// while what arrives after a dropped connection (seconds to minutes late) still does.
+/// Live messages and reactions older than this don't notify.
 const NOTIFY_MAX_AGE_SECS: i64 = 5 * 60;
+/// Messages from the server's offline queue (what arrived while the Mac slept) notify
+/// up to this old, one notification per chat once the queue is drained.
+const OFFLINE_NOTIFY_MAX_AGE_SECS: i64 = 24 * 3600;
+/// Shows the offline notifications collected so far if the drain's end never comes.
+const OFFLINE_NOTIFY_FLUSH: Duration = Duration::from_secs(20);
 /// How often expired disappearing messages are deleted.
 const PURGE_INTERVAL: Duration = Duration::from_secs(60);
 /// Bounds on the steps of `Command::Shutdown`, so the backend is gone well within the
@@ -701,6 +705,16 @@ struct Session {
     /// Detached tasks to abort and wait for at teardown (they hold the client).
     side_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     presence_subscribed: Mutex<HashSet<String>>,
+    /// Notifications for messages from the offline queue, shown per chat when it's drained.
+    offline_notes: Mutex<Vec<Notification>>,
+}
+
+/// The fields of an [`Event::Notify`].
+struct Notification {
+    chat_jid: String,
+    message_id: String,
+    title: String,
+    body: String,
 }
 
 /// Forwards bus events to the session's worker in arrival order, without dropping any,
@@ -804,6 +818,7 @@ async fn run_session(shared: &Arc<Shared>, cmd_rx: &flume::Receiver<Command>) ->
         after_connect_started: AtomicBool::new(false),
         side_tasks: Mutex::new(Vec::new()),
         presence_subscribed: Mutex::new(HashSet::new()),
+        offline_notes: Mutex::new(Vec::new()),
     });
     let (session_cmd_tx, session_cmd_rx) = mpsc::unbounded_channel();
     let tasks = [
@@ -971,6 +986,38 @@ impl Session {
         }));
     }
 
+    /// Hold back a notification from the offline queue until it's drained (or
+    /// [`OFFLINE_NOTIFY_FLUSH`] passes), so a backlog becomes one notification per chat.
+    fn queue_offline_note(self: &Arc<Self>, note: Notification) {
+        let mut notes = self.offline_notes.lock().unwrap_or_else(|e| e.into_inner());
+        let first = notes.is_empty();
+        notes.push(note);
+        drop(notes);
+        if first {
+            let session = self.clone();
+            self.track(tokio::spawn(async move {
+                tokio::time::sleep(OFFLINE_NOTIFY_FLUSH).await;
+                session.flush_offline_notes();
+            }));
+        }
+    }
+
+    fn flush_offline_notes(&self) {
+        let notes = std::mem::take(&mut *self.offline_notes.lock().unwrap_or_else(|e| e.into_inner()));
+        if notes.is_empty() {
+            return;
+        }
+        let shared = &self.shared;
+        // Chats read elsewhere in the meantime (the phone's read receipts come in the same
+        // queue) stay quiet.
+        let unread = |chat: &str| shared.store(|s| s.unread_count(chat)).unwrap_or(0) > 0;
+        let notes = coalesce_offline_notes(notes, unread);
+        log::info!("offline queue drained: {} notification(s)", notes.len());
+        for n in notes {
+            shared.emit(Event::Notify { chat_jid: n.chat_jid, message_id: n.message_id, title: n.title, body: n.body });
+        }
+    }
+
     fn request_group_name(&self, jid: &str) {
         let first = self.groups_requested.lock().unwrap_or_else(|e| e.into_inner()).insert(jid.to_owned());
         if first {
@@ -1076,11 +1123,20 @@ impl Session {
                 // Read receipts that couldn't be sent before.
                 let session = self.clone();
                 self.track(tokio::spawn(async move { send_receipts(&session.shared, &session, None).await }));
+                // The library has just said "available": take it back right away while
+                // away, as a wake in the background may not last the 3 s.
+                if !shared.active.load(Ordering::Relaxed) {
+                    let session = self.clone();
+                    self.track(tokio::spawn(async move { session.apply_presence().await }));
+                }
                 self.correct_presence_soon();
             }
             // The library goes online after a connect's offline catch-up: undo that if the
             // app isn't in front.
-            E::OfflineSyncCompleted(_) => self.correct_presence_soon(),
+            E::OfflineSyncCompleted(_) => {
+                self.correct_presence_soon();
+                self.flush_offline_notes();
+            }
             E::Disconnected(d) => {
                 shared.emit(Event::Connection(ConnectionState::Disconnected { reason: d.reason.to_string() }));
             }
@@ -1311,12 +1367,13 @@ impl Session {
                     }
                     // Not for one deleted before it arrived (its content is gone).
                     let age = now_secs() - msg.timestamp;
-                    if inserted && !msg.from_me && age > NOTIFY_MAX_AGE_SECS {
+                    let max_age = if info.is_offline { OFFLINE_NOTIFY_MAX_AGE_SECS } else { NOTIFY_MAX_AGE_SECS };
+                    if inserted && !msg.from_me && age > max_age {
                         log::info!("no notification for {}: {age}s old", msg.id);
                     }
                     if inserted
                         && !msg.from_me
-                        && age <= NOTIFY_MAX_AGE_SECS
+                        && age <= max_age
                         && !s.is_revoked(&msg.chat_jid, &msg.id)?
                     {
                         notify = notification(s, &msg)?;
@@ -1367,8 +1424,12 @@ impl Session {
             shared.emit(Event::MessageUpserted(msg));
             shared.mark_chats_dirty();
         }
-        if let Some(n) = notify {
-            shared.emit(n);
+        match notify {
+            Some(Event::Notify { chat_jid, message_id, title, body }) if info.is_offline => {
+                self.queue_offline_note(Notification { chat_jid, message_id, title, body });
+            }
+            Some(n) => shared.emit(n),
+            None => {}
         }
         if is_group_jid(&chat)
             && self.groups_fetched.load(Ordering::Relaxed)
@@ -1738,10 +1799,13 @@ async fn handle_command(shared: &Arc<Shared>, session: Option<&Arc<Session>>, cm
                 _ => {}
             }
         }
-        Command::SetActive { active } => {
+        Command::SetActive { active, done } => {
             shared.active.store(active, Ordering::Relaxed);
             if let Some(session) = session {
                 session.apply_presence().await;
+            }
+            if let Some(done) = done {
+                let _ = done.send(());
             }
         }
         Command::SetTyping { chat_jid, typing } => {
@@ -2023,6 +2087,31 @@ fn reaction_notification(s: &Store, r: &NewReaction, target: &ChatMessage) -> Re
         title: name,
         body: format!("{sender} reacted {} to “{snippet}{ellipsis}”", r.emoji),
     }))
+}
+
+/// One notification per chat with unread messages, for its latest message, in the order
+/// the chats' latest messages arrived.
+fn coalesce_offline_notes(notes: Vec<Notification>, unread: impl Fn(&str) -> bool) -> Vec<Notification> {
+    let mut per_chat: Vec<(Notification, usize)> = Vec::new();
+    for note in notes {
+        if let Some(i) = per_chat.iter().position(|(n, _)| n.chat_jid == note.chat_jid) {
+            let (_, count) = per_chat.remove(i);
+            per_chat.push((note, count + 1));
+        } else {
+            per_chat.push((note, 1));
+        }
+    }
+    per_chat
+        .into_iter()
+        .filter(|(n, _)| unread(&n.chat_jid))
+        .map(|(mut n, count)| {
+            if count > 1 {
+                let more = count - 1;
+                n.body = format!("{}\nand {more} more message{}", n.body, if more == 1 { "" } else { "s" });
+            }
+            n
+        })
+        .collect()
 }
 
 /// How much of the message a reaction notification quotes.
@@ -3857,6 +3946,20 @@ mod tests {
         assert_eq!(other.sender.as_deref(), Some("2@s.whatsapp.net"));
         assert_eq!(message_id_from("bad id!".into()).len(), 24);
         assert_eq!(message_id_from("ABCDEF123456".into()), "ABCDEF123456");
+    }
+
+    #[test]
+    fn offline_backlog_notifies_once_per_unread_chat() {
+        let note = |chat: &str, id: &str| Notification {
+            chat_jid: chat.into(),
+            message_id: id.into(),
+            title: chat.to_uppercase(),
+            body: format!("text {id}"),
+        };
+        let notes = vec![note("a", "1"), note("b", "2"), note("a", "3"), note("c", "4"), note("a", "5"), note("b", "6")];
+        let out = coalesce_offline_notes(notes, |chat| chat != "c");
+        let got: Vec<_> = out.iter().map(|n| (n.chat_jid.as_str(), n.message_id.as_str(), n.body.as_str())).collect();
+        assert_eq!(got, [("a", "5", "text 5\nand 2 more messages"), ("b", "6", "text 6\nand 1 more message")]);
     }
 
     #[test]
