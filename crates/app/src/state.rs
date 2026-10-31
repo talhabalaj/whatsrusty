@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification};
+use gpui_kit::{AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SystemNotification, SystemNotificationAction};
 use wa_backend::{
     BackendHandle, ChatMessage, ChatSummary, Command, ConnectionState, DeliveryStatus, Event, GroupRead, MessageBody, MessageReceipt,
     SearchHit,
@@ -427,23 +427,31 @@ impl Store {
                 }
             },
             Event::Notify { chat_jid, message_id, title, body } => {
-                // Like Messages: no banner for the conversation you're looking at, or one
-                // popped out into a visible mini window.
-                let focused = self.main_active(cx) && self.selected.as_deref() == Some(chat_jid.as_str());
-                let popped = self.popped.get(&chat_jid).map(|p| p.window);
-                let mini_visible = popped.is_some_and(|w| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false));
+                // Like Messages: no banner for the conversation you're looking at (the app in
+                // front and the chat showing in the main window, whichever of our windows is
+                // key), or one popped out into a visible mini window.
+                let visible = |w: AnyWindowHandle, cx: &mut Context<Self>| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false);
+                let app_active = cx.active_window().is_some();
+                let shown_in_main = self.selected.as_deref() == Some(chat_jid.as_str())
+                    && app_active
+                    && self.main_window.is_some_and(|w| visible(w, cx));
+                let mini_visible = self.popped.get(&chat_jid).is_some_and(|p| visible(p.window, cx));
                 // Archived chats stay quiet, like WhatsApp's "Keep chats archived".
                 let archived = self.chats.iter().any(|c| c.jid == chat_jid && c.archived);
-                log::debug!("notify {chat_jid}: focused={focused} mini_visible={mini_visible} archived={archived}");
-                if !focused && !mini_visible && !archived {
+                let show = !shown_in_main && !mini_visible && !archived;
+                log::info!(
+                    "notify {message_id} in {chat_jid}: show={show} (in main={shown_in_main} mini={mini_visible} archived={archived})"
+                );
+                if show {
                     cx.show_system_notification(SystemNotification {
-                        tag: chat_jid.into(),
+                        // One per message: reusing the chat's tag replaces its earlier
+                        // notification, which macOS may do without a banner.
+                        tag: notification_tag(&chat_jid, &message_id).into(),
                         title: crate::links::strip_bidi(&title).into(),
                         body: crate::links::strip_bidi(&body).into(),
-                        actions: Vec::new(),
+                        actions: notification_actions(),
                     });
                 }
-                log::debug!("notify {message_id}");
             }
             Event::Contacts(list) => self.contacts = list,
             Event::PhoneLookup { phone, jid, error } => {
@@ -685,6 +693,19 @@ impl Store {
     }
 
     /// `mentions`: JIDs whose `@<digits>` are in `text`.
+    /// Reply typed into a notification: a plain message (not the reply the composer may
+    /// have pending for that chat), and the chat counts as read, like WhatsApp.
+    pub fn send_notification_reply(&mut self, chat_jid: String, text: &str, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let client_id = self.new_sent_id();
+        self.send(Command::MarkRead { chat_jid: chat_jid.clone() });
+        self.send(Command::SendText { chat_jid, text, client_id, reply_to: None, mentions: Vec::new() });
+        cx.notify();
+    }
+
     pub fn send_text(&mut self, chat_jid: String, text: String, mentions: Vec<String>, cx: &mut Context<Self>) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -1333,9 +1354,40 @@ fn load_image(path: &Path, max_px: Option<u32>) -> Option<Arc<Image>> {
     }))
 }
 
+/// A notification's tag: the chat, then the message (JIDs never contain `#`).
+fn notification_tag(chat_jid: &str, message_id: &str) -> String {
+    format!("{chat_jid}#{message_id}")
+}
+
+/// What a notification's response asks for: [`NOTIFY_REPLY`] (with the typed text) or
+/// [`NOTIFY_READ`]; no action means its body was clicked.
+pub const NOTIFY_REPLY: &str = "reply";
+pub const NOTIFY_READ: &str = "read";
+
+/// Reply inline, or mark the chat read, from the notification.
+fn notification_actions() -> Vec<SystemNotificationAction> {
+    vec![
+        SystemNotificationAction { id: NOTIFY_REPLY.into(), label: "Reply".into(), text_input: Some("Message".into()) },
+        SystemNotificationAction { id: NOTIFY_READ.into(), label: "Mark as Read".into(), text_input: None },
+    ]
+}
+
+/// The chat a notification's tag belongs to.
+pub fn notification_chat(tag: &str) -> &str {
+    tag.split_once('#').map_or(tag, |(chat, _)| chat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_tags_lead_back_to_the_chat() {
+        let tag = notification_tag("120363000000000001@g.us", "3EB0ABC");
+        assert_eq!(notification_chat(&tag), "120363000000000001@g.us");
+        // Tags from before they carried the message.
+        assert_eq!(notification_chat("923001234567@s.whatsapp.net"), "923001234567@s.whatsapp.net");
+    }
 
     #[test]
     fn avatars_load_small() {

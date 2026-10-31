@@ -31,12 +31,15 @@ pub fn pop_out(store: &Entity<Store>, jid: String, cx: &mut App) {
     let store = store.clone();
     // Usually called from a click: that window is leased until the handler returns.
     cx.defer(move |cx| {
-        if let Some(window) = store.read(cx).popped.get(&jid).map(|p| p.window)
-            && window.update(cx, |_, window, _| window.activate_window()).is_ok()
+        let shown = store.read(cx).popped.get(&jid).map(|p| p.window).is_some_and(|window| {
+            window.update(cx, |_, window, _| window.activate_window()).is_ok()
+        });
+        // The chat moves out of the main window, which closes (the Dock icon reopens it).
+        if (shown || open(store.clone(), jid, cx))
+            && let Some(main) = store.read(cx).main_window
         {
-            return;
+            let _ = main.update(cx, |_, window, _| window.remove_window());
         }
-        open(store, jid, cx);
     });
 }
 
@@ -54,7 +57,8 @@ pub fn open_in_main(store: &Entity<Store>, jid: String, cx: &mut App) {
     });
 }
 
-fn open(store: Entity<Store>, jid: String, cx: &mut App) {
+/// Whether the window opened.
+fn open(store: Entity<Store>, jid: String, cx: &mut App) -> bool {
     let name = store.read(cx).chats.iter().find(|c| c.jid == jid).map_or_else(|| jid.clone(), |c| c.name.clone());
     // The frame it had last time, if it's still on a screen; else the top right of the
     // main screen, cascading.
@@ -84,8 +88,12 @@ fn open(store: Entity<Store>, jid: String, cx: &mut App) {
             log::info!("popped out {jid}");
             store.update(cx, |s, _| s.set_popped(&jid, Some(handle)));
             let _ = handle.update(cx, |_, window, _| configure_native(window));
+            true
         }
-        Err(e) => log::error!("opening a mini window failed: {e:#}"),
+        Err(e) => {
+            log::error!("opening a mini window failed: {e:#}");
+            false
+        }
     }
 }
 

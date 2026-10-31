@@ -26,7 +26,7 @@ use whatsapp_rust::{ErrorChainExt as _, Jid, SendOptions, UploadOptions};
 
 use crate::extract::{
     DELETED_LABEL, Extracted, MediaKind, QuotedRef, StoredMedia, classify, document_name, expiration_of, fallback_name,
-    is_forwarded, is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
+    hd_parent_of, is_forwarded, is_group_jid, is_hidden_chat, is_lid_jid, media_of, non_ad, preview_text, quoted_of,
 };
 use crate::media::{
     TempFile, avatar_file, create_private_dir_all, create_private_file, documents_dir, ext_for_mime, media_file,
@@ -69,8 +69,9 @@ const AVATAR_INTERVAL: Duration = Duration::from_millis(300);
 const PROFILE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a download requested while (re)connecting waits for the connection.
 const DOWNLOAD_CONNECT_WAIT: Duration = Duration::from_secs(30);
-/// Incoming messages older than this (offline catch-up) don't notify.
-const NOTIFY_MAX_AGE_SECS: i64 = 60;
+/// Incoming messages older than this don't notify: the backlog after sleep stays quiet,
+/// while what arrives after a dropped connection (seconds to minutes late) still does.
+const NOTIFY_MAX_AGE_SECS: i64 = 5 * 60;
 /// How often expired disappearing messages are deleted.
 const PURGE_INTERVAL: Duration = Duration::from_secs(60);
 /// Bounds on the steps of `Command::Shutdown`, so the backend is gone well within the
@@ -1284,7 +1285,8 @@ impl Session {
                 }
                 let msg = NewMessage {
                     chat_jid: chat.clone(),
-                    id: info.id.clone(),
+                    // An HD copy upgrades its standard-quality original in place.
+                    id: hd_parent_of(&m.message).unwrap_or_else(|| info.id.clone()),
                     sender_jid: sender,
                     wire_chat,
                     wire_sender: src.is_group.then(|| src.sender.to_non_ad_string()),
@@ -1308,9 +1310,13 @@ impl Session {
                         s.clear_unread(&msg.chat_jid)?;
                     }
                     // Not for one deleted before it arrived (its content is gone).
+                    let age = now_secs() - msg.timestamp;
+                    if inserted && !msg.from_me && age > NOTIFY_MAX_AGE_SECS {
+                        log::info!("no notification for {}: {age}s old", msg.id);
+                    }
                     if inserted
                         && !msg.from_me
-                        && now_secs() - msg.timestamp <= NOTIFY_MAX_AGE_SECS
+                        && age <= NOTIFY_MAX_AGE_SECS
                         && !s.is_revoked(&msg.chat_jid, &msg.id)?
                     {
                         notify = notification(s, &msg)?;
@@ -1543,6 +1549,7 @@ fn apply_history_sync(s: &Store, hs: &wa::HistorySync, own: &Own, now: Timestamp
             };
             match classify(msg) {
                 Extracted::Body(body) => {
+                    let id = &hd_parent_of(msg).unwrap_or_else(|| id.clone());
                     let expires_at = history_expiry(wmi, msg, ts);
                     if expires_at.is_some_and(|t| t <= now) {
                         continue;
